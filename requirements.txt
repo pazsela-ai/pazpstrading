@@ -5,3 +5,5 @@ google-genai
 yfinance
 feedparser
 requests
+finvizfinance
+pandas
