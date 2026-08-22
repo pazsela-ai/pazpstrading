@@ -18,6 +18,7 @@ from telegram.ext import (
 
 import yfinance as yf
 import pandas as pd
+from deep_translator import GoogleTranslator
 
 # ---------------------------------------------------------------------------
 # 1. הגדרות לוגים ומצבי שיחה
@@ -28,7 +29,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# שלבי השיחה עבור תהליך העסקה
 WAITING_FOR_CURRENCY, WAITING_FOR_PRICE = range(2)
 
 # ---------------------------------------------------------------------------
@@ -49,15 +49,26 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Autonomous Trading Bot with Currency Support & Reasoning is Live!"
+    return "Autonomous Trading Bot with Translated News & Trend Analysis is Live!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
 # ---------------------------------------------------------------------------
-# 4. מנוע חישוב ואינדיקטורים
+# 4. עזרי תרגום וניתוח סנטימנט
 # ---------------------------------------------------------------------------
+def translate_to_hebrew(text: str) -> str:
+    """מתרגם טקסט מאנגלית לעברית בצורה בטוחה"""
+    try:
+        if not text or text.strip() == "":
+            return text
+        translated = GoogleTranslator(source='en', target='he').translate(text)
+        return translated if translated else text
+    except Exception as e:
+        logger.error(f"שגיאת תרגום: {e}")
+        return text
+
 def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -135,7 +146,8 @@ def evaluate_opportunity(data: dict):
 
         if matched_titles:
             score += 2
-            reasons.append(f"קטליזטור חדשותי חיובי: '{matched_titles[0]}'")
+            translated_title = translate_to_hebrew(matched_titles[0])
+            reasons.append(f"קטליזטור חדשותי חיובי: '{translated_title}'")
 
     is_hot = score >= 4.5
     return is_hot, score, reasons
@@ -158,7 +170,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 **מערכת מודיעין פיננסי ואיתותים אוטונומית**\n\n"
         "פקודות זמינות:\n"
         "• `/technical TICKER` - ניתוח טכני + המלצת השקעה מנומקת ומחיר כניסה\n"
-        "• `/news TICKER` - חדשות + המלצה מנומקת לפי סנטימנט\n"
+        "• `/news TICKER` - חדשות מתורגמות + ניתוח סנטימנט ומגמה צפויה\n"
         "• `/scan` - הרצה ידנית מורחבת של הסורק\n"
         "• `/test_alert` - בדיקת תקינות התראות"
     )
@@ -182,8 +194,8 @@ async def handle_technical(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if score >= 4.5:
         recommendation = "✅ **שווה להשקיע!**"
         reasoning = (
-            f"**נימוק להמלצה:** המנייה קיבלה ציון מגוון של {score}/10. "
-            f"השילוב של האינדיקטורים מעיד על מומנטום חיובי ונפח מסחר תומך (" + 
+            f"**נימוק להמלצה:** המנייה קיבלה ציון של {score}/10. "
+            f"האינדיקטורים מעידים על מומנטום חיובי ונפח מסחר תומך (" + 
             ", ".join(reasons) + ")."
         )
         entry_price = min(data['current_price'], data['sma_10'])
@@ -218,7 +230,7 @@ async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     symbol = context.args[0].upper()
-    await update.message.reply_text(f"🌐 שולף עדכונים עבור {symbol}...")
+    await update.message.reply_text(f"🌐 שולף ומתרגם עדכונים עבור {symbol}...")
 
     ticker = yf.Ticker(symbol)
     news_items = ticker.news if hasattr(ticker, "news") else []
@@ -230,14 +242,20 @@ async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    msg = f"📰 **עדכוני חדשות עבור {symbol}**\n───────────────────────\n\n"
-    catalyst_titles = []
+    msg = f"📰 **עדכוני חדשות מתורגמים עבור {symbol}**\n───────────────────────\n\n"
+    
+    pos_keywords = ["earnings", "upgrade", "growth", "buy", "deal", "fda", "revenue", "partnership", "record", "profit"]
+    neg_keywords = ["downgrade", "loss", "lawsuit", "investigation", "drop", "decline", "miss", "risk", "cut"]
+
+    pos_score = 0
+    neg_score = 0
     valid_news_count = 0
+    translated_catalysts = []
 
     for item in news_items:
         content = item.get("content", item)
+        raw_title = content.get("title") or item.get("title")
         
-        title = content.get("title") or item.get("title")
         publisher = (
             content.get("provider", {}).get("displayName") or 
             content.get("publisher") or 
@@ -251,12 +269,20 @@ async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else content.get("link") or item.get("link") or "#"
         )
 
-        if title:
-            msg += f"• **{title}**\n  ✍️ מקור: {publisher} | [לכתבה המלאה]({link})\n\n"
-            valid_news_count += 1
+        if raw_title:
+            # תרגום הכותרת לעברית
+            translated_title = translate_to_hebrew(raw_title)
             
-            if any(kw in title.lower() for kw in ["earnings", "upgrade", "growth", "buy", "deal", "fda", "revenue"]):
-                catalyst_titles.append(title)
+            msg += f"• **{translated_title}**\n  ✍️ מקור: {publisher} | [לכתבה המלאה]({link})\n\n"
+            valid_news_count += 1
+
+            # ניתוח סנטימנט לכותרת
+            title_lower = raw_title.lower()
+            if any(kw in title_lower for kw in pos_keywords):
+                pos_score += 1
+                translated_catalysts.append(translated_title)
+            if any(kw in title_lower for kw in neg_keywords):
+                neg_score += 1
 
         if valid_news_count >= 4:
             break
@@ -268,24 +294,41 @@ async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    msg += "💡 **המלצה ונימוק סנטימנטלי:**\n"
-    if catalyst_titles:
-        msg += (
-            f"✅ **שווה לשקול השקעה!**\n"
-            f"**נימוק:** זוהו כתבות קטליזטוריות חיוביות (למשל: '{catalyst_titles[0]}') "
-            f"שעשויות להוות טריגר לעליית מחירים בטווח הקרוב."
+    # קביעת המגמה הצפויה וההמלצה
+    if pos_score > neg_score and pos_score > 0:
+        expected_trend = "📈 **מגמה צפויה:** חיובית (עצימות שורית)"
+        recommendation = "✅ **שווה לשקול השקעה!**"
+        reasoning = (
+            f"**נימוק:** הכותרות האחרונות כוללות קטליזטורים חיוביים "
+            f"(למשל: '{translated_catalysts[0]}'). "
+            f"הסנטימנט בחדשות תומך בעליית מחירים בטווח הקצר."
+        )
+    elif neg_score > pos_score:
+        expected_trend = "📉 **מגמה צפויה:** שלילית (עצימות דובית)"
+        recommendation = "🛑 **לא מומלץ להשקיע כרגע.**"
+        reasoning = (
+            f"**נימוק:** הדיווחים האחרונים כוללים חדשות שליליות או אזהרות, "
+            f"מה שעלול להפעיל לחץ מוכרים על המנייה בטווח הקרוב."
         )
     else:
-        msg += (
-            f"ℹ️ **לא מומלץ להיכנס רק על בסיס החדשות.**\n"
-            f"**נימוק:** הדיווחים האחרונים ניטרליים ואינם כוללים אירוע קטליזטורי מובהק."
+        expected_trend = "➡️ **מגמה צפויה:** ניטרלית / מעורבת"
+        recommendation = "⏳ **להמתין ולא להיכנס רק על בסיס החדשות.**"
+        reasoning = (
+            f"**נימוק:** הידיעות האחרונות ניטרליות או מעורבות ואינן מציגות טריגר חד-משמעי לפריצה."
         )
+
+    msg += (
+        f"───────────────────────\n"
+        f"{expected_trend}\n"
+        f"💡 **המלצה:** {recommendation}\n"
+        f"🧠 {reasoning}"
+    )
 
     reply_markup = build_action_keyboard(symbol)
     await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True, reply_markup=reply_markup)
 
 # ---------------------------------------------------------------------------
-# 6. מנגנון תהליך "בצע עסקה" עם בחירת מטבע (USD / ILS)
+# 6. מנגנון תהליך "בצע עסקה" עם בחירת מטבע
 # ---------------------------------------------------------------------------
 async def start_trade_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -385,14 +428,15 @@ async def autonomous_market_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if data['news']:
                     first_news = data['news'][0]
                     content = first_news.get("content", first_news)
-                    title = content.get("title") or first_news.get("title", "")
+                    raw_title = content.get("title") or first_news.get("title", "")
                     click_through = content.get("clickThroughUrl") or content.get("canonicalUrl", {})
                     link = (
                         click_through.get("url") if isinstance(click_through, dict) 
                         else content.get("link") or first_news.get("link") or "#"
                     )
-                    if title:
-                        news_snippet = f"\n📰 **חדשות:** [{title}]({link})\n"
+                    if raw_title:
+                        translated_title = translate_to_hebrew(raw_title)
+                        news_snippet = f"\n📰 **חדשות:** [{translated_title}]({link})\n"
 
                 entry_price = min(data['current_price'], data['sma_10'])
 
@@ -438,7 +482,6 @@ def main():
 
     tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # דיאלוג ביצוע עסקה מתקדם המטפל בבחירת מטבע ולאחר מכן במחיר
     trade_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_trade_flow, pattern="^trade_")],
         states={
