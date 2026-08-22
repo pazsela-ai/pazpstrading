@@ -11,7 +11,7 @@ from threading import Thread
 from finvizfinance.screener.technical import Technical
 from google import genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # הגדרת לוגים
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -25,12 +25,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 # אתחול Gemini API
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+# זיכרון זמני למעקב ומחשבון
+user_trade_state = {}
+
 # ---------------------------------------------------------
-# 1. מנוע ניתוח טכני דינמי (מניעת כניסה בשיא)
+# 1. מנוע ניתוח טכני דינמי
 # ---------------------------------------------------------
 
 def run_technical_screener():
-    """סורק את כל השוק ומחזיר אותות טכניים איכותיים בתחילת תנועה"""
     try:
         f_screener = Technical()
         filters_dict = {
@@ -54,11 +56,10 @@ def run_technical_screener():
 
         return valid_signals
     except Exception as e:
-        logger.error(f"שגיאה בסורק הטכני הדינמי: {e}")
+        logger.error(f"שגיאה בסורק הטכני: {e}")
         return []
 
 def analyze_technical_setup(ticker_symbol: str):
-    """מחשב אינדיקטורים ובודק שרכבת המסחר לא נסעה"""
     try:
         stock = yf.Ticker(ticker_symbol)
         df = stock.history(period="3mo")
@@ -67,27 +68,28 @@ def analyze_technical_setup(ticker_symbol: str):
 
         current_price = df['Close'].iloc[-1]
         
-        # חישוב RSI
+        # RSI
         delta = df["Close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs.iloc[-1]))
 
-        # ממוצע נעים 20
+        # SMA 20
         sma20 = df['Close'].rolling(window=20).mean().iloc[-1]
         dist_from_sma20 = ((current_price - sma20) / sma20) * 100
 
-        # נפח מסחר
+        # Volume
         avg_volume = df['Volume'].rolling(window=20).mean().iloc[-1]
         curr_volume = df['Volume'].iloc[-1]
         vol_ratio = curr_volume / avg_volume if avg_volume > 0 else 1.0
 
-        # בלמי חירום למניעת כניסה בשיא
-        if rsi >= 65 or dist_from_sma20 > 4.0 or vol_ratio < 1.2:
+        # סינון לרכבת שנסעה
+        if rsi >= 68 or dist_from_sma20 > 5.0 or vol_ratio < 1.1:
             return None
 
-        # חישוב יעד וסטופ
+        is_warning = rsi >= 60
+
         atr = (df['High'] - df['Low']).rolling(14).mean().iloc[-1]
         stop_loss = max(current_price - (1.5 * atr), current_price * 0.95)
         take_profit = current_price + (3.0 * atr)
@@ -95,10 +97,6 @@ def analyze_technical_setup(ticker_symbol: str):
         risk_per_share = current_price - stop_loss
         reward_per_share = take_profit - current_price
         rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0
-
-        budget = 1000
-        shares = int(budget // current_price) if current_price <= budget else 1
-        max_loss = round(shares * risk_per_share, 2)
 
         return {
             "ticker": ticker_symbol,
@@ -108,16 +106,15 @@ def analyze_technical_setup(ticker_symbol: str):
             "vol_ratio": round(vol_ratio, 1),
             "stop_loss": round(stop_loss, 2),
             "take_profit": round(take_profit, 2),
-            "shares": shares,
-            "max_loss": max_loss,
-            "rr_ratio": round(rr_ratio, 1)
+            "rr_ratio": round(rr_ratio, 1),
+            "is_warning": is_warning
         }
     except Exception as e:
-        logger.error(f"שגיאה בניתוח טכני עבור {ticker_symbol}: {e}")
+        logger.error(f"שגיאה בניתוח עבור {ticker_symbol}: {e}")
         return None
 
 # ---------------------------------------------------------
-# 2. מנוע ניתוח חדשותי (Gemini)
+# 2. מנוע ניתוח חדשותי
 # ---------------------------------------------------------
 
 def fetch_rss_news():
@@ -133,7 +130,7 @@ def fetch_rss_news():
     return news_items
 
 # ---------------------------------------------------------
-# 3. תזמון סריקות ושליחת התראות בטלגרם
+# 3. תזמון וטיפול בהודעות
 # ---------------------------------------------------------
 
 async def send_telegram_msg(bot, text, reply_markup=None):
@@ -141,50 +138,99 @@ async def send_telegram_msg(bot, text, reply_markup=None):
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown", reply_markup=reply_markup)
 
 async def periodic_news_scan(context: ContextTypes.DEFAULT_TYPE):
-    """מסלול 1: ניתוח חדשותי ברקע"""
     items = fetch_rss_news()
     if not items or not ai_client:
         return
-
-    prompt = f"מתוכם מצא ידיעה דרמטית אחת בעלת פוטנציאל להזזת מניה: {items}. החזר JSON עם ticker, summary, action."
     try:
+        prompt = f"מצא ידיעה דרמטית אחת בעלת פוטנציאל להזזת מניה: {items}. החזר JSON עם ticker, summary, action."
         response = ai_client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
-        # לשם פשטות – ניטור רציף של חדשות
     except Exception as e:
         logger.error(f"שגיאה בסריקת חדשות: {e}")
 
 async def periodic_technical_scan(context: ContextTypes.DEFAULT_TYPE):
-    """מסלול 2: ניתוח טכני דינמי"""
     signals = run_technical_screener()
     for sig in signals:
+        header = "⚠️ **[אזהרת מומנטום - רגע לפני שהרכבת נוסעת]**" if sig['is_warning'] else "📊 **[אות טכני - תחילת תנועה]**"
+        status_note = "מתקרב לקצה טווח הכניסה! חלון הזדמנות אחרון." if sig['is_warning'] else "נקודת כניסה אופטימלית בקו הזינוק."
+
         msg = (
-            f"📊 **[אות טכני - תחילת תנועה]**\n"
+            f"{header}\n"
             f"**מניה:** `{sig['ticker']}` | **מחיר:** ${sig['price']}\n\n"
-            f"🚥 **בדיקת תזמון (מניעת רדיפה בשיא):**\n"
-            f"• **RSI (14):** `{sig['rsi']}` 🟢 *(רחוק משיא)*\n"
-            f"• **מרחק מממוצע 20:** `{sig['dist_sma20']}%+` 🟢 *(בקו הזינוק)*\n"
-            f"• **נפח מסחר:** פי `{sig['vol_ratio']}` מהממוצע 🟢\n\n"
+            f"🚥 **בדיקת תזמון:**\n"
+            f"• **RSI (14):** `{sig['rsi']}` 🟢\n"
+            f"• **מרחק מממוצע 20:** `{sig['dist_sma20']}%+` 🟢\n"
+            f"• **סטטוס:** {status_note}\n\n"
             f"💡 **למה שווה לבדוק?**\n"
-            f"פריצת התנגדות נקודתית בנפח ער עם תזמון כניסה אופטימלי.\n\n"
-            f"🛡️ **ניהול סיכונים מומלץ (תקציב $1,000):**\n"
+            f"פריצת התנגדות בנפח מסחר ער (פי `{sig['vol_ratio']}` מהממוצע).\n\n"
+            f"🛡️ **פרמטרים לעסקה:**\n"
             f"• **כניסה:** ${sig['price']}\n"
             f"• **סטופ לוס:** ${sig['stop_loss']}\n"
             f"• **יעד רווח:** ${sig['take_profit']}\n"
-            f"• **כמות מניות:** {sig['shares']}\n"
-            f"• **סיכון מקסימלי:** ${sig['max_loss']}\n"
             f"• **יחס סיכוי/סיכון:** `1 : {sig['rr_ratio']}` 🟢"
         )
+        
         keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 אני רוצה לבצע עסקה", callback_data=f"calc_{sig['ticker']}_{sig['price']}_{sig['stop_loss']}_{sig['take_profit']}")],
             [InlineKeyboardButton("🔗 גרף ב-TradingView", url=f"https://www.tradingview.com/symbols/{sig['ticker']}")]
         ])
         await send_telegram_msg(context.bot, msg, reply_markup=keyboard)
 
 # ---------------------------------------------------------
-# 4. פקודות בוט ושרת Flask ל-Render
+# 4. מחשבון עסקאות אינטראקטיבי
+# ---------------------------------------------------------
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data.split("_")
+    if data[0] == "calc":
+        ticker, price, stop, target = data[1], float(data[2]), float(data[3]), float(data[4])
+        user_trade_state[query.from_user.id] = {
+            "ticker": ticker, "price": price, "stop": stop, "target": target
+        }
+        await query.message.reply_text(f"רשמי כעת את הסכום הכולל ב-$ שתרצי להשקיע במניית {ticker}:")
+
+async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id in user_trade_state:
+        try:
+            budget = float(update.message.text.replace("$", "").strip())
+            trade = user_trade_state.pop(user_id)
+            
+            price = trade['price']
+            stop = trade['stop']
+            target = trade['target']
+            
+            shares = int(budget // price) if price <= budget else 1
+            total_cost = round(shares * price, 2)
+            max_loss = round(shares * (price - stop), 2)
+            max_gain = round(shares * (target - price), 2)
+            rr = round(max_gain / max_loss, 1) if max_loss > 0 else 0
+            
+            msg = (
+                f"🎯 **[תוכנית ביצוע מותאמת אישית]**\n"
+                f"**מניה:** `{trade['ticker']}` | **תקציב שהזנת:** ${budget:,.0f}\n\n"
+                f"📊 **תוכנית קנייה מדויקת:**\n"
+                f"• **כמות מניות לקנייה:** `{shares}` מניות\n"
+                f"• **סכום השקעה בפועל:** ${total_cost:,.2f}\n"
+                f"• **מחיר סטופ לוס:** ${stop}\n"
+                f"• **מחיר יעד רווח:** ${target}\n\n"
+                f"🛡️ **ניהול סיכונים בשורה התחתונה:**\n"
+                f"• **הפסד מקסימלי בעסקה:** **${max_loss}** 🛑\n"
+                f"• **רווח פוטנציאלי:** **${max_gain}** 🎯\n"
+                f"• **יחס סיכוי/סיכון:** `1 : {rr}` 🟢"
+            )
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except ValueError:
+            await update.message.reply_text("אנא הזיני מספר תקין (למשל: 1500).")
+
+# ---------------------------------------------------------
+# 5. פקודות ושרת Flask
 # ---------------------------------------------------------
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("היי! הבוט מחובר. סורק חדשות ופרמטרים טכניים באופן עצמאי וישלח התראות בזמן אמת.")
+    await update.message.reply_text("היי! הבוט מחובר ומנטר ניתוח חדשותי וטכני בזמן אמת.")
 
 async def test_tech_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("מריץ סריקה טכנית ידנית כעת...")
@@ -209,8 +255,9 @@ def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("testtech", test_tech_cmd))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input))
 
-    # הוספת משימות תקופתיות ברקע
     job_queue = application.job_queue
     job_queue.run_repeating(periodic_news_scan, interval=600, first=10)
     job_queue.run_repeating(periodic_technical_scan, interval=1800, first=20)
