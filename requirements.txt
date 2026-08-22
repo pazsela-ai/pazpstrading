@@ -8,6 +8,6 @@ requests
 finvizfinance
 pandas
 google-generativeai
-https://github.com/twopirllc/pandas-ta/archive/refs/heads/main.zip
+pandas-ta
 finnhub-python
 apscheduler
