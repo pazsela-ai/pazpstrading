@@ -1,253 +1,232 @@
 import os
 import logging
-import threading
-from datetime import datetime, timedelta
+import asyncio
+import requests
+import feedparser
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
+from finvizfinance.quote import snapshot
 import finnhub
-
 from flask import Flask
-from apscheduler.schedulers.background import BackgroundScheduler
-from google import genai
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import google.generativeai as genai
 
-# ==========================================
-# 1. הגדרת Logging
-# ==========================================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+# הגדרת הלוגים
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# 2. טעינת משתני סביבה ולקוחות API
-# ==========================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "YOUR_FINNHUB_API_KEY")
+# טעינת מפתחות סביבה
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# לקוח Gemini 2.5
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# הגדרת Gemini 2.5
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-2.5-flash')
 
-# לקוח Finnhub
-finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
+# הגדרת Finnhub
+finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY) if FINNHUB_API_KEY else None
 
-# ==========================================
-# 3. שרת Flask ל-Keep Alive (מניעת הרדמה ב-Render)
-# ==========================================
+# Flask App
 app = Flask(__name__)
 
-@app.route("/")
+@app.route('/')
 def home():
-    return "Trading Bot is Live & Active!", 200
+    return "Autonomous Trading Alert System (US & IL) is Live!"
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+# ----------------------------------------------------
+# מנועי איסוף נתונים (תמיכה במניות ישראליות וגלובליות)
+# ----------------------------------------------------
 
-# ==========================================
-# 4. פונקציות עזר: נתוני שוק ואינדיקטורים
-# ==========================================
-def get_live_technical_data(symbol: str):
-    """מושך נתוני מחיר היסטוריים ומחשב אינדיקטורים בעזרת pandas-ta"""
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period="3m")
-    
-    if df.empty or len(df) < 20:
-        return None
-
-    # חישוב אינדיקטורים בעזרת pandas-ta
-    df.ta.rsi(length=14, append=True)
-    df.ta.sma(length=20, append=True)
-    df.ta.macd(fast=12, slow=26, signal=9, append=True)
-
-    latest = df.iloc[-1]
-    
-    current_price = round(latest["Close"], 2)
-    rsi_val = round(latest["RSI_14"], 2) if "RSI_14" in latest and not pd.isna(latest["RSI_14"]) else 50.0
-    sma20_val = round(latest["SMA_20"], 2) if "SMA_20" in latest and not pd.isna(latest["SMA_20"]) else current_price
-    volume = int(latest["Volume"])
-    avg_volume = int(df["Volume"].tail(20).mean())
-    vol_ratio = round(volume / avg_volume, 2) if avg_volume > 0 else 1.0
-
-    # גזירת תוכנית מסחר דינמית לניהול סיכונים
-    stop_loss = round(current_price * 0.96, 2)   # סיכון של 4%
-    take_profit = round(current_price * 1.09, 2) # יעד רווח של 9%
-    risk = round(current_price - stop_loss, 2)
-    reward = round(take_profit - current_price, 2)
-    rr_ratio = round(reward / risk, 2) if risk > 0 else 0
-
-    return {
-        "symbol": symbol.upper(),
-        "price": current_price,
-        "rsi": rsi_val,
-        "sma20": sma20_val,
-        "vol_ratio": vol_ratio,
-        "entry": current_price,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "rr_ratio": rr_ratio,
-    }
-
-def get_latest_company_news(symbol: str):
-    """מושך את הכתבה העדכנית ביותר מ-Finnhub"""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    from_str = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-    
+def fetch_technical_signals(symbol: str) -> str:
+    """ניתוח טכני מעמיק מותאם למניות ישראליות ואמריקאיות"""
     try:
-        news_list = finnhub_client.company_news(symbol.upper(), _from=from_str, to=today_str)
-        if news_list and len(news_list) > 0:
-            top_news = news_list[0]
-            return {
-                "headline": top_news.get("headline", "אין כותרת"),
-                "summary": top_news.get("summary", "אין תקציר זמין"),
-                "source": top_news.get("source", "Finnhub News"),
-                "url": top_news.get("url", ""),
-            }
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="6mo")
+        if df.empty:
+            return f"אין נתונים עבור {symbol}"
+        
+        # חישוב אינדיקטורים באמצעות pandas-ta
+        df.ta.sma(length=20, append=True)
+        df.ta.sma(length=50, append=True)
+        df.ta.rsi(length=14, append=True)
+        df.ta.macd(append=True)
+        
+        latest = df.iloc[-1]
+        close_price = latest.get('Close', 0)
+        sma20 = latest.get('SMA_20', 0)
+        sma50 = latest.get('SMA_50', 0)
+        rsi = latest.get('RSI_14', 0)
+        
+        # Finviz עובד רק עבור מניות הרשומות בארה"ב (כולל ישראליות דואליות כמו TEVA, NICE)
+        finviz_info = ""
+        if not symbol.endswith(".TA"):
+            try:
+                fv_data = snapshot(symbol)
+                finviz_info = f"Finviz Volume/Rel Vol: {fv_data.get('Volume', 'N/A')} | {fv_data.get('Rel Volume', 'N/A')}"
+            except Exception:
+                pass
+
+        currency = "אג' / ש\"ח" if symbol.endswith(".TA") else "$"
+
+        return (
+            f"מחיר: {close_price:.2f} {currency}\n"
+            f"SMA20: {sma20:.2f} | SMA50: {sma50:.2f}\n"
+            f"RSI (14): {rsi:.2f}\n"
+            f"{finviz_info}"
+        )
     except Exception as e:
-        logger.error(f"Error fetching news from Finnhub: {e}")
-    return None
+        logger.error(f"Technical error for {symbol}: {e}")
+        return f"שגיאה בחישוב טכני: {e}"
 
-# ==========================================
-# 5. פקודות הבוט בטלגרם
-# ==========================================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_text = (
-        "🤖 **ברוכים הבאים לבוט המסחר והסייען הפיננסי!**\n\n"
-        "הבוט מחובר כעת לנתוני אמת של השוק ומשלב בינה מלאכותית (Gemini 2.5).\n\n"
-        "📌 **פקודות זמינות:**\n"
-        "• `/technical <SYMBOL>` - ניתוח טכני בלייב (דוגמה: `/technical NVDA`)\n"
-        "• `/news <SYMBOL>` - ניתוח חדשות וסנטימנט בלייב (דוגמה: `/news AAPL`)\n"
-        "• **טקסט חופשי** - שאל כל שאלה בנושאי שוק ההון ומסחר!"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+def fetch_live_news(symbol: str) -> str:
+    """איסוף חדשות מ-Finnhub ו-RSS (מנקה את סיומת .TA במידת הצורך)"""
+    news_list = []
+    clean_symbol = symbol.replace(".TA", "")
+    
+    # 1. Finnhub
+    if finnhub_client:
+        try:
+            res = finnhub_client.company_news(clean_symbol, _from="2026-08-01", to="2026-08-22")
+            for item in res[:3]:
+                news_list.append(f"- Finnhub: {item.get('headline')} ({item.get('summary')})")
+        except Exception as e:
+            logger.error(f"Finnhub error: {e}")
 
-async def technical_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """טיפול בפקודת ניתוח טכני בלייב"""
-    if not context.args:
-        await update.message.reply_text("❌ אנא ציין סימול מניה. דוגמה: `/technical TSLA`", parse_mode="Markdown")
-        return
+    # 2. RSS Feeds
+    try:
+        rss_url = f"https://finance.yahoo.com/rss/headline?s={symbol}"
+        feed = feedparser.parse(rss_url)
+        for entry in feed.entries[:2]:
+            news_list.append(f"- RSS: {entry.title}")
+    except Exception as e:
+        logger.error(f"RSS error: {e}")
 
-    symbol = context.args[0].upper()
-    await update.message.reply_text(f"📊 מושך נתוני אמת ומחשב אינדיקטורים עבור **{symbol}**...", parse_mode="Markdown")
+    return "\n".join(news_list) if news_list else "אין חדשות מתפרצות כעת."
 
-    data = get_live_technical_data(symbol)
-    if not data:
-        await update.message.reply_text(f"❌ לא ניתן היה למשוך נתונים עבור הסימול `{symbol}`. ודא שהסימול תקין.", parse_mode="Markdown")
-        return
+# ----------------------------------------------------
+# המנוע הראשי: סריקה אוטונומית ברקע (כולל מניות ישראליות)
+# ----------------------------------------------------
 
-    report = (
-        f"📊 **דוח ניתוח טכני בזמן אמת — ${data['symbol']}**\n"
-        f"───────\n"
-        f"💰 **מחיר נוכחי:** ${data['price']}\n"
-        f"📈 **אינדיקטורים (pandas-ta):**\n"
-        f"• **RSI (14):** {data['rsi']} " + ("(קניות יתר ⚠️)" if data['rsi'] > 70 else "(מכירות יתר 🟢)" if data['rsi'] < 30 else "(ניטרלי)") + "\n"
-        f"• **SMA (20):** ${data['sma20']} " + ("(מגמה עולה 🟢)" if data['price'] > data['sma20'] else "(מגמה יורדת 🔴)") + "\n"
-        f"• **יחס נפח מסחר:** x{data['vol_ratio']} מהממוצע\n\n"
-        f"🎯 **תוכנית עבודה וניהול סיכונים:**\n"
-        f"• **מחיר כניסה (Entry):** ${data['entry']}\n"
-        f"• **יעד רווח (Take Profit):** ${data['take_profit']}\n"
-        f"• **סטופ לוס (Stop Loss):** ${data['stop_loss']}\n"
-        f"• **יחס סיכון/סיכוי (R:R):** 1:{data['rr_ratio']}\n"
-    )
-    await update.message.reply_text(report, parse_mode="Markdown")
+async def autonomous_market_scan(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("⚡ מריץ סריקה אוטונומית (מניות אמריקאיות וישראליות)...")
+    
+    # רשימת מעקב משולבת: מניות ארה"ב + מניות ישראליות בארה"ב + מניות בבורסת תל אביב (.TA)
+    watchlist_symbols = [
+        # מניות ישראליות בבורסת ת"א
+        "POLI.TA", "DSCT.TA", "ICL.TA",
+        # מניות ישראליות הדואליות/אמריקאיות
+        "TEVA", "NICE", "WIX", "CHKP", "MNDY",
+        # מניות אמריקאיות מובילות
+        "NVDA", "AAPL", "TSLA"
+    ] 
+    
+    for symbol in watchlist_symbols:
+        tech_data = fetch_technical_signals(symbol)
+        news_data = fetch_live_news(symbol)
+        
+        prompt = (
+            f"אתה מנוע התראות מסחר אוטונומי בזמן אמת.\n"
+            f"נתח את הנתונים הבאים עבור המנייה {symbol}:\n"
+            f"נתונים טכניים (pandas-ta/yfinance):\n{tech_data}\n"
+            f"חדשות בלייב (Finnhub/RSS):\n{news_data}\n\n"
+            f"קבע אם יש אירוע חריג (כמו RSI קיצוני, פריצה, או חדשה בעלת אימפקט גבוה). "
+            f"אם יש אירוע חריג, נסח התראה קצרה, חדה ומעוצבת בעברית כולל המלצת פעולה וסיכון. "
+            f"אם אין שום דבר חריג, ענה במילה אחת בלבד: NONE."
+        )
+        
+        try:
+            response = model.generate_content(prompt)
+            result_text = response.text.strip()
+            
+            if "NONE" not in result_text and CHAT_ID:
+                alert_message = f"🚨 **התראת מסחר אוטונומית בזמן אמת [{symbol}]**\n\n{result_text}"
+                await context.bot.send_message(chat_id=CHAT_ID, text=alert_message, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Error in scan for {symbol}: {e}")
 
-async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """טיפול בפקודת ניתוח חדשות בלייב באמצעות Finnhub + Gemini"""
-    if not context.args:
-        await update.message.reply_text("❌ אנא ציין סימול מניה. דוגמה: `/news NVDA`", parse_mode="Markdown")
-        return
+# ----------------------------------------------------
+# מצב טסט (Test Mode)
+# ----------------------------------------------------
 
-    symbol = context.args[0].upper()
-    await update.message.reply_text(f"📰 מנטר חדשות אחרונות עבור **{symbol}** ומנתח בעזרת Gemini...", parse_mode="Markdown")
-
-    news_item = get_latest_company_news(symbol)
-    if not news_item:
-        await update.message.reply_text(f"ℹ️ לא נמצאו דיווחים חדשותיים ב-5 הימים האחרונים עבור `{symbol}`.", parse_mode="Markdown")
-        return
-
-    # ניתוח הידיעה בעזרת Gemini 2.5
+async def handle_test_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """פקודת טסט המריצה ניתוח על מנייה ישראלית לדוגמה"""
+    await update.message.reply_text("🧪 מריץ סימולציה מלאה של התראה עבור מנייה ישראלית...")
+    
+    test_symbol = "TEVA"  # או "POLI.TA" לבדיקת תל אביב
+    tech_data = fetch_technical_signals(test_symbol)
+    news_data = fetch_live_news(test_symbol)
+    
     prompt = (
-        f"אתה אנליסט מומחה בשוק ההון. נתח את הידיעה החדשותית הבאה עבור מניית {symbol}:\n\n"
-        f"כותרת: {news_item['headline']}\n"
-        f"תקציר: {news_item['summary']}\n"
-        f"מקור: {news_item['source']}\n\n"
-        f"הנפק תמצית קצרה בעברית הכוללת:\n"
-        f"1. ניתוח סנטימנט (חיובי/שלילי/ניטרלי והסבר קצר).\n"
-        f"2. הערכת עוצמת ההשפעה על המחיר בטווח הקצר.\n"
-        f"3. אזהרת סיכון FOMO במידה ורלוונטי."
+        f"אתה מנוע התראות מסחר. צור התראת טסט מעוצבת למנייה הישראלית {test_symbol} המבוססת על הנתונים הבאים:\n"
+        f"טכני: {tech_data}\n"
+        f"חדשות: {news_data}\n\n"
+        f"השתמש באימוג'ים, הדגש את השורה התחתונה, רמות תמיכה/תנגדות ורמת סיכון."
     )
-
+    
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-        ai_analysis = response.text
+        response = model.generate_content(prompt)
+        alert_msg = f"🧪 **[סימולציית התראה בזמן אמת - מנייה ישראלית]**\n\n{response.text}"
+        await update.message.reply_text(alert_msg, parse_mode='Markdown')
     except Exception as e:
-        logger.error(f"Gemini API Error: {e}")
-        ai_analysis = "לא ניתן היה להשלים את הניתוח האוטומטי."
+        await update.message.reply_text(f"שגיאה בהרצת הטסט: {e}")
 
-    report = (
-        f"📰 **ניתוח חדשות ואירועי מפתח — ${symbol}**\n"
-        f"───────\n"
-        f"📌 **כותרת:** {news_item['headline']}\n"
-        f"🏢 **מקור:** {news_item['source']}\n\n"
-        f"🤖 **ניתוח AI (Gemini 2.5):**\n"
-        f"{ai_analysis}\n\n"
-        f"🔗 [לקריאת הכתבה המלאה]({news_item['url']})"
+# ----------------------------------------------------
+# פקודות אופציונליות בלבד
+# ----------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "🤖 **מערכת התראות המסחר האוטונומית (ארה\"ב וישראל) פעילה!**\n\n"
+        "המערכת מנטרת את השוק ברקע ושולחת התראות בזמן אמת.\n\n"
+        "📌 **פקודות בדיקה:**\n"
+        "• `/test_alert` - הפעלת סימולציית התראה בלייב (מצב טסט)\n"
+        "• `/technical <SYMBOL>` - ניתוח טכני יזום (למשל `/technical TEVA` או `/technical POLI.TA`)\n"
+        "• `/news <SYMBOL>` - ניתוח חדשות יזום"
     )
-    await update.message.reply_text(report, parse_mode="Markdown", disable_web_page_preview=True)
+    await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """מענה לשאילתות טקסט חופשיות דרך Gemini"""
-    user_text = update.message.text
-    prompt = f"אתה סייען מסחר ושוק ההון מקצועי. ענה בקצרה, בדיוק ובעברית ברורה: {user_text}"
+async def handle_technical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("ציין סימול. דוגמה: `/technical TEVA` או `/technical POLI.TA`", parse_mode='Markdown')
+        return
+    symbol = context.args[0].upper()
+    data = fetch_technical_signals(symbol)
+    response = model.generate_content(f"סיכום טכני קצר בעברית עבור {symbol}:\n{data}")
+    await update.message.reply_text(f"📊 **{symbol} ניתוח טכני:**\n\n{response.text}", parse_mode='Markdown')
 
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-        await update.message.reply_text(response.text, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Error handling text message: {e}")
-        await update.message.reply_text("מצטער, נתקלתי בשגיאה בעיבוד הבקשה.")
+async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("ציין סימול. דוגמה: `/news TEVA`", parse_mode='Markdown')
+        return
+    symbol = context.args[0].upper()
+    data = fetch_live_news(symbol)
+    response = model.generate_content(f"סיכום חדשות וסנטימנט בעברית עבור {symbol}:\n{data}")
+    await update.message.reply_text(f"📰 **{symbol} חדשות:**\n\n{response.text}", parse_mode='Markdown')
 
-# ==========================================
-# 6. הפעלת השרת והבוט (Main Loop)
-# ==========================================
+# ----------------------------------------------------
+# הרצת השרת והמתזמן
+# ----------------------------------------------------
+
 def main():
-    # 1. הפעלת שרת ה-Flask בשרשור נפרד למניעת נתק ב-Render
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    logger.info("Flask Keep-Alive Server started successfully.")
+    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("test_alert", handle_test_alert))
+    tg_app.add_handler(CommandHandler("technical", handle_technical))
+    tg_app.add_handler(CommandHandler("news", handle_news))
 
-    # 2. אתחול מנוע APScheduler (מוכן למשימות מתתוזמנות)
-    scheduler = BackgroundScheduler()
-    scheduler.start()
+    job_queue = tg_app.job_queue
+    if job_queue:
+        # הרצה כל 5 דקות (300 שניות)
+        job_queue.run_repeating(autonomous_market_scan, interval=300, first=10)
 
-    # 3. אתחול והפעלת Telegram Application
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", start_command))
-    application.add_handler(CommandHandler("technical", technical_command))
-    application.add_handler(CommandHandler("news", news_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("Telegram Bot started listening for messages...")
-    application.run_polling()
+    logger.info("המערכת האוטונומית אותחלה בהצלחה ומנטרת מניות מ-US ו-TASE...")
+    tg_app.run_polling()
 
 if __name__ == "__main__":
     main()
