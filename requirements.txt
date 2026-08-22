@@ -8,3 +8,6 @@ requests
 finvizfinance
 pandas
 google-generativeai
+pandas-ta
+finnhub-python
+apscheduler
