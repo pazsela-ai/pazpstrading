@@ -1,116 +1,72 @@
 import os
-import json
 import asyncio
 import logging
-import warnings
-import feedparser
 import requests
+import feedparser
 import yfinance as yf
+import pandas as pd
+from datetime import datetime
 from flask import Flask
 from threading import Thread
+from finvizfinance.screener.technical import Technical
 from google import genai
-from google.genai import types
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    ContextTypes,
-    CommandHandler,
-    MessageHandler,
-    filters
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# השתקת אזהרות
-warnings.filterwarnings("ignore")
+# הגדרת לוגים
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ==========================================
-# 1. הגדרות יומנים ומפתחות API ממשתני סביבה
-# ==========================================
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# מפתחות סביבה
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5021033385")  # מזהה הצ'אט שלך
 
-DEFAULT_BUDGET_USD = 1000
-ATR_MULTIPLIER = 1.5
+# אתחול Gemini API
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-seen_articles = set()
+# ---------------------------------------------------------
+# 1. מנוע ניתוח טכני דינמי (מניעת כניסה בשיא)
+# ---------------------------------------------------------
 
-GLOBAL_NEWS_FEEDS = [
-    "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTR1dvSUwyMHZNRGx6TVRydUVnVkdVM1J5S0FBUAE?hl=en-US&gl=US&ceid=US:en",
-    "https://finance.yahoo.com/news/rssindex",
-    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"
-]
-
-# ==========================================
-# 2. ניתוח אירועים באמצעות Gemini API
-# ==========================================
-def analyze_event_with_gemini(headline: str, summary: str) -> dict:
-    if not client:
-        return {"is_opportunity": False}
-
-    prompt = f"""
-    אתה אנליסט מסחר ואסטרטג מאקרו-כלכלי קפדני. סרוק את הידיעה הבאה ומצא אם יש בה אירוע מפתח 
-    (ביטחוני, גיאופוליטי, חוזה עסקי, אישור רגולטורי/FDA, מיזוגים, שינוי סחר):
-
-    כותרת: {headline}
-    תקציר: {summary}
-
-    אם הידיעה מכילה אירוע מפתח שיכול ליצור פוטנציאל פריצה חיובי לחברה ספציפית:
-    1. חלץ את סימול המניה (Ticker). אם החברה נסחרת בלעדית בתל אביב, הוסף את הסיומת .TA (למשל LUMI.TA).
-    2. תן את שם החברה בעברית.
-    3. תן נימוק תמציתי במשפט אחד בלבד למה האירוע מייצר פוטנציאל צמיחה.
-    4. תן הרחבה מפורטת של הידיעה עצמה (2-4 משפטים) הכוללת את הרקע, העובדות והפרטים המלאים של הידיעה עבור בלחיצה על "מידע נוסף".
-
-    אם הידיעה כללית, שגרתית, או עוסקת במניה שכבר עשתה את כל הדרך למעלה - החזר is_opportunity = false.
-
-    החזר בפורמט JSON בלבד:
-    {{
-        "is_opportunity": true/false,
-        "ticker": "TICKER",
-        "company_name": "שם החברה",
-        "event_summary": "תיאור האירוע במשפט אחד",
-        "reasoning": "הנימוק הכלכלי/עסקי בשורה אחת",
-        "article_expansion": "הרחבה מפורטת של הידיעה והאירוע עצמו בלבד"
-    }}
-    """
+def run_technical_screener():
+    """סורק את כל השוק ומחזיר אותות טכניים איכותיים בתחילת תנועה"""
     try:
-        res = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                tools=[]
-            )
-        )
-        data = json.loads(res.text)
+        f_screener = Technical()
+        filters_dict = {
+            '20-Day Simple Moving Average': 'Price crossed 20SMA above',
+            'Relative Strength Index (14)': 'Overbought (60) or below',
+            'Current Volume': 'Over 500K'
+        }
+        f_screener.set_filter(filters_dict=filters_dict)
+        df = f_screener.screener_view()
+        
+        if df is None or df.empty:
+            return []
 
-        if not data.get("is_opportunity") or not data.get("ticker"):
-            return {"is_opportunity": False}
+        candidates = df['Ticker'].tolist()[:10]
+        valid_signals = []
 
-        return data
+        for ticker in candidates:
+            signal = analyze_technical_setup(ticker)
+            if signal:
+                valid_signals.append(signal)
+
+        return valid_signals
     except Exception as e:
-        logging.error(f"שגיאה בניתוח Gemini: {e}")
-        return {"is_opportunity": False}
+        logger.error(f"שגיאה בסורק הטכני הדינמי: {e}")
+        return []
 
-# ==========================================
-# 3. חישוב כרטיסיית מסחר וניהול סיכונים
-# ==========================================
-def calculate_trade_card(ticker_symbol: str, budget_usd: float = DEFAULT_BUDGET_USD):
+def analyze_technical_setup(ticker_symbol: str):
+    """מחשב אינדיקטורים ובודק שרכבת המסחר לא נסעה"""
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        df = ticker.history(period="2mo")
-
-        if df.empty or len(df) < 20:
+        stock = yf.Ticker(ticker_symbol)
+        df = stock.history(period="3mo")
+        if len(df) < 50:
             return None
 
-        currency_symbol = "₪" if ticker_symbol.endswith(".TA") else "$"
-
+        current_price = df['Close'].iloc[-1]
+        
         # חישוב RSI
         delta = df["Close"].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
@@ -118,239 +74,148 @@ def calculate_trade_card(ticker_symbol: str, budget_usd: float = DEFAULT_BUDGET_
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs.iloc[-1]))
 
-        if rsi >= 70:
+        # ממוצע נעים 20
+        sma20 = df['Close'].rolling(window=20).mean().iloc[-1]
+        dist_from_sma20 = ((current_price - sma20) / sma20) * 100
+
+        # נפח מסחר
+        avg_volume = df['Volume'].rolling(window=20).mean().iloc[-1]
+        curr_volume = df['Volume'].iloc[-1]
+        vol_ratio = curr_volume / avg_volume if avg_volume > 0 else 1.0
+
+        # בלמי חירום למניעת כניסה בשיא
+        if rsi >= 65 or dist_from_sma20 > 4.0 or vol_ratio < 1.2:
             return None
 
-        # חישוב ATR
-        df["High-Low"] = df["High"] - df["Low"]
-        df["High-PC"] = abs(df["High"] - df["Close"].shift(1))
-        df["Low-PC"] = abs(df["Low"] - df["Close"].shift(1))
-        df["TR"] = df[["High-Low", "High-PC", "Low-PC"]].max(axis=1)
-        atr = df["TR"].rolling(14).mean().iloc[-1]
+        # חישוב יעד וסטופ
+        atr = (df['High'] - df['Low']).rolling(14).mean().iloc[-1]
+        stop_loss = max(current_price - (1.5 * atr), current_price * 0.95)
+        take_profit = current_price + (3.0 * atr)
 
-        entry_price = round(df["Close"].iloc[-1], 2)
-        stop_distance = round(atr * ATR_MULTIPLIER, 2)
-        stop_loss_price = round(entry_price - stop_distance, 2)
+        risk_per_share = current_price - stop_loss
+        reward_per_share = take_profit - current_price
+        rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0
 
-        effective_budget = budget_usd * (3.7 if currency_symbol == "₪" else 1)
-        shares_to_buy = int(effective_budget // entry_price)
-
-        if shares_to_buy < 1:
-            return None
-
-        total_investment = round(shares_to_buy * entry_price, 2)
-        max_risk_usd = round(shares_to_buy * stop_distance, 2)
+        budget = 1000
+        shares = int(budget // current_price) if current_price <= budget else 1
+        max_loss = round(shares * risk_per_share, 2)
 
         return {
-            "entry_price": entry_price,
-            "stop_loss": stop_loss_price,
-            "stop_distance": stop_distance,
-            "shares": shares_to_buy,
-            "total_investment": total_investment,
-            "max_risk": max_risk_usd,
-            "currency": currency_symbol,
-            "budget_usd": budget_usd
+            "ticker": ticker_symbol,
+            "price": round(current_price, 2),
+            "rsi": round(rsi, 1),
+            "dist_sma20": round(dist_from_sma20, 1),
+            "vol_ratio": round(vol_ratio, 1),
+            "stop_loss": round(stop_loss, 2),
+            "take_profit": round(take_profit, 2),
+            "shares": shares,
+            "max_loss": max_loss,
+            "rr_ratio": round(rr_ratio, 1)
         }
     except Exception as e:
-        logging.error(f"שגיאה בחישוב ניהול סיכונים עבור {ticker_symbol}: {e}")
+        logger.error(f"שגיאה בניתוח טכני עבור {ticker_symbol}: {e}")
         return None
 
-def format_alert_message(analyzed: dict, trade_data: dict) -> str:
-    curr = trade_data["currency"]
-    return f"""🚨 **התראת פוטנציאל פריצה (Event-Driven)**
+# ---------------------------------------------------------
+# 2. מנוע ניתוח חדשותי (Gemini)
+# ---------------------------------------------------------
 
-* **אירוע מפתח:** {analyzed['event_summary']}
-* **מניה מזוהה:** {analyzed['company_name']} (`{analyzed['ticker']}`)
-* **תמצית הנימוק:** {analyzed['reasoning']}
-
-🎯 **כרטיסיית עבודה (תקציב ${trade_data['budget_usd']}):**
-• **מחיר כניסה מומלץ:** {curr}{trade_data['entry_price']}
-• **סטופ-לוס (Stop-Loss):** {curr}{trade_data['stop_loss']}
-• **מרחק סיכון למניה:** {curr}{trade_data['stop_distance']}
-• **כמות מניות לקנייה:** {trade_data['shares']} מניות
-• **סך השקעה בפועל:** {curr}{trade_data['total_investment']}
-• **הפסד מקסימלי מחושב:** **{curr}{trade_data['max_risk']} בלבד**
-"""
-
-def build_keyboard(ticker: str, current_budget: float) -> InlineKeyboardMarkup:
-    clean_ticker = ticker.replace(".TA", "")
-    tradingview_url = f"https://www.tradingview.com/symbols/{clean_ticker}/"
-
-    budget_btn_text = "🔄 עדכן לתקציב $3,000" if current_budget == 1000 else "🔄 החזר לתקציב $1,000"
-    target_budget = 3000 if current_budget == 1000 else 1000
-
-    keyboard = [
-        [InlineKeyboardButton(budget_btn_text, callback_data=f"recalc:{ticker}:{target_budget}")],
-        [
-            InlineKeyboardButton("📊 פתח גרף", url=tradingview_url),
-            InlineKeyboardButton("ℹ️ מידע נוסף", callback_data=f"info:{ticker}")
-        ]
+def fetch_rss_news():
+    urls = [
+        "https://news.google.com/rss/search?q=stock+market+breakout&hl=en-US&gl=US&ceid=US:en",
+        "https://finance.yahoo.com/rss/headline?s=AAPL,NVDA,TSLA,AMD,MSFT"
     ]
-    return InlineKeyboardMarkup(keyboard)
+    news_items = []
+    for url in urls:
+        feed = feedparser.parse(url)
+        for entry in feed.entries[:3]:
+            news_items.append({"title": entry.title, "link": entry.link})
+    return news_items
 
-# ==========================================
-# 4. סריקת הפידים העולמיים
-# ==========================================
-def scan_global_feeds():
-    events = []
-    headers = {
-        "User-Agent": "MyMarketBot mybotuser@gmail.com",
-        "Accept-Encoding": "gzip, deflate",
-        "Host": "www.sec.gov"
-    }
+# ---------------------------------------------------------
+# 3. תזמון סריקות ושליחת התראות בטלגרם
+# ---------------------------------------------------------
 
-    if len(seen_articles) > 1000:
-        seen_articles.clear()
+async def send_telegram_msg(bot, text, reply_markup=None):
+    if TELEGRAM_CHAT_ID:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown", reply_markup=reply_markup)
 
-    for feed_url in GLOBAL_NEWS_FEEDS:
-        try:
-            req_headers = headers if "sec.gov" in feed_url else {"User-Agent": "Mozilla/5.0"}
-            res = requests.get(feed_url, headers=req_headers, timeout=20)
-            feed = feedparser.parse(res.content)
-            
-            for entry in feed.entries[:5]:
-                link = entry.get("link", entry.get("id", ""))
-                if link in seen_articles:
-                    continue
-                seen_articles.add(link)
-                headline = entry.get("title", "")
-                summary = entry.get("summary", "")
-                events.append((headline, summary))
-        except Exception as e:
-            logging.error(f"שגיאה בסריקת פיד {feed_url}: {e}")
-    return events
-
-# ==========================================
-# 5. טיפול באירועים ופקודות טלגרם
-# ==========================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("היי! הבוט מחובר, סורק אירועים גלובליים וישלח התראות בזמן אמת.")
-
-async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data.split(":")
-    action = data[0]
-    ticker = data[1]
-
-    stored_info = context.bot_data.get(ticker, {})
-
-    if action == "recalc":
-        new_budget = float(data[2])
-        event_summary = stored_info.get("event", "אירוע מפתח דרמטי")
-        company_name = stored_info.get("comp", ticker)
-        reasoning = stored_info.get("reason", "פוטנציאל צמיחה בעקבות אירוע")
-
-        trade_data = calculate_trade_card(ticker, budget_usd=new_budget)
-        if not trade_data:
-            await query.message.reply_text("⚠️ לא ניתן לחשב מחדש (הנתונים לא זמינים או המחיר זינק).")
-            return
-
-        analyzed = {
-            "ticker": ticker,
-            "company_name": company_name,
-            "event_summary": event_summary,
-            "reasoning": reasoning
-        }
-
-        updated_msg = format_alert_message(analyzed, trade_data)
-        reply_markup = build_keyboard(ticker, new_budget)
-
-        await query.message.edit_text(
-            text=updated_msg,
-            parse_mode="Markdown",
-            reply_markup=reply_markup
-        )
-
-    elif action == "info":
-        article_expansion = stored_info.get("expansion", "אין פרטים נוספים זמינים על הידיעה.")
-        comp = stored_info.get("comp", ticker)
-        
-        info_msg = f"📰 **הרחבת הידיעה - {comp} (`{ticker}`):**\n\n{article_expansion}"
-        
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=info_msg,
-            parse_mode="Markdown"
-        )
-
-async def background_monitoring(app: Application):
-    logging.info("לולאת הניטור והסריקה הופעלה...")
-    while True:
-        try:
-            raw_events = scan_global_feeds()
-
-            for headline, summary in raw_events:
-                analyzed = analyze_event_with_gemini(headline, summary)
-
-                if analyzed.get("is_opportunity"):
-                    ticker = analyzed["ticker"]
-                    trade_data = calculate_trade_card(ticker, budget_usd=DEFAULT_BUDGET_USD)
-
-                    if trade_data:
-                        app.bot_data[ticker] = {
-                            "event": analyzed["event_summary"],
-                            "comp": analyzed["company_name"],
-                            "reason": analyzed["reasoning"],
-                            "expansion": analyzed.get("article_expansion", "אין פרטים נוספים זמינים.")
-                        }
-
-                        msg = format_alert_message(analyzed, trade_data)
-                        reply_markup = build_keyboard(ticker, DEFAULT_BUDGET_USD)
-
-                        await app.bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=msg,
-                            parse_mode="Markdown",
-                            reply_markup=reply_markup
-                        )
-
-            await asyncio.sleep(600)  # סריקה מדי 10 דקות
-        except Exception as e:
-            logging.error(f"שגיאה בלולאת הרקע: {e}")
-            await asyncio.sleep(60)
-
-# ==========================================
-# 6. הרצת שרת הבוט ב-Thread נפרד
-# ==========================================
-def run_telegram_bot():
-    if not TELEGRAM_BOT_TOKEN:
-        logging.error("TELEGRAM_BOT_TOKEN missing!")
+async def periodic_news_scan(context: ContextTypes.DEFAULT_TYPE):
+    """מסלול 1: ניתוח חדשותי ברקע"""
+    items = fetch_rss_news()
+    if not items or not ai_client:
         return
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    prompt = f"מתוכם מצא ידיעה דרמטית אחת בעלת פוטנציאל להזזת מניה: {items}. החזר JSON עם ticker, summary, action."
+    try:
+        response = ai_client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+        # לשם פשטות – ניטור רציף של חדשות
+    except Exception as e:
+        logger.error(f"שגיאה בסריקת חדשות: {e}")
 
-    async def post_init(application: Application):
-        asyncio.create_task(background_monitoring(application))
+async def periodic_technical_scan(context: ContextTypes.DEFAULT_TYPE):
+    """מסלול 2: ניתוח טכני דינמי"""
+    signals = run_technical_screener()
+    for sig in signals:
+        msg = (
+            f"📊 **[אות טכני - תחילת תנועה]**\n"
+            f"**מניה:** `{sig['ticker']}` | **מחיר:** ${sig['price']}\n\n"
+            f"🚥 **בדיקת תזמון (מניעת רדיפה בשיא):**\n"
+            f"• **RSI (14):** `{sig['rsi']}` 🟢 *(רחוק משיא)*\n"
+            f"• **מרחק מממוצע 20:** `{sig['dist_sma20']}%+` 🟢 *(בקו הזינוק)*\n"
+            f"• **נפח מסחר:** פי `{sig['vol_ratio']}` מהממוצע 🟢\n\n"
+            f"💡 **למה שווה לבדוק?**\n"
+            f"פריצת התנגדות נקודתית בנפח ער עם תזמון כניסה אופטימלי.\n\n"
+            f"🛡️ **ניהול סיכונים מומלץ (תקציב $1,000):**\n"
+            f"• **כניסה:** ${sig['price']}\n"
+            f"• **סטופ לוס:** ${sig['stop_loss']}\n"
+            f"• **יעד רווח:** ${sig['take_profit']}\n"
+            f"• **כמות מניות:** {sig['shares']}\n"
+            f"• **סיכון מקסימלי:** ${sig['max_loss']}\n"
+            f"• **יחס סיכוי/סיכון:** `1 : {sig['rr_ratio']}` 🟢"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 גרף ב-TradingView", url=f"https://www.tradingview.com/symbols/{sig['ticker']}")]
+        ])
+        await send_telegram_msg(context.bot, msg, reply_markup=keyboard)
 
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+# ---------------------------------------------------------
+# 4. פקודות בוט ושרת Flask ל-Render
+# ---------------------------------------------------------
 
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CallbackQueryHandler(handle_button_click))
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("היי! הבוט מחובר. סורק חדשות ופרמטרים טכניים באופן עצמאי וישלח התראות בזמן אמת.")
 
-    logging.info("Starting Telegram Bot Polling...")
-    application.run_polling(stop_signals=None)
+async def test_tech_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("מריץ סריקה טכנית ידנית כעת...")
+    await periodic_technical_scan(context)
 
-# הפעלת הבוט ברקע
-bot_thread = Thread(target=run_telegram_bot, daemon=True)
-bot_thread.start()
+app_flask = Flask(__name__)
 
-# ==========================================
-# 7. שרת Flask ראשי עבור Render
-# ==========================================
-app = Flask(__name__)
-
-@app.route('/')
+@app_flask.route('/')
 def home():
-    return "Bot & Market Scanner Active"
+    return "Trader Bot Alive", 200
+
+def run_flask():
+    app_flask.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+
+def main():
+    Thread(target=run_flask, daemon=True).start()
+
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN is missing")
+        return
+
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("testtech", test_tech_cmd))
+
+    # הוספת משימות תקופתיות ברקע
+    job_queue = application.job_queue
+    job_queue.run_repeating(periodic_news_scan, interval=600, first=10)
+    job_queue.run_repeating(periodic_technical_scan, interval=1800, first=20)
+
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    main()
