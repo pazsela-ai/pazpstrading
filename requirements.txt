@@ -11,3 +11,4 @@ google-generativeai
 pandas-ta
 finnhub-python
 apscheduler
+deep-translator
