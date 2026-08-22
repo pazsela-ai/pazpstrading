@@ -15,18 +15,17 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# הגדרת לוגים לקבלת אינדיקציה על פעילות הבוט ברקע
+# הגדרת לוגים
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# מזהה הצ'אט/ערוץ שאליו הבוט ישלח את ההתראות האוטומטיות
-# (אם הוגדר משתנה סביבה CHAT_ID הוא יילקח ממנו)
+# CHAT_ID יעד להתראות אוטומטיות
 TARGET_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# רשימת מעקב יסודית לסריקה אוטומטית (ניתן להרחיב כרצונך)
+# רשימת מעקב לסריקה אוטומטית
 WATCHLIST = ["AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "GOOGL", "META", "MRNA", "PLTR"]
 
 # ==========================================
@@ -34,7 +33,7 @@ WATCHLIST = ["AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "GOOGL", "META", "MR
 # ==========================================
 
 def translate_to_hebrew(text: str) -> str:
-    """מתרגם טקסט מאנגלית לעברית בעזרת deep_translator"""
+    """מתרגם טקסט מאנגלית לעברית"""
     try:
         if not text or not text.strip():
             return text
@@ -55,7 +54,7 @@ def build_action_keyboard(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def calculate_rsi(series, period=14):
-    """חישוב RSI בסיסי"""
+    """חישוב RSI"""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -73,7 +72,6 @@ def generate_full_analysis_report(symbol: str) -> dict:
     symbol = symbol.upper()
     ticker = yf.Ticker(symbol)
     
-    # 1. משיכת נתוני מחיר וגרף
     hist = ticker.history(period="1mo")
     if hist.empty or len(hist) < 20:
         return {"has_data": False, "symbol": symbol}
@@ -82,18 +80,15 @@ def generate_full_analysis_report(symbol: str) -> dict:
     volume_today = float(hist['Volume'].iloc[-1])
     avg_volume = float(hist['Volume'].mean())
 
-    # חישוב RSI ו-SMA20
     hist['RSI'] = calculate_rsi(hist['Close'])
     rsi_value = float(hist['RSI'].dropna().iloc[-1]) if not hist['RSI'].dropna().empty else 50.0
     sma20_value = float(hist['Close'].rolling(window=20).mean().iloc[-1])
 
-    # 2. גזירת תוכנית מסחר מוגדרת וניהול סיכונים
     entry_price = round(current_price, 2)
-    take_profit = round(current_price * 1.06, 2)  # יעד רווח 6%
-    stop_loss = round(current_price * 0.97, 2)    # קטיעת הפסד 3%
+    take_profit = round(current_price * 1.06, 2)
+    stop_loss = round(current_price * 0.97, 2)
     risk_reward = "1:2.0"
 
-    # 3. משיכת חדשות וניתוח סנטימנט
     news_items = ticker.news if hasattr(ticker, "news") else []
     pos_keywords = ["breakthrough", "win", "surges", "soars", "beat", "growth", "deal", "approval", "fda", "buy", "upgrade"]
     neg_keywords = ["lawsuit", "investigation", "drop", "decline", "miss", "risk", "cut", "downgrade", "bankrupt", "loss"]
@@ -112,13 +107,11 @@ def generate_full_analysis_report(symbol: str) -> dict:
                 if kw in title_lower: neg_score += 1.5
             translated_titles.append(translate_to_hebrew(raw_title))
 
-    # סינון סיכון FOMO וסנטימנט
     is_fomo_risk = rsi_value > 72
     fomo_text = "⚠️ **סיכון FOMO גבוה:** המנייה במתיחת יתר (RSI גבוה), מומלץ להמתין לממשו" if is_fomo_risk else "✅ **רמת סיכון FOMO:** תקינה לכניסה"
 
     news_summary_text = " • " + "\n • ".join(translated_titles) if translated_titles else "אין חדשות מהותיות כרגע"
 
-    # בניית ההודעה המעוצבת לפי המפרט
     msg = (
         f"🚨 **התראת סורק אוטומטית - זיהוי מומנטום עבור {symbol}**\n"
         f"───────────────────────\n\n"
@@ -138,7 +131,6 @@ def generate_full_analysis_report(symbol: str) -> dict:
         f"🛡️ {fomo_text}\n"
     )
 
-    # התנאי להקפצת התראה אוטומטית: נפח גבוה / RSI במומנטום / סנטימנט חיובי
     is_alert_triggered = (volume_today > avg_volume * 1.1) or (pos_score > neg_score) or (rsi_value > 60)
 
     return {
@@ -158,10 +150,9 @@ async def auto_market_scanner_job(app: Application):
     """
     logger.info("🔍 מתחיל סריקת שוק אוטומטית ברקע...")
     
-    # אם לא הגדרת CHAT_ID ספציפי, הבוט לא יוכל לדעת למי להקפיץ
     global TARGET_CHAT_ID
     if not TARGET_CHAT_ID:
-        logger.warning("לא הוגדר TELEGRAM_CHAT_ID, הסורק פועל במצב בדיקה בלבד.")
+        logger.warning("לא הוגדר TELEGRAM_CHAT_ID. שלח /start לבוט בטלגרם כדי לקשר אותו אליך.")
         return
 
     for symbol in WATCHLIST:
@@ -178,7 +169,6 @@ async def auto_market_scanner_job(app: Application):
                     reply_markup=reply_markup,
                     disable_web_page_preview=True
                 )
-                # השהייה קלה למניעת הצפה
                 await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"שגיאה בסריקת {symbol}: {e}")
@@ -195,7 +185,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_text = (
         "👋 **ברוכים הבאים לסייען המסחר הפיננסי האוטומטי!**\n\n"
         "🤖 **הבוט מנטר כעת את השוק ברקע באופן אוטומטי.**\n"
-        "ברגע שפותו טריגרים (קפיצות נפח, מומנטום או חדשות חמות) - תקבל התראה קופצת בזמן אמת!\n\n"
+        "ברגע שזוהו טריגרים (קפיצות נפח, מומנטום או חדשות חמות) - תקבל התראה קופצת בזמן אמת!\n\n"
         "💡 **פקודות סימולציה/טסטים ידניות:**\n"
         "• `/news MRNA` - ניתוח חדשותי נקודתי\n"
         "• `/scan` - הפעלת סריקה אקטיבית מידית על רשימת המעקב"
@@ -231,22 +221,12 @@ async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 # ==========================================
-# הפעלת הבוט וה-Scheduler
+# הוספת ה-Scheduler בתוך ה-Event Loop של Telegram
 # ==========================================
 
-def main():
-    TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
-
-    application = Application.builder().token(TOKEN).build()
-
-    # רישום פקודות ידניות / טסטים
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("scan", handle_manual_scan))
-    application.add_handler(CommandHandler("news", handle_news))
-
-    # הגדרת ה-APScheduler לסריקות אוטומטיות ברקע
+async def post_init(application: Application) -> None:
+    """פונקציה זו רצה מיד לאחר שלולאת האירועים הופעלה בהצלחה"""
     scheduler = AsyncIOScheduler()
-    # הסורק ירוץ באופן אוטומטי כל 15 דקות ברקע
     scheduler.add_job(
         auto_market_scanner_job, 
         'interval', 
@@ -254,8 +234,18 @@ def main():
         args=[application]
     )
     scheduler.start()
+    logger.info("🤖 APScheduler הופעל בהצלחה בתוך לולאת האירועים הראשיות!")
 
-    logger.info("🤖 הבוט והסורק האוטומטי ברקע הופעלו בהצלחה!")
+def main():
+    TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+
+    application = Application.builder().token(TOKEN).post_init(post_init).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("scan", handle_manual_scan))
+    application.add_handler(CommandHandler("news", handle_news))
+
+    logger.info("🤖 הבוט עולה לאוויר...")
     application.run_polling()
 
 if __name__ == "__main__":
