@@ -12,7 +12,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-import google.generativeai as genai
+from google import genai
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ---------------------------------------------------------
@@ -37,13 +37,14 @@ if not GEMINI_API_KEY:
     logger.error("GEMINI_API_KEY is missing!")
 
 # ---------------------------------------------------------
-# 3. הגדרת Google Gemini API
+# 3. הגדרת Google Gemini Client
 # ---------------------------------------------------------
+ai_client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-else:
-    model = None
+    try:
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        logger.error(f"Failed to initialize Gemini Client: {e}")
 
 # ---------------------------------------------------------
 # 4. הגדרת שרת Flask (Keep-Alive עבור Render)
@@ -84,7 +85,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
         "📌 **מפתח פקודות:**\n\n"
         "• `/test_technical` - מציג ניתוח טכני מלא לדוגמה (RSI, ממוצעים, נפח, יעד וסטופ).\n"
-        "• `/test_news` - מציג ניתוח חדשותי לדוגמה (אירוע קטליזטור, סנטימנט וסינון FOMO).\n"
+        "• `/test_news` - מציג ניתוח חדשותי לדוגמה (אירוע קטליזטור, סנטימנט, FOMO ותוכנית מסחר מלאה).\n"
         "• שלח/י לי טקסט חופשי או סימול מניה ואענה באמצעות Gemini."
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
@@ -121,45 +122,69 @@ async def test_technical(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def test_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """פקודת טסט לניתוח חדשותי סימולטיבי"""
+    """פקודת טסט לניתוח חדשותי סימולטיבי המשולב עם תוכנית עבודה מעשית"""
     news_items = [
         {
             "ticker": "AMZN",
+            "name": "Amazon.com Inc",
             "headline": "אמזון מודיעה על שיתוף פעולה אסטרטגי בתחום תשתיות AI ועננים",
             "source": "Bloomberg",
             "impact": "חיובי חזק (High Impact)",
             "fomo_risk": "נמוך - המניה בתחילת תנועה, טרם הגיעה לשיא",
-            "summary": "החוזה כולל התחייבות לרכישת שירותי ענן בהיקף של 5 מיליארד דולר על פני 3 שנים, צפוי להעלות את התחזית לרבעון הבא."
+            "summary": "החוזה כולל התחייבות לרכישת שירותי ענן בהיקף של 5 מיליארד דולר על פני 3 שנים, צפוי להעלות את התחזית לרבעון הבא.",
+            "price": 178.20,
+            "entry": 178.50,
+            "target": 198.00,
+            "stop": 171.00
         },
         {
             "ticker": "MSFT",
+            "name": "Microsoft Corp",
             "headline": "מיקרוסופט מציגה גידול של 28% בהכנסות מחטיבת הענן",
             "source": "Reuters",
             "impact": "חיובי בינוני (Medium Impact)",
             "fomo_risk": "בינוני - מומלץ להמתין למעקב נפח במסחר הסדיר",
-            "summary": "התוצאות עברו את תחזיות האנליסטים בוול סטריט. התגובה במסחר המוקדם מתונה."
+            "summary": "התוצאות עברו את תחזיות האנליסטים בוול סטריט. התגובה במסחר המוקדם מתונה.",
+            "price": 425.00,
+            "entry": 426.00,
+            "target": 460.00,
+            "stop": 412.00
         },
         {
             "ticker": "GOOGL",
+            "name": "Alphabet Inc",
             "headline": "אישור רגולטורי באירופה להרחבת שירותי ה-Autonomous Driving",
             "source": "CNBC",
             "impact": "חיובי לטווח קצר/בינוני",
             "fomo_risk": "נמוך - זיהוי מוקדם של הודעת המפתח",
-            "summary": "האישור מאפשר תחילת ניסויים מסחריים ב-3 ערים מרכזיות באירופה החל מהרבעון הרביעי."
+            "summary": "האישור מאפשר תחילת ניסויים מסחריים ב-3 ערים מרכזיות באירופה החל מהרבעון הרביעי.",
+            "price": 165.40,
+            "entry": 165.80,
+            "target": 182.00,
+            "stop": 158.50
         }
     ]
     
     item = random.choice(news_items)
+    potential_gain = round(((item['target'] - item['entry']) / item['entry']) * 100, 1)
+    max_loss = round(((item['entry'] - item['stop']) / item['entry']) * 100, 1)
+    risk_reward = round((item['target'] - item['entry']) / (item['entry'] - item['stop']), 2)
 
     msg = (
         "⚠️ **טסט בלבד**\n\n"
-        f"📰 **דו\"ח ניתוח חדשות ואירועי מפתח - {item['ticker']}**\n"
+        f"📰 **דו\"ח ניתוח חדשות ואירועי מפתח - {item['ticker']} ({item['name']})**\n"
         "───────────────────────\n"
         f"📣 **כותרת:** {item['headline']}\n"
         f"🌐 **מקור:** {item['source']}\n"
         f"💥 **השפעה משוערת:** {item['impact']}\n"
         f"🛡️ **סינון סיכון FOMO:** {item['fomo_risk']}\n\n"
-        f"📝 **תמצית הדיווח:**\n{item['summary']}\n\n"
+        f"📝 **תמצית הדיווח והניתוח:**\n{item['summary']}\n\n"
+        "🎯 **תוכנית עבודה נגזרת (ניהול סיכונים):**\n"
+        f"• **מחיר נוכחי:** ${item['price']}\n"
+        f"• **נקודת כניסה מומלצת (Entry):** ${item['entry']}\n"
+        f"• **מחיר יעד (Take Profit):** ${item['target']} (+{potential_gain}%)\n"
+        f"• **קטיעת הפסד (Stop Loss):** ${item['stop']} (-{max_loss}%)\n"
+        f"• **יחס סיכון/סיכוי (R:R):** 1:{risk_reward}\n\n"
         "⚙️ *הערה: הנתונים המופקים לעיל הם לצורכי בדיקת המערכת בלבד.*"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -168,12 +193,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """טיפול בהודעות טקסט רגילות בעזרת Gemini"""
     user_text = update.message.text
 
-    if not model:
+    if not ai_client:
         await update.message.reply_text("מפתח Gemini API אינו מוגדר. אנא בדוק/י את משתני הסביבה.")
         return
 
     try:
-        response = model.generate_content(user_text)
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=user_text,
+        )
         bot_response = response.text if response and response.text else "לא התקבלה תשובה מ-Gemini."
         await update.message.reply_text(bot_response)
     except Exception as e:
