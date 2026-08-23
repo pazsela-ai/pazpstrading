@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import threading
+import requests
 import yfinance as yf
 from flask import Flask
 from deep_translator import GoogleTranslator
@@ -27,9 +28,6 @@ logger = logging.getLogger(__name__)
 
 # CHAT_ID יעד להתראות אוטומטיות
 TARGET_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# רשימת מעקב לסריקה אוטומטית
-WATCHLIST = ["AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "GOOGL", "META", "MRNA", "PLTR"]
 
 # שער חליפין משוער (USD to ILS) לחישובי המחשבון
 USD_TO_ILS = 3.65
@@ -91,7 +89,7 @@ def calculate_rsi(series, period=14):
 
 def generate_full_analysis_report(symbol: str) -> dict:
     """
-    מנתח מנייה באופן מקיף ומפיק את תבנית התוצר האחידה והקבועה לכל סוגי הסריקות.
+    מנתח מנייה באופן מקיף ומפיק את תבנית התוצר האחידה והקבועה.
     """
     symbol = symbol.upper()
     ticker = yf.Ticker(symbol)
@@ -113,13 +111,13 @@ def generate_full_analysis_report(symbol: str) -> dict:
         take_profit = round(current_price * 1.06, 2)
         stop_loss = round(current_price * 0.97, 2)
 
-        # ניתוח חדשות מקיף (כללי, כלכלי, ביטחוני, טכנולוגי, רגולטורי ועוד)
+        # ניתוח חדשות מקיף (דוחות, אירועים כלכליים, רגולציה, טכנולוגיה, ביטחון)
         news_items = ticker.news if hasattr(ticker, "news") else []
         
         pos_keywords = [
             "breakthrough", "win", "surges", "soars", "beat", "growth", "deal", "approval", 
             "fda", "defense", "contract", "buy", "record", "profit", "expansion", "bullish", 
-            "partnership", "patent", "upgrade", "success", "launch"
+            "partnership", "patent", "upgrade", "success", "launch", "earnings"
         ]
         neg_keywords = [
             "lawsuit", "investigation", "drop", "decline", "miss", "risk", "cut", "downgrade", 
@@ -146,19 +144,19 @@ def generate_full_analysis_report(symbol: str) -> dict:
             tech_recommendation = "🟡 המתנה / זהירות"
             tech_reasoning = f"המנייה במתיחת יתר (RSI={rsi_value:.1f}). קיימת סכנת תיקון כלפי מטה (FOMO)."
         elif current_price > sma20_value and volume_today > avg_volume:
-            tech_recommendation = "🟢 מומלץ להשקיע (כניסה)"
-            tech_reasoning = f"מחיר המנייה מעל ממוצע SMA20 (${sma20_value:.2f}) בליווי נפח מסחר חריג, המעיד על מומנטום חזק."
+            tech_recommendation = "🟢 מומלץ להשקיע (פוטנציאל פריצה)"
+            tech_reasoning = f"המנייה מציגה מומנטום מעל SMA20 (${sma20_value:.2f}) בשילוב גידול בנפחי המסחר, מעיד על צבירת מומנטום לפני פריצה."
         else:
             tech_recommendation = "🟡 מעקב בלבד"
             tech_reasoning = "המדדים הפיננסיים ניטרליים. לא זוהתה פריצת מומנטום מובהקת כרגע."
 
         # ניתוח והמלצה חדשותית
         if pos_score > neg_score:
-            news_recommendation = "🟢 מומלץ להשקיע (חיובי)"
-            news_reasoning = "סורק החדשות זיהה סנטימנט חיובי בולט בדיווחים האחרונים (חוזים, דוחות, צמיחה או התפתחויות בשוק)."
+            news_recommendation = "🟢 מומלץ להשקיע (סנטימנט חיובי)"
+            news_reasoning = "זיהוי סנטימנט חיובי בדיווחים ובדוחות האחרונים עשוי לשמש כטריגר לצמיחה."
         elif neg_score > pos_score:
             news_recommendation = "🔴 לא מומלץ (סיכון)"
-            news_reasoning = "סורק החדשות זיהה סנטימנט שלילי או חשיפה לסיכונים (משפטיים, רגולטוריים, מאקרו-כלכליים וכד')."
+            news_reasoning = "זיהוי סנטימנט שלילי או חשיפה לסיכונים בדיווחים האחרונים."
         else:
             news_recommendation = "🟡 ניטרלי"
             news_reasoning = "אין כרגע אירועים חדשותיים או דיווחים בעלי השפעה דרמטית על כיוון המנייה."
@@ -220,16 +218,60 @@ def generate_full_analysis_report(symbol: str) -> dict:
         return {"has_data": False, "symbol": symbol}
 
 # ==========================================
+# מנוע סורק שוק רחב (Broad Market Screener)
+# ==========================================
+
+def discover_broad_market_opportunities() -> list:
+    """
+    סורק את כלל השוק ומאתר מניות בעלות סיכויי פריצה טכנית או טריגר חדשותי/דוחות.
+    """
+    discovered_symbols = set()
+
+    # 1. ניטור מניות שצוברות נפחי מסחר חריגים ומראות מומנטום בשוק הכללי (Day Gainers / Actives)
+    try:
+        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&key=day_gainers"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+            for item in results[:8]:
+                sym = item.get("symbol")
+                if sym and "." not in sym:  # סינון מניות זרות
+                    discovered_symbols.add(sym)
+    except Exception as e:
+        logger.error(f"שגיאה בסריקת מנוע Gainers/Actives: {e}")
+
+    # 2. גיבוי לסורק מניות עם נפחי מסחר גבוהים (Most Actives)
+    try:
+        url_active = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&key=most_actives"
+        response_act = requests.get(url_active, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if response_act.status_code == 200:
+            data_act = response_act.json()
+            results_act = data_act.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+            for item in results_act[:5]:
+                sym = item.get("symbol")
+                if sym and "." not in sym:
+                    discovered_symbols.add(sym)
+    except Exception as e:
+        logger.error(f"שגיאה בסריקת Most Actives: {e}")
+
+    return list(discovered_symbols)
+
+# ==========================================
 # סורק רקע אוטומטי (Background Job)
 # ==========================================
 
 async def auto_market_scanner_job(app: Application):
-    """סריקה אוטומטית ברקע – משתמשת בתבנית ההודעה האחידה"""
+    """סריקה אוטומטית ברקע על כלל השוק ללא הגבלת רשימה מוגדרת מראש"""
     global TARGET_CHAT_ID
     if not TARGET_CHAT_ID:
         return
 
-    for symbol in WATCHLIST:
+    # מזהה מניות בעלות פוטנציאל פריצה או טריגר חדשותי בכל השוק
+    candidate_symbols = discover_broad_market_opportunities()
+
+    for symbol in candidate_symbols:
         try:
             report = generate_full_analysis_report(symbol)
             if report.get("has_data") and report.get("is_alert"):
@@ -246,7 +288,7 @@ async def auto_market_scanner_job(app: Application):
             logger.error(f"שגיאה בסריקת {symbol}: {e}")
 
 # ==========================================
-# פקודות ידניות - משתמשות באותה תבנית אחידה
+# פקודות ידניות
 # ==========================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -255,17 +297,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     TARGET_CHAT_ID = str(update.effective_chat.id)
     
     welcome_text = (
-        "👋 **ברוכים הבאים לסייען המסחר הפיננסי האוטומטי!**\n\n"
-        "🤖 **הבוט מנטר את השוק ברקע באופן אוטומטי ושולח התראות בזמן אמת.**\n\n"
-        "💡 **סריקות ידניות (מציגות פורמט זהה להתראות האוטומטיות):**\n"
-        "• `/tech TSLA` - סריקה טכנית מבוססת גרפים ומדדים\n"
-        "• `/news TSLA` - סריקה חדשותית מקיפה\n"
-        "• `/scan` - הפעלת סריקה ידנית יזומה על כל רשימת המעקב"
+        "👋 **ברוכים הבאים לסורק השוק והסייען הפיננסי האוטומטי!**\n\n"
+        "🤖 **הבוט מנטר את השוק הרחב ברקע באופן רציף לאיתור מניות לפני פריצה או בעלות טריגר חדשותי.**\n\n"
+        "💡 **סריקות ידניות לבחירתך:**\n"
+        "• `/tech TSLA` - סריקה טכנית מבוססת גרפים ומדדים למנייה ספציפית\n"
+        "• `/news TSLA` - סריקה חדשותית מקיפה למנייה ספציפית\n"
+        "• `/scan` - הפעלת סריקה יזומה עכשיו על כלל השוק לאיתור מניות חמות"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def handle_tech(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """סריקה ידנית טכנית - פורמט זהה לחלוטין להתראה האוטומטית"""
+    """סריקה ידנית טכנית"""
     if not context.args:
         await update.message.reply_text("אנא ציין סימול מנייה. דוגמה: `/tech TSLA`", parse_mode="Markdown")
         return
@@ -287,7 +329,7 @@ async def handle_tech(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """סריקה ידנית חדשותית - פורמט זהה לחלוטין להתראה האוטומטית"""
+    """סריקה ידנית חדשותית"""
     if not context.args:
         await update.message.reply_text("אנא ציין סימול מנייה. דוגמה: `/news TSLA`", parse_mode="Markdown")
         return
@@ -309,12 +351,12 @@ async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 async def handle_manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """הפעלה ידנית של הסורק האוטומטי על כל הרשימה"""
+    """הפעלה ידנית של הסורק האוטומטי על כל השוק"""
     global TARGET_CHAT_ID
     TARGET_CHAT_ID = str(update.effective_chat.id)
-    await update.message.reply_text("🔎 מפעיל סריקה יזומה מקיפה על כל רשימת המעקב...")
+    await update.message.reply_text("🔎 מפעיל סורק שוק רחב לאיתור מניות רגע לפני פריצה או לאחר אירועים מהותיים...")
     await auto_market_scanner_job(context.application)
-    await update.message.reply_text("✅ הסריקה הידנית הושלמה.")
+    await update.message.reply_text("✅ סריקת השוק הרחבה הושלמה.")
 
 # ==========================================
 # מטפל בלחיצות כפתורים (Callback Queries)
