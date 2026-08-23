@@ -1,9 +1,9 @@
 import os
 import logging
-import urllib.parse
-import requests
 import asyncio
+import threading
 import yfinance as yf
+from flask import Flask
 from deep_translator import GoogleTranslator
 
 # יבוא ספריות ה-Telegram ורכיבי התזמון (APScheduler)
@@ -22,11 +22,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# CHAT_ID יעד להתראות אוטומטיות
+# CHAT_ID יעד להתראות אוטומטית
 TARGET_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # רשימת מעקב לסריקה אוטומטית
 WATCHLIST = ["AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "GOOGL", "META", "MRNA", "PLTR"]
+
+# ==========================================
+# שרת Web זעיר לשמירה על Render פעיל (Health Check)
+# ==========================================
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def health_check():
+    return "Bot is alive and running!", 200
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
 
 # ==========================================
 # פונקציות עזר - תרגום, חישוב טכני ומקלדות
@@ -237,6 +250,9 @@ async def post_init(application: Application) -> None:
     logger.info("🤖 APScheduler הופעל בהצלחה בתוך לולאת האירועים הראשיות!")
 
 def main():
+    # הפעלת שרת ה-Web ברקע ב-Thread נפרד כדי לתת תגובות חיים ל-Render
+    threading.Thread(target=run_web_server, daemon=True).start()
+
     TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
 
     application = Application.builder().token(TOKEN).post_init(post_init).build()
