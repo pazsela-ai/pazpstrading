@@ -63,7 +63,7 @@ def translate_to_hebrew(text: str) -> str:
         return text
 
 def build_action_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    """בונה מקלדת כפתורים אינטראקטיבית לכל הודעת התראה/סריקה"""
+    """בונה מקלדת כפתורים אינטראקטיבית אחידה לכל הודעה"""
     tradingview_url = f"https://www.tradingview.com/chart/?symbol={symbol}"
     keyboard = [
         [
@@ -86,12 +86,12 @@ def calculate_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 # ==========================================
-# מנוע ניתוח מרכזי (טכני + חדשות מקיפות + נימוקים)
+# מנוע ניתוח מרכזי - מייצר את הפורמט האחיד
 # ==========================================
 
 def generate_full_analysis_report(symbol: str) -> dict:
     """
-    מנתח מנייה באופן מקיף (חדשות מכל התחומים, ניתוח טכני, המלצות וניהול סיכונים)
+    מנתח מנייה באופן מקיף ומפיק את תבנית התוצר האחידה והקבועה לכל סוגי הסריקות.
     """
     symbol = symbol.upper()
     ticker = yf.Ticker(symbol)
@@ -113,10 +113,9 @@ def generate_full_analysis_report(symbol: str) -> dict:
         take_profit = round(current_price * 1.06, 2)
         stop_loss = round(current_price * 0.97, 2)
 
-        # ניתוח חדשות מקיף ורחב (כללי, כלכלי, ביטחוני, טכנולוגי, רגולטורי ועוד)
+        # ניתוח חדשות מקיף (כללי, כלכלי, ביטחוני, טכנולוגי, רגולטורי ועוד)
         news_items = ticker.news if hasattr(ticker, "news") else []
         
-        # מילון מילות מפתח מורחב לזיהוי סנטימנט בכל תחום
         pos_keywords = [
             "breakthrough", "win", "surges", "soars", "beat", "growth", "deal", "approval", 
             "fda", "defense", "contract", "buy", "record", "profit", "expansion", "bullish", 
@@ -153,7 +152,7 @@ def generate_full_analysis_report(symbol: str) -> dict:
             tech_recommendation = "🟡 מעקב בלבד"
             tech_reasoning = "המדדים הפיננסיים ניטרליים. לא זוהתה פריצת מומנטום מובהקת כרגע."
 
-        # ניתוח והמלצה חדשותית מקיפה
+        # ניתוח והמלצה חדשותית
         if pos_score > neg_score:
             news_recommendation = "🟢 מומלץ להשקיע (חיובי)"
             news_reasoning = "סורק החדשות זיהה סנטימנט חיובי בולט בדיווחים האחרונים (חוזים, דוחות, צמיחה או התפתחויות בשוק)."
@@ -177,15 +176,18 @@ def generate_full_analysis_report(symbol: str) -> dict:
 
         news_summary_text = " • " + "\n • ".join(translated_titles) if translated_titles else "אין חדשות מהותיות כרגע"
 
+        # **תבנית הודעה אחידה וקבועה לכל הסריקות**
         msg = (
             f"🚨 **דוח ניתוח מקיף עבור {symbol}**\n"
             f"───────────────────────\n\n"
             f"💡 **המלצה סופית:** {final_recommendation}\n"
             f"📌 **נימוק:** {final_reason}\n\n"
             f"📊 **ניתוח טכני:**\n"
-            f"• מחיר: ${current_price:.2f} | RSI: {rsi_value:.1f} | SMA20: ${sma20_value:.2f}\n\n"
+            f"• מחיר: ${current_price:.2f} | RSI: {rsi_value:.1f} | SMA20: ${sma20_value:.2f}\n"
+            f"• סטטוס טכני: {tech_recommendation}\n\n"
             f"📰 **חדשות וסנטימנט:**\n"
-            f"{news_summary_text}\n\n"
+            f"{news_summary_text}\n"
+            f"• סטטוס חדשותי: {news_recommendation}\n\n"
             f"🎯 **ניהול סיכונים ותוכנית מסחר:**\n"
             f"• **מחיר כניסה מומלץ:** ${entry_price}\n"
             f"  👈 *מדוע:* {entry_reason}\n"
@@ -222,7 +224,7 @@ def generate_full_analysis_report(symbol: str) -> dict:
 # ==========================================
 
 async def auto_market_scanner_job(app: Application):
-    """ריצה תקופתית ברקע שסורקת ומקפיצה התראות"""
+    """סריקה אוטומטית ברקע – משתמשת בתבנית ההודעה האחידה"""
     global TARGET_CHAT_ID
     if not TARGET_CHAT_ID:
         return
@@ -244,7 +246,7 @@ async def auto_market_scanner_job(app: Application):
             logger.error(f"שגיאה בסריקת {symbol}: {e}")
 
 # ==========================================
-# פקודות ידניות בדיקה / ניתוחים
+# פקודות ידניות - משתמשות באותה תבנית אחידה
 # ==========================================
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -255,74 +257,56 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_text = (
         "👋 **ברוכים הבאים לסייען המסחר הפיננסי האוטומטי!**\n\n"
         "🤖 **הבוט מנטר את השוק ברקע באופן אוטומטי ושולח התראות בזמן אמת.**\n\n"
-        "💡 **סריקות ואיסוף מידע ידני:**\n"
-        "• `/tech TSLA` - סריקה טכנית מבוססת גרפים ומדדים עם המלצה ונימוק\n"
-        "• `/news TSLA` - סריקה חדשותית מקיפה (כל תחום משפיע) עם המלצה ונימוק\n"
+        "💡 **סריקות ידניות (מציגות פורמט זהה להתראות האוטומטיות):**\n"
+        "• `/tech TSLA` - סריקה טכנית מבוססת גרפים ומדדים\n"
+        "• `/news TSLA` - סריקה חדשותית מקיפה\n"
         "• `/scan` - הפעלת סריקה ידנית יזומה על כל רשימת המעקב"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 async def handle_tech(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """סריקה ידנית - ניתוח טכני בלבד"""
+    """סריקה ידנית טכנית - פורמט זהה לחלוטין להתראה האוטומטית"""
     if not context.args:
         await update.message.reply_text("אנא ציין סימול מנייה. דוגמה: `/tech TSLA`", parse_mode="Markdown")
         return
 
     symbol = context.args[0].upper()
-    await update.message.reply_text(f"📊 מבצע ניתוח טכני וסריקת גרפים עבור {symbol}...")
+    await update.message.reply_text(f"📊 מבצע סריקה וניתוח עבור {symbol}...")
 
     report = generate_full_analysis_report(symbol)
     if not report.get("has_data"):
         await update.message.reply_text("ℹ️ לא נמצאו נתונים זמינים עבור מנייה זו.")
         return
 
-    msg = (
-        f"📊 **סריקה וניתוח טכני עבור {symbol}**\n"
-        f"───────────────────────\n\n"
-        f"💡 **המלצה:** {report['tech_recommendation']}\n"
-        f"📌 **נימוק טכני:** {report['tech_reasoning']}\n\n"
-        f"🎯 **נתוני כניסה וניהול סיכונים:**\n"
-        f"• **מחיר כניסה:** ${report['entry_price']}\n"
-        f"  👈 *מדוע:* {report['entry_reason']}\n"
-        f"• **מחיר סטופ לוס:** ${report['stop_loss']}\n"
-        f"  👈 *מדוע:* {report['stop_reason']}\n"
-        f"• **יעד רווח:** ${report['take_profit']}"
+    reply_markup = build_action_keyboard(symbol)
+    await update.message.reply_text(
+        report["formatted_message"], 
+        parse_mode="Markdown", 
+        reply_markup=reply_markup, 
+        disable_web_page_preview=True
     )
 
-    reply_markup = build_action_keyboard(symbol)
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
-
 async def handle_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """סריקה ידנית - ניתוח חדשותי מקיף"""
+    """סריקה ידנית חדשותית - פורמט זהה לחלוטין להתראה האוטומטית"""
     if not context.args:
         await update.message.reply_text("אנא ציין סימול מנייה. דוגמה: `/news TSLA`", parse_mode="Markdown")
         return
 
     symbol = context.args[0].upper()
-    await update.message.reply_text(f"📰 סורק חדשות, דוחות וסנטימנט רחב עבור {symbol}...")
+    await update.message.reply_text(f"📰 סורק חדשות וסנטימנט עבור {symbol}...")
 
     report = generate_full_analysis_report(symbol)
     if not report.get("has_data"):
         await update.message.reply_text("ℹ️ לא נמצאו נתונים זמינים עבור מנייה זו.")
         return
 
-    news_list = report.get("news_titles", [])
-    news_text = " • " + "\n • ".join(news_list) if news_list else "אין חדשות מהותיות כרגע"
-
-    msg = (
-        f"📰 **סריקה חדשותית מקיפה עבור {symbol}**\n"
-        f"(כולל דוחות, חוזים, אירועים כלכליים, גיאופוליטיים, רגולציות ועוד)\n"
-        f"───────────────────────\n\n"
-        f"💡 **המלצה:** {report['news_recommendation']}\n"
-        f"📌 **נימוק חדשותי:** {report['news_reasoning']}\n\n"
-        f"📰 **כותרות אחרונות:**\n{news_text}\n\n"
-        f"🎯 **נתוני מסחר מומלצים:**\n"
-        f"• **מחיר כניסה:** ${report['entry_price']} ({report['entry_reason']})\n"
-        f"• **סטופ לוס:** ${report['stop_loss']} ({report['stop_reason']})"
-    )
-
     reply_markup = build_action_keyboard(symbol)
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
+    await update.message.reply_text(
+        report["formatted_message"], 
+        parse_mode="Markdown", 
+        reply_markup=reply_markup, 
+        disable_web_page_preview=True
+    )
 
 async def handle_manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """הפעלה ידנית של הסורק האוטומטי על כל הרשימה"""
@@ -337,7 +321,6 @@ async def handle_manual_scan(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ==========================================
 
 async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """מטפל בלחיצות על המקלדת האינטראקטיבית"""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -400,7 +383,6 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 # ==========================================
 
 async def handle_user_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """מקבל את סכום ההשקעה מהמשתמש ומחשב את הרווח והסיכון הצפויים"""
     symbol = context.user_data.get("awaiting_amount_for")
     if not symbol:
         return
