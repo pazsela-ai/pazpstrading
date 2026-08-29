@@ -33,28 +33,41 @@ CACHE = {}
 CACHE_TTL = 300  # 5 דקות
 
 # ------------------------------------------------------------------------------
-# 2. שליפת רשימת מניות מורחבת (S&P 500 + NASDAQ 100)
+# 2. שליפת רשימת מניות מורחבת ויציבה (כל מניות S&P 500)
 # ------------------------------------------------------------------------------
 def fetch_market_tickers() -> list:
     tickers = set()
+    
+    # שליפה ישירה של CSV מ-GitHub (לא נחסם ע"י דפדפנים)
     try:
-        sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
-        tickers.update(sp500_table['Symbol'].str.replace('.', '-').tolist())
+        url_sp500 = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+        df_sp = pd.read_csv(url_sp500)
+        if 'Symbol' in df_sp.columns:
+            clean_symbols = df_sp['Symbol'].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
+            tickers.update(clean_symbols)
     except Exception as e:
-        print(f"[Ticker Fetch Error - S&P500]: {e}")
+        print(f"[Ticker Fetch Error - Primary CSV]: {e}")
 
-    try:
-        nasdaq100_table = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')[4]
-        tickers.update(nasdaq100_table['Ticker'].str.replace('.', '-').tolist())
-    except Exception as e:
-        print(f"[Ticker Fetch Error - NASDAQ100]: {e}")
+    # מקור גיבוי משני במידה והראשון נכשל
+    if len(tickers) < 100:
+        try:
+            url_backup = "https://raw.githubusercontent.com/rreoch/financial_data/main/sp500_tickers.csv"
+            df_backup = pd.read_csv(url_backup)
+            tickers.update(df_backup.iloc[:, 0].astype(str).str.replace('.', '-', regex=False).str.strip().tolist())
+        except Exception as e:
+            print(f"[Ticker Fetch Error - Backup CSV]: {e}")
 
-    if not tickers:
-        tickers = {
-            "AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "META", "GOOGL", "NFLX",
-            "LLY", "AVGO", "JPM", "UNH", "V", "PG", "MA", "HD", "CVX", "MRK", "ABBV"
-        }
-    return sorted(list(tickers))
+    if len(tickers) >= 100:
+        tickers_list = sorted(list(tickers))
+        print(f"[Success] נשלפו בהצלחה {len(tickers_list)} מניות לסריקה.")
+        return tickers_list
+
+    # רשימת חירום בלבד אם אין חיבור לרשת
+    print("[Warning] עובר לרשימת חירום מצומצמת.")
+    return [
+        "AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "META", "GOOGL", "NFLX",
+        "LLY", "AVGO", "JPM", "UNH", "V", "PG", "MA", "HD", "CVX", "MRK", "ABBV"
+    ]
 
 # ------------------------------------------------------------------------------
 # 3. ניהול בסיס נתונים (SQLite Database + מעקב התראות יומי)
@@ -335,14 +348,6 @@ def fetch_finnhub_data(symbol: str) -> dict:
 # ------------------------------------------------------------------------------
 # 7. חישוב יעדים וניהול סיכונים
 # ------------------------------------------------------------------------------
-def get_usd_ils_rate() -> float:
-    try:
-        usd_ticker = yf.Ticker("USDILS=X")
-        rate = usd_ticker.history(period="1d")['Close'].iloc[-1]
-        return round(float(rate), 2)
-    except Exception:
-        return 3.70
-
 def calculate_trade_plan(entry_price: float, stop_loss: float) -> dict:
     risk_per_share = entry_price - stop_loss
     tp1_price = entry_price + (risk_per_share * 1.5)
@@ -438,7 +443,7 @@ def is_market_open() -> bool:
     return start_time <= now <= end_time
 
 def scan_worker_auto(symbol: str):
-    """בודק מניה ושולח התראה מיידית אם זוהה BUY ולא הציג התראה היום"""
+    """בודק מניה ושולח התראה מיידית אם זוהה BUY ולא התריע לגביה היום"""
     if has_alerted_today(symbol):
         return
 
