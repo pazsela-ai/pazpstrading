@@ -39,6 +39,11 @@ DEFAULT_SCAN_TICKERS = [
     "LMT", "RTX", "PLTR", "NOC"
 ]
 
+# Header מותאם למניעת חסימות HTTP 500/403
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+}
+
 # ------------------------------------------------------------------------------
 # 2. ניהול בסיס נתונים (SQLite Database + מעקב התראות יומי)
 # ------------------------------------------------------------------------------
@@ -102,7 +107,7 @@ def keep_alive_ping():
         try:
             time.sleep(600)
             if "localhost" not in SELF_URL:
-                requests.get(SELF_URL, timeout=10)
+                requests.get(SELF_URL, timeout=10, headers=HEADERS)
         except Exception as e:
             print(f"[Keep-Alive Error]: {e}")
 
@@ -119,12 +124,24 @@ def analyze_technical_patterns(symbol: str) -> dict:
     try:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="1y")
+        
+        # ניקוי ערכי NaN במחיר הסגירה
+        if not df.empty:
+            df = df.dropna(subset=['Close'])
+
         if df.empty or len(df) < 50:
             return None
 
+        # טיפול בערכי NaN פוטנציאליים בשורות האחרונות
         current_price = float(df['Close'].iloc[-1])
-        prev_price = float(df['Close'].iloc[-2])
-        change_pct = ((current_price - prev_price) / prev_price) * 100
+        prev_price = float(df['Close'].iloc[-2]) if len(df) > 1 else current_price
+        
+        # Fallback למקרה ש-Close עדיין מחזיר NaN או 0
+        if pd.isna(current_price) or current_price == 0:
+            current_price = float(ticker.fast_info.get('lastPrice', 0))
+            prev_price = float(ticker.fast_info.get('previousClose', current_price))
+
+        change_pct = ((current_price - prev_price) / prev_price) * 100 if prev_price > 0 else 0.0
 
         # --- א. חישוב אינדיקטורים וממוצעים נעים ---
         df['RSI'] = ta.rsi(df['Close'], length=14)
@@ -133,11 +150,20 @@ def analyze_technical_patterns(symbol: str) -> dict:
         df['EMA200'] = ta.ema(df['Close'], length=200)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
 
-        rsi = float(df['RSI'].dropna().iloc[-1]) if not df['RSI'].dropna().empty else 50.0
-        ema20 = float(df['EMA20'].dropna().iloc[-1])
-        ema50 = float(df['EMA50'].dropna().iloc[-1])
-        ema200 = float(df['EMA200'].dropna().iloc[-1]) if not df['EMA200'].dropna().empty else ema50
-        atr = float(df['ATR'].dropna().iloc[-1])
+        rsi_valid = df['RSI'].dropna()
+        rsi = float(rsi_valid.iloc[-1]) if not rsi_valid.empty else 50.0
+
+        ema20_valid = df['EMA20'].dropna()
+        ema20 = float(ema20_valid.iloc[-1]) if not ema20_valid.empty else current_price
+
+        ema50_valid = df['EMA50'].dropna()
+        ema50 = float(ema50_valid.iloc[-1]) if not ema50_valid.empty else current_price
+
+        ema200_valid = df['EMA200'].dropna()
+        ema200 = float(ema200_valid.iloc[-1]) if not ema200_valid.empty else ema50
+
+        atr_valid = df['ATR'].dropna()
+        atr = float(atr_valid.iloc[-1]) if not atr_valid.empty else (current_price * 0.02)
 
         # בדיקת מגמה לפי ממוצעים נעים
         is_uptrend = current_price > ema20 > ema50 and current_price > ema200
@@ -145,7 +171,7 @@ def analyze_technical_patterns(symbol: str) -> dict:
         # ניתוח נפח מסחר (Volume Accumulation)
         avg_vol_20 = df['Volume'].iloc[-21:-1].mean()
         curr_vol = df['Volume'].iloc[-1]
-        volume_spike = curr_vol > (avg_vol_20 * 1.3)
+        volume_spike = bool(curr_vol > (avg_vol_20 * 1.3)) if avg_vol_20 > 0 else False
 
         patterns = []
         candlesticks = []
@@ -252,37 +278,26 @@ NOISE_PATTERNS = [
 ]
 
 HIGH_IMPACT_CATALYSTS = {
-    # א. פארמה, קליני ורגולציה
     r"\bfda\b|\btrial\b|\bphase\b|\bclinical\b|\bapproval\b": 
         ("אישור/ניסוי קליני מפתח (FDA/Pharma)", 10),
-
-    # ב. אירועים גיאופוליטיים, ביטחוניים ומלחמות
     r"\bdefense contract\b|\bmilitary deal\b|\bpentagon\b|\barmy contract\b": 
         ("חוזה הצטיידות ביטחוני / פנטגון 🛡️", 10),
     r"\bsanctions\b|\btariff exemption\b|\bexport license\b": 
         ("שינוי מדיניות סחר / הקלת סנקציות / מכסים 🌐", 9),
     r"\bgeopolitical\b|\bwar demand\b|\bsecurity crisis\b|\bsupply disruption\b": 
         ("אירוע גיאופוליטי / הסטת ביקוש מלחמתית ⚠️", 8),
-
-    # ג. דוחות, רווחיות ותחזיות
     r"\bearnings\b|\bbeat\b|\brevenue beat\b|\brecord revenue\b": 
         ("דוחות כספיים / תוצאות שיא 📈", 9),
     r"\bguidance\b|\braises outlook\b|\braised guidance\b": 
         ("עדכון תחזית צמיחה כלפי מעלה 🚀", 9),
-
-    # ד. מיזוגים, רכישות וחוזים
     r"\bmerger\b|\bacquisition\b|\bbuyout\b|\btakeover\b": 
         ("עסקת מיזוג / רכישה דרמטית 🤝", 9),
     r"\bcontract\b|\bdeal\b|\bpartnership\b|\bsupply agreement\b": 
         ("חתימת חוזה אסטרטגי / הספקת ענק 📝", 8),
-
-    # ה. מענקי ממשל, חוקים וסובסידיות
     r"\bgovernment grant\b|\bsubsidy\b|\bchips act\b|\bfederal funding\b": 
         ("מענק ממשלתי / סובסידיה אסטרטגית 🏛️", 8),
     r"\bftc approval\b|\bdoj approval\b|\bregulatory clearance\b": 
         ("אישור רגולטורי / יציאה מסיכון משפטי ⚖️", 8),
-
-    # ו. בעלי עניין, אקטיביזם וטכנולוגיה
     r"\binsider buy(ing)?\b|\bceo bought\b|\bdirector purchased\b": 
         ("רכישת מניות מאסיבית ע\"י הנהלה (Insider Buying) 💎", 9),
     r"\bshare buyback\b|\brepurchase program\b": 
@@ -309,13 +324,15 @@ def evaluate_headline_impact(headline: str) -> tuple:
 def fetch_finnhub_data(symbol: str) -> dict:
     raw_headlines = []
     
+    # 1. ניסיון שליפה מ-Finnhub
     if FINNHUB_API_KEY and FINNHUB_API_KEY != "YOUR_FINNHUB_API_KEY":
         try:
             today = datetime.date.today()
             from_date = (today - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
             to_date = today.strftime('%Y-%m-%d')
             news_url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={from_date}&to={to_date}&token={FINNHUB_API_KEY}"
-            res = requests.get(news_url, timeout=5)
+            
+            res = requests.get(news_url, headers=HEADERS, timeout=5)
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list):
@@ -323,9 +340,12 @@ def fetch_finnhub_data(symbol: str) -> dict:
                         h = item.get("headline")
                         if h:
                             raw_headlines.append(h)
+            else:
+                print(f"[Finnhub Status Warning] {symbol}: HTTP {res.status_code}")
         except Exception as e:
             print(f"[Finnhub Fetch Error] {symbol}: {e}")
 
+    # 2. ניסיון שליפה מ-YFinance במקרה של חוסר נתונים
     if not raw_headlines:
         try:
             ticker = yf.Ticker(symbol)
@@ -383,8 +403,10 @@ def fetch_finnhub_data(symbol: str) -> dict:
 def get_usd_ils_rate() -> float:
     try:
         usd_ticker = yf.Ticker("USDILS=X")
-        rate = usd_ticker.history(period="1d")['Close'].iloc[-1]
-        return round(float(rate), 2)
+        df = usd_ticker.history(period="1d")
+        if not df.empty and not pd.isna(df['Close'].iloc[-1]):
+            return round(float(df['Close'].iloc[-1]), 2)
+        return 3.70
     except Exception:
         return 3.70
 
@@ -673,7 +695,6 @@ def scheduled_market_scan():
         return
 
     for sym in DEFAULT_SCAN_TICKERS:
-        # בדיקה אם המנייה כבר התריעה היום
         if has_alerted_today(sym):
             continue
 
