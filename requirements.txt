@@ -7,4 +7,3 @@ requests
 Flask
 APScheduler
 pytz
-gunicorn
