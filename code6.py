@@ -20,7 +20,9 @@ FINNHUB_KEY = os.environ.get('FINNHUB_KEY')
 ALPHAVANTAGE_KEY = os.environ.get('ALPHAVANTAGE_KEY', '')
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-translator = GoogleTranslator(source='auto', target='he')
+
+# תיקון קוד השפה לעברית עבור גוגל תרגום ('iw')
+translator = GoogleTranslator(source='auto', target='iw')
 app = Flask(__name__)
 
 # ------------------------------------------------------------------------------
@@ -136,11 +138,12 @@ def analyze_stock(ticker_symbol):
     
     sentiment_score = 0
     for headline in news_list:
-        # תרגום הכתבה לעברית
+        # תרגום הכתבה לעברית בבטיחות
         try:
             translated = translator.translate(headline)
-        except:
+        except Exception:
             translated = headline
+            
         news_summary_hebrew.append(f"• {translated}")
         
         # ניתוח סנטימנט בסיסי לפי מילות מפתח
