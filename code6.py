@@ -6,6 +6,7 @@ import requests
 import datetime
 import pytz
 import re
+import concurrent.futures
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
@@ -31,21 +32,61 @@ USER_CALC_STATE = {}
 CACHE = {}
 CACHE_TTL = 300  # 5 דקות
 
-DEFAULT_SCAN_TICKERS = [
-    "AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "META", "GOOGL", "NFLX", "BRK-B",
-    "LLY", "AVGO", "JPM", "UNH", "V", "PG", "MA", "HD", "CVX", "MRK", "ABBV", "COST",
-    "PEP", "ADBE", "WMT", "CRM", "BAC", "ACN", "MCD", "CSCO", "ORCL", "LIN", "ABT",
-    "INTC", "QCOM", "TXN", "AMAT", "MU", "PANW", "SNPS", "CDNS", "SMCI", "ARM", "MRNA",
-    "LMT", "RTX", "PLTR", "NOC"
-]
-
-# Header מותאם למניעת חסימות HTTP 500/403
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 }
 
 # ------------------------------------------------------------------------------
-# 2. ניהול בסיס נתונים (SQLite Database + מעקב התראות יומי)
+# 1.5. שליפה דינמית של כל מניות S&P 500 ו-NASDAQ
+# ------------------------------------------------------------------------------
+def get_sp500_and_nasdaq_tickers() -> list:
+    """
+    שולפת בזמן אמת את הרשימה המלאה של מניות S&P 500 ו-NASDAQ 100 מויקיפדיה,
+    וכוללת גיבוי למקרה של חסימת שרת.
+    """
+    tickers = set()
+    
+    # 1. שליפת מניות S&P 500
+    try:
+        sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        tables = pd.read_html(sp500_url)
+        sp500_df = tables[0]
+        sp500_symbols = sp500_df['Symbol'].str.replace('.', '-', regex=False).tolist()
+        tickers.update(sp500_symbols)
+    except Exception as e:
+        print(f"[Ticker Fetch Error] S&P 500: {e}")
+
+    # 2. שליפת מניות NASDAQ 100
+    try:
+        nasdaq_url = "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies"
+        tables = pd.read_html(nasdaq_url)
+        for t in tables:
+            if 'Ticker' in t.columns:
+                nasdaq_symbols = t['Ticker'].str.replace('.', '-', regex=False).tolist()
+                tickers.update(nasdaq_symbols)
+                break
+            elif 'Symbol' in t.columns:
+                nasdaq_symbols = t['Symbol'].str.replace('.', '-', regex=False).tolist()
+                tickers.update(nasdaq_symbols)
+                break
+    except Exception as e:
+        print(f"[Ticker Fetch Error] NASDAQ 100: {e}")
+
+    # Fallback במידה והשליפה הדינמית נכשלה (רשימת ליבה רחבה)
+    if not tickers:
+        print("[Ticker Fetch Warning] משתמש ברשימת גיבוי לגרעין השוק.")
+        tickers = {
+            "AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "META", "GOOGL", "NFLX", "BRK-B",
+            "LLY", "AVGO", "JPM", "UNH", "V", "PG", "MA", "HD", "CVX", "MRK", "ABBV", "COST",
+            "PEP", "ADBE", "WMT", "CRM", "BAC", "ACN", "MCD", "CSCO", "ORCL", "LIN", "ABT",
+            "INTC", "QCOM", "TXN", "AMAT", "MU", "PANW", "SNPS", "CDNS", "SMCI", "ARM", "MRNA",
+            "LMT", "RTX", "PLTR", "NOC", "CRM", "CAT", "GE", "IBM", "NOW", "ISRG", "BKNG"
+        }
+
+    return sorted(list(tickers))
+
+# ------------------------------------------------------------------------------
+# 2. ניהול בסיס נתונים (SQLite Database)
 # ------------------------------------------------------------------------------
 DB_FILE = "bot_database.db"
 
@@ -115,45 +156,30 @@ def keep_alive_ping():
 # 3.5. מנגנון בקרה ואימות נתונים (VALIDATION LAYER)
 # ------------------------------------------------------------------------------
 def validate_technical_data(tech: dict) -> bool:
-    """
-    בקרת איכות נתונים בסיסית: לוודא שהנתונים שהתקבלו תקינים, שלמים וסבירים.
-    """
     if not tech:
         return False
-
-    # 1. אימות מחירי שוק
     current_price = tech.get("current_price", 0)
     if pd.isna(current_price) or current_price <= 0:
         return False
-
-    # 2. אימות מדד RSI (חייב להיות בטווח 0-100)
     rsi = tech.get("rsi", 50)
     if pd.isna(rsi) or not (0 <= rsi <= 100):
         return False
-
-    # 3. אימות סטופ-לוס ומחיר כניסה
     if tech.get("signal") == "BUY":
         entry = tech.get("entry_price")
         stop = tech.get("stop_loss")
         if not entry or not stop or pd.isna(entry) or pd.isna(stop):
             return False
-        if stop >= entry:  # בלונג - סטופ לוס חייב להיות נמוך ממחיר הכניסה
+        if stop >= entry:
             return False
-
     return True
 
 def validate_technical_signal(tech: dict) -> bool:
-    """
-    בקרת לוגיקה פיננסית: לוודא שאיתות קנייה עומד בקריטריונים קשיחים של סיכון/סיכוי ומניעת איתותי שווא.
-    """
     if not tech or tech.get("signal") != "BUY":
-        return True  # ניטרלי/המתנה אינו דורש סינון קשיח
-
+        return True
     entry = tech.get("entry_price")
     stop = tech.get("stop_loss")
     rsi = tech.get("rsi", 50)
     
-    # 1. אימות יחס סיכון-סיכוי (R:R Ratio) - יעד 1 חייב לשקף לפחות 1:1.5
     risk = entry - stop
     if risk <= 0:
         return False
@@ -162,16 +188,12 @@ def validate_technical_signal(tech: dict) -> bool:
     if (tp1 - entry) / risk < 1.5:
         return False
 
-    # 2. מניעת מתיחת יתר (RSI Overbought) - כניסה מעל RSI 75 היא בסיכון גבוה
     if rsi > 75:
         return False
 
     return True
 
 def validate_and_clean_news(headlines: list) -> list:
-    """
-    בקרת איכות תוכן ותרגום: מנקה כותרות ריקות, כפילויות ושגיאות תרגום.
-    """
     cleaned = []
     seen = set()
     for h in headlines:
@@ -185,7 +207,7 @@ def validate_and_clean_news(headlines: list) -> list:
     return cleaned
 
 # ------------------------------------------------------------------------------
-# 4. מנוע ניתוח טכני משולב (ממוצעים נעים + תבניות + נרות + ווליום)
+# 4. מנוע ניתוח טכני משולב
 # ------------------------------------------------------------------------------
 def analyze_technical_patterns(symbol: str) -> dict:
     now = time.time()
@@ -198,25 +220,22 @@ def analyze_technical_patterns(symbol: str) -> dict:
         ticker = yf.Ticker(symbol)
         df = ticker.history(period="1y")
         
-        # ניקוי ערכי NaN במחיר הסגירה
         if not df.empty:
             df = df.dropna(subset=['Close'])
 
         if df.empty or len(df) < 50:
             return None
 
-        # טיפול בערכי NaN פוטנציאליים בשורות האחרונות
         current_price = float(df['Close'].iloc[-1])
         prev_price = float(df['Close'].iloc[-2]) if len(df) > 1 else current_price
         
-        # Fallback למקרה ש-Close עדיין מחזיר NaN או 0
         if pd.isna(current_price) or current_price == 0:
             current_price = float(ticker.fast_info.get('lastPrice', 0))
             prev_price = float(ticker.fast_info.get('previousClose', current_price))
 
         change_pct = ((current_price - prev_price) / prev_price) * 100 if prev_price > 0 else 0.0
 
-        # --- א. חישוב אינדיקטורים וממוצעים נעים ---
+        # אינדיקטורים
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['EMA20'] = ta.ema(df['Close'], length=20)
         df['EMA50'] = ta.ema(df['Close'], length=50)
@@ -238,10 +257,8 @@ def analyze_technical_patterns(symbol: str) -> dict:
         atr_valid = df['ATR'].dropna()
         atr = float(atr_valid.iloc[-1]) if not atr_valid.empty else (current_price * 0.02)
 
-        # בדיקת מגמה לפי ממוצעים נעים
         is_uptrend = current_price > ema20 > ema50 and current_price > ema200
 
-        # ניתוח נפח מסחר (Volume Accumulation)
         avg_vol_20 = df['Volume'].iloc[-21:-1].mean()
         curr_vol = df['Volume'].iloc[-1]
         volume_spike = bool(curr_vol > (avg_vol_20 * 1.3)) if avg_vol_20 > 0 else False
@@ -249,7 +266,6 @@ def analyze_technical_patterns(symbol: str) -> dict:
         patterns = []
         candlesticks = []
 
-        # --- ב. זיהוי נרות היפוך/אישור (Candlesticks) ---
         o1, h1, l1, c1 = float(df['Open'].iloc[-1]), float(df['High'].iloc[-1]), float(df['Low'].iloc[-1]), float(df['Close'].iloc[-1])
         o2, c2 = float(df['Open'].iloc[-2]), float(df['Close'].iloc[-2])
 
@@ -257,44 +273,34 @@ def analyze_technical_patterns(symbol: str) -> dict:
         lower_shadow1 = min(o1, c1) - l1
         upper_shadow1 = h1 - max(o1, c1)
 
-        # 1. נר פטיש (Hammer)
         if lower_shadow1 >= (2 * body1) and upper_shadow1 <= (0.3 * body1) and body1 > 0:
             candlesticks.append("נר פטיש היפוכי (Hammer)")
 
-        # 2. בליעה שורית (Bullish Engulfing)
         if c2 < o2 and c1 > o1 and c1 > o2 and o1 < c2:
             candlesticks.append("בליעה שורית (Bullish Engulfing)")
 
-        # --- ג. זיהוי תבניות מחיר (Chart Patterns) ---
         high_30 = float(df['High'].iloc[-30:].max())
         low_30 = float(df['Low'].iloc[-30:].min())
         recent_support = float(df['Low'].tail(10).min())
 
-        # 1. ספל וידית (Cup & Handle)
         if (high_30 - current_price) / high_30 < 0.04 and current_price > ema20:
             patterns.append("ספל וידית (Cup & Handle)")
 
-        # 2. תחתית כפולה (Double Bottom)
         lows = df['Low'].iloc[-30:]
         double_bottom_hits = lows[lows <= low_30 * 1.025]
         if len(double_bottom_hits) >= 2 and (current_price > low_30 * 1.03):
             patterns.append("תחתית כפולה (Double Bottom)")
 
-        # 3. משולש עולה (Ascending Triangle)
         highs_flat = abs(df['High'].iloc[-15:].max() - df['High'].iloc[-5:].max()) / current_price < 0.02
         lows_rising = df['Low'].iloc[-15] < df['Low'].iloc[-8] < df['Low'].iloc[-1]
         if highs_flat and lows_rising:
             patterns.append("משולש עולה (Ascending Triangle)")
 
-        # 4. דגל שורי (Bullish Flag)
         recent_runup = (df['High'].iloc[-5:].max() - df['Low'].iloc[-15:].min()) / df['Low'].iloc[-15:].min()
         if recent_runup > 0.10 and abs(current_price - df['Close'].iloc[-3:].mean()) / current_price < 0.02:
             patterns.append("דגל שורי (Bullish Flag)")
 
-        # --- ד. מודל הצטלבות קריטריונים (Confluence Signal Engine) ---
         has_pattern_or_candle = len(patterns) > 0 or len(candlesticks) > 0
-        
-        # תנאי סף לאיתות כניסה חזק (BUY): מגמה עולה + תבנית/נר היפוך + נפח מסחר/RSI תקין
         is_strong_buy = is_uptrend and has_pattern_or_candle and (volume_spike or (45 <= rsi <= 70))
 
         if is_strong_buy:
@@ -333,13 +339,10 @@ def analyze_technical_patterns(symbol: str) -> dict:
             "atr": round(atr, 2)
         }
 
-        # --- ה. הפעלת מנגנון הבקרה והאימות ---
         if not validate_technical_data(result):
-            print(f"[Validation Warning] {symbol}: הנתונים שנשלפו אינם תקינים.")
             return None
 
         if not validate_technical_signal(result):
-            # במידה והאיתות לא עבר אימות איכות טכני - משנמכים ל-HOLD
             result["signal"] = "HOLD"
             result["entry_price"] = None
             result["stop_loss"] = None
@@ -348,11 +351,10 @@ def analyze_technical_patterns(symbol: str) -> dict:
         return result
 
     except Exception as e:
-        print(f"[Tech Analysis Error] {symbol}: {e}")
         return None
 
 # ------------------------------------------------------------------------------
-# 5. ניתוח חדשות מורחב (Comprehensive Catalyst NLP Engine)
+# 5. ניתוח חדשות מורחב
 # ------------------------------------------------------------------------------
 NOISE_PATTERNS = [
     r"stock(s)? to watch", r"market recap", r"top gainers", r"weekly roundup",
@@ -394,28 +396,22 @@ HIGH_IMPACT_CATALYSTS = {
 
 def evaluate_headline_impact(headline: str) -> tuple:
     h_lower = headline.lower()
-
     for noise in NOISE_PATTERNS:
         if re.search(noise, h_lower):
             return 0, None
-
     for pattern, (label, score) in HIGH_IMPACT_CATALYSTS.items():
         if re.search(pattern, h_lower):
             return score, label
-
     return 4, "ידיעה חברתית/סקטוריאלית כללית"
 
 def fetch_finnhub_data(symbol: str) -> dict:
     raw_headlines = []
-    
-    # 1. ניסיון שליפה מ-Finnhub
     if FINNHUB_API_KEY and FINNHUB_API_KEY != "YOUR_FINNHUB_API_KEY":
         try:
             today = datetime.date.today()
             from_date = (today - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
             to_date = today.strftime('%Y-%m-%d')
             news_url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={from_date}&to={to_date}&token={FINNHUB_API_KEY}"
-            
             res = requests.get(news_url, headers=HEADERS, timeout=5)
             if res.status_code == 200:
                 data = res.json()
@@ -424,12 +420,9 @@ def fetch_finnhub_data(symbol: str) -> dict:
                         h = item.get("headline")
                         if h:
                             raw_headlines.append(h)
-            else:
-                print(f"[Finnhub Status Warning] {symbol}: HTTP {res.status_code}")
         except Exception as e:
-            print(f"[Finnhub Fetch Error] {symbol}: {e}")
+            pass
 
-    # 2. ניסיון שליפה מ-YFinance במקרה של חוסר נתונים
     if not raw_headlines:
         try:
             ticker = yf.Ticker(symbol)
@@ -442,7 +435,7 @@ def fetch_finnhub_data(symbol: str) -> dict:
                     if title:
                         raw_headlines.append(title)
         except Exception as e:
-            print(f"[YFinance News Error] {symbol}: {e}")
+            pass
 
     scored_headlines = []
     found_catalysts = set()
@@ -465,9 +458,7 @@ def fetch_finnhub_data(symbol: str) -> dict:
         except Exception:
             translated_headlines.append(h)
 
-    # בקרת איכות שניקוי כותרות ותרגום
     translated_headlines = validate_and_clean_news(translated_headlines)
-
     catalyst_str = " | ".join(found_catalysts) if found_catalysts else "לא אותרו קטליזטורים דרמטיים"
     
     if len(found_catalysts) > 0:
@@ -501,10 +492,8 @@ def get_usd_ils_rate() -> float:
 
 def calculate_trade_plan(entry_price: float, stop_loss: float, pattern_depth_pct: float = 0.15) -> dict:
     risk_per_share = entry_price - stop_loss
-    
     tp1_price = entry_price + (risk_per_share * 2)
     tp1_pct = ((tp1_price - entry_price) / entry_price) * 100
-    
     tp2_price = entry_price + (risk_per_share * 3.5)
     tp2_pct = ((tp2_price - entry_price) / entry_price) * 100
     
@@ -640,16 +629,23 @@ def create_report_message(symbol: str) -> tuple:
 # ------------------------------------------------------------------------------
 # 8. ניהול פקודות ואירועים (Telegram Handlers)
 # ------------------------------------------------------------------------------
+def fetch_and_analyze(symbol: str):
+    """פונקציית עזר להרצה במקביל בסורק המלא"""
+    tech = analyze_technical_patterns(symbol)
+    if tech and tech["signal"] == "BUY":
+        return symbol, tech
+    return symbol, None
+
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     add_user(message.chat.id)
     welcome_text = """
 <b>ברוכים הבאים לסורק השוק והסייען הפיננסי! 🚀</b>
 
-הבוט משלב ממוצעים נעים (EMA20/50/200), תבניות מחיר ונרות היפוך, לצד סינון חדשות חכם מבוסס אימפקט ומערכת בקרת איכות נתונים.
+הבוט סורק באופן דינמי את **כלל מניות S&P 500 ו-NASDAQ** ומאתר איתותי פריצה מבוססי תבניות, ממוצעים, נרות ווליום.
 
 <b>פקודות זמינות:</b>
-/scan - סריקת שוק לזיהוי פריצות בזמן אמת
+/scan - סריקה מהירה של מניות מדדי S&P 500 ו-NASDAQ
 /tech &lt;SYMBOL&gt; - ניתוח טכני למנייה (למשל: <code>/tech TSLA</code>)
 /news &lt;SYMBOL&gt; - חדשות ואירועים למנייה (למשל: <code>/news MRNA</code>)
 """
@@ -658,18 +654,21 @@ def cmd_start(message):
 @bot.message_handler(commands=['scan'])
 def cmd_scan(message):
     add_user(message.chat.id)
-    bot.reply_to(message, "🔍 מתחיל סריקה מורחבת בשוק... אנא המתן.")
+    all_tickers = get_sp500_and_nasdaq_tickers()
+    bot.reply_to(message, f"🔍 מתחיל סריקה אסינכרונית על {len(all_tickers)} מניות במדדי S&P 500 ו-NASDAQ... אנא המתן כ-30 שניות.")
     
     found_any = False
-    for sym in DEFAULT_SCAN_TICKERS:
-        tech = analyze_technical_patterns(sym)
-        if tech and tech["signal"] == "BUY":
-            msg, markup = create_report_message(sym)
-            bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
-            found_any = True
+    # הרצת סריקה במקביל בלולאה של 20 תהליכונים
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        results = executor.map(fetch_and_analyze, all_tickers)
+        for symbol, tech in results:
+            if tech:
+                msg, markup = create_report_message(symbol)
+                bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
+                found_any = True
 
     if not found_any:
-        bot.send_message(message.chat.id, "ℹ️ לא אותרו כעת מניות העונות על כלל הקריטריונים (מגמה + תבנית + ווליום + אימות בקרת איכות).")
+        bot.send_message(message.chat.id, "ℹ️ לא אותרו כעת מניות העונות על כלל הקריטריונים במדדים אלו.")
 
 @bot.message_handler(commands=['tech'])
 def cmd_tech(message):
@@ -761,7 +760,7 @@ def process_calculator_amount(message):
         bot.register_next_step_handler(message, process_calculator_amount)
 
 # ------------------------------------------------------------------------------
-# 10. מנוע סריקה אוטומטית (עם מנגנון סינון התראות יומי)
+# 10. מנוע סריקה אוטומטית מקבילי (על כל מניות S&P 500 ו-NASDAQ)
 # ------------------------------------------------------------------------------
 def is_market_open() -> bool:
     israel_tz = pytz.timezone('Asia/Jerusalem')
@@ -783,20 +782,21 @@ def scheduled_market_scan():
     if not users:
         return
 
-    for sym in DEFAULT_SCAN_TICKERS:
-        if has_alerted_today(sym):
-            continue
+    all_tickers = get_sp500_and_nasdaq_tickers()
 
-        tech = analyze_technical_patterns(sym)
-        if tech and tech["signal"] == "BUY":
-            msg, markup = create_report_message(sym)
-            for chat_id in users:
-                try:
-                    bot.send_message(chat_id, f"🚨 <b>התראת איתות פריצה בזמן אמת!</b>\n{msg}", parse_mode="HTML", reply_markup=markup)
-                except Exception as e:
-                    print(f"[Scheduled Notification Error] to {chat_id}: {e}")
+    # סריקה במקביל של כל מניות המדדים לקבלת ביצועים מהירים
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        results = executor.map(fetch_and_analyze, all_tickers)
+        for sym, tech in results:
+            if tech and not has_alerted_today(sym):
+                msg, markup = create_report_message(sym)
+                for chat_id in users:
+                    try:
+                        bot.send_message(chat_id, f"🚨 <b>התראת איתות פריצה בזמן אמת!</b>\n{msg}", parse_mode="HTML", reply_markup=markup)
+                    except Exception as e:
+                        print(f"[Scheduled Notification Error] to {chat_id}: {e}")
 
-            mark_alerted_today(sym)
+                mark_alerted_today(sym)
 
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(scheduled_market_scan, 'interval', minutes=15)
