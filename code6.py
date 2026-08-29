@@ -33,35 +33,31 @@ CACHE = {}
 CACHE_TTL = 300  # 5 דקות
 
 # ------------------------------------------------------------------------------
-# 2. מנון שליפת רשימות מניות מורחבת (S&P 500 + NASDAQ 100)
+# 2. שליפת רשימת מניות מורחבת (S&P 500 + NASDAQ 100)
 # ------------------------------------------------------------------------------
 def fetch_market_tickers() -> list:
-    """שולף רשימה מאוחדת ועדכנית של מניות מובילות מ-S&P 500 ו-NASDAQ 100"""
     tickers = set()
     try:
-        # שליפת S&P 500 מ-Wikipedia
         sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
         tickers.update(sp500_table['Symbol'].str.replace('.', '-').tolist())
     except Exception as e:
         print(f"[Ticker Fetch Error - S&P500]: {e}")
 
     try:
-        # שליפת NASDAQ 100 מ-Wikipedia
         nasdaq100_table = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')[4]
         tickers.update(nasdaq100_table['Ticker'].str.replace('.', '-').tolist())
     except Exception as e:
         print(f"[Ticker Fetch Error - NASDAQ100]: {e}")
 
-    # גיבוי לרשימה בסיסית במידה והשליפה נכשלה
     if not tickers:
         tickers = {
-            "AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "META", "GOOGL", "NFLX", "BRK-B",
-            "LLY", "AVGO", "JPM", "UNH", "V", "PG", "MA", "HD", "CVX", "MRK", "ABBV", "COST"
+            "AAPL", "NVDA", "TSLA", "AMD", "AMZN", "MSFT", "META", "GOOGL", "NFLX",
+            "LLY", "AVGO", "JPM", "UNH", "V", "PG", "MA", "HD", "CVX", "MRK", "ABBV"
         }
     return sorted(list(tickers))
 
 # ------------------------------------------------------------------------------
-# 3. ניהול בסיס נתונים (SQLite Database)
+# 3. ניהול בסיס נתונים (SQLite Database + מעקב התראות יומי)
 # ------------------------------------------------------------------------------
 DB_FILE = "bot_database.db"
 
@@ -123,7 +119,7 @@ def keep_alive_ping():
             print(f"[Keep-Alive Error]: {e}")
 
 # ------------------------------------------------------------------------------
-# 5. מנוע ניתוח טכני מדויק (הידוק תנאי פריצה ואישורים)
+# 5. מנוע ניתוח טכני
 # ------------------------------------------------------------------------------
 def analyze_technical_patterns(symbol: str) -> dict:
     now = time.time()
@@ -142,7 +138,6 @@ def analyze_technical_patterns(symbol: str) -> dict:
         prev_price = float(df['Close'].iloc[-2])
         change_pct = ((current_price - prev_price) / prev_price) * 100
 
-        # אינדיקטורים טכניים
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['EMA20'] = ta.ema(df['Close'], length=20)
         df['EMA50'] = ta.ema(df['Close'], length=50)
@@ -155,21 +150,16 @@ def analyze_technical_patterns(symbol: str) -> dict:
         ema200 = float(df['EMA200'].dropna().iloc[-1]) if not df['EMA200'].dropna().empty else ema50
         atr = float(df['ATR'].dropna().iloc[-1])
 
-        # בדיקת מגמה ראשית
         is_uptrend = current_price > ema20 > ema50 and current_price > ema200
 
-        # נפח מסחר חורג (Volume Spike)
         avg_vol_20 = df['Volume'].iloc[-21:-1].mean()
         curr_vol = df['Volume'].iloc[-1]
         volume_spike = curr_vol > (avg_vol_20 * 1.4)
 
-        patterns = []
-        candlesticks = []
+        patterns, candlesticks = [], []
 
-        # זיהוי נרות היפוך מבוססי נפח מסחר
         o1, h1, l1, c1 = float(df['Open'].iloc[-1]), float(df['High'].iloc[-1]), float(df['Low'].iloc[-1]), float(df['Close'].iloc[-1])
         o2, c2 = float(df['Open'].iloc[-2]), float(df['Close'].iloc[-2])
-
         body1 = abs(c1 - o1)
         lower_shadow1 = min(o1, c1) - l1
         upper_shadow1 = h1 - max(o1, c1)
@@ -180,12 +170,9 @@ def analyze_technical_patterns(symbol: str) -> dict:
         if c2 < o2 and c1 > o1 and c1 > o2 and o1 < c2 and volume_spike:
             candlesticks.append("בליעה שורית מאושרת נפח (Bullish Engulfing)")
 
-        # זיהוי תבניות מחיר קפדני (עם בדיקת פריצת קו צוואר)
         high_50 = float(df['High'].iloc[-50:-5].max())
-        low_50 = float(df['Low'].iloc[-50:].min())
         recent_support = float(df['Low'].tail(15).min())
 
-        # 1. פריצת תחתית כפולה (Double Bottom Breakout)
         lows = df['Low'].iloc[-50:-10]
         first_bottom = lows.min()
         second_bottom_candidates = df['Low'].iloc[-20:-2]
@@ -196,16 +183,9 @@ def analyze_technical_patterns(symbol: str) -> dict:
                 if current_price > neckline and prev_price <= neckline:
                     patterns.append("פריצת תחתית כפולה (Double Bottom Breakout)")
 
-        # 2. פריצת ספל וידית (Cup & Handle Breakout)
         if current_price > high_50 and prev_price <= high_50 and volume_spike:
             patterns.append("פריצת ספל וידית (Cup & Handle Breakout)")
 
-        # 3. דגל שורי (Bullish Flag)
-        recent_runup = (df['High'].iloc[-15:].max() - df['Low'].iloc[-30:].min()) / df['Low'].iloc[-30:].min()
-        if recent_runup > 0.12 and (df['High'].iloc[-5:].max() - df['Low'].iloc[-5:].min()) / current_price < 0.03 and current_price > ema20:
-            patterns.append("דגל שורי (Bullish Flag)")
-
-        # קריטריון קשיח לאיתות כניסה: מגמה עולה + פריצה/נר מאושר + RSI תקין + נפח חורג
         has_breakout = len(patterns) > 0 or len(candlesticks) > 0
         is_strong_buy = is_uptrend and has_breakout and volume_spike and (45 <= rsi <= 68)
 
@@ -250,7 +230,7 @@ def analyze_technical_patterns(symbol: str) -> dict:
         return None
 
 # ------------------------------------------------------------------------------
-# 6. מנוע ניתוח חדשות מתקדם (סינון עדכניות 48h, רלוונטיות ואיכות)
+# 6. מנוע ניתוח חדשות (עדכניות 48h, איכות וסנטימנט)
 # ------------------------------------------------------------------------------
 HIGH_IMPACT_CATALYSTS = {
     r"\bfda\b|\btrial\b|\bphase\b|\bclinical\b|\bapproval\b": ("אישור/ניסוי קליני (FDA/Pharma)", 10),
@@ -262,24 +242,20 @@ HIGH_IMPACT_CATALYSTS = {
 }
 
 def is_headline_relevant_and_fresh(headline: str, symbol: str, company_name: str, pub_date: datetime.datetime = None) -> tuple:
-    """בודק רלוונטיות למנייה, עדכניות (48 שעות) ואיכות הכותרת"""
-    # 1. בדיקת עדכניות (48 שעות אחרונות בלבד)
     if pub_date:
         now_utc = datetime.datetime.now(pytz.utc)
-        if (now_utc - pub_date).total_seconds() > 172800:  # 48 שעות
+        if (now_utc - pub_date).total_seconds() > 172800:
             return 0, None
 
     h_lower = headline.lower()
     sym_lower = symbol.lower()
     comp_lower = company_name.lower() if company_name else sym_lower
 
-    # 2. Entity Matching - וידוא שהכותרת מזכירה ישירות את המנייה/חברה ולא חברה אחרת
     has_entity = (re.search(r'\b' + re.escape(sym_lower) + r'\b', h_lower) or 
                   (len(comp_lower) > 3 and comp_lower in h_lower))
     if not has_entity:
-        return 0, None  # סינון חדשות כלליות או חדשות על חברות אחרות
+        return 0, None
 
-    # 3. בדיקת קטליזטור בעל אימפקט גבוה בלבד (סינון חדשות פשטניות)
     for pattern, (label, score) in HIGH_IMPACT_CATALYSTS.items():
         if re.search(pattern, h_lower):
             return score, label
@@ -290,14 +266,12 @@ def fetch_finnhub_data(symbol: str) -> dict:
     raw_articles = []
     company_name = symbol
 
-    # שליפת שם החברה מ-yfinance לטובת Entity Matching
     try:
         t_info = yf.Ticker(symbol).info
         company_name = t_info.get("shortName", symbol).split()[0]
     except Exception:
         pass
 
-    # 1. שליפה מ-Finnhub (אם מוגדר API Key)
     if FINNHUB_API_KEY and FINNHUB_API_KEY != "YOUR_FINNHUB_API_KEY":
         try:
             today = datetime.date.today()
@@ -315,7 +289,6 @@ def fetch_finnhub_data(symbol: str) -> dict:
         except Exception as e:
             print(f"[Finnhub Fetch Error] {symbol}: {e}")
 
-    # 2. גיבוי מ-yfinance
     if not raw_articles:
         try:
             news_items = yf.Ticker(symbol).news
@@ -360,7 +333,7 @@ def fetch_finnhub_data(symbol: str) -> dict:
     }
 
 # ------------------------------------------------------------------------------
-# 7. מחשבון עסקאות וניהול סיכונים
+# 7. חישוב יעדים וניהול סיכונים
 # ------------------------------------------------------------------------------
 def get_usd_ils_rate() -> float:
     try:
@@ -384,51 +357,6 @@ def calculate_trade_plan(entry_price: float, stop_loss: float) -> dict:
         "tp2_pct": round(((tp2_price - entry_price) / entry_price) * 100, 1),
     }
 
-def generate_calculator_response(amount: float, is_usd: bool, usd_rate: float, trade_plan: dict) -> str:
-    currency_symbol = "$" if is_usd else "₪"
-    amount_in_usd = amount if is_usd else amount / usd_rate
-    
-    entry = trade_plan["entry"]
-    stop = trade_plan["stop_loss"]
-    tp1 = trade_plan["tp1"]
-    tp2 = trade_plan["tp2"]
-
-    total_shares = int(amount_in_usd / entry)
-    if total_shares < 1:
-        return "⚠️ סכום ההשקעה נמוך מדי לרכישת מנייה אחת לפחות."
-
-    half_shares = total_shares // 2
-    rem_shares = total_shares - half_shares
-
-    profit_tp1_usd = half_shares * (tp1 - entry)
-    profit_tp2_usd = rem_shares * (tp2 - entry)
-    total_profit_usd = profit_tp1_usd + profit_tp2_usd
-    max_risk_usd = total_shares * (entry - stop)
-
-    return f"""
-<b>💰 תוכנית מסחר מודולרית ({amount:,.0f}{currency_symbol}):</b>
-<i>(שער המרה: ₪{usd_rate})</i>
-
-<b>📌 כניסה וכמות:</b>
-• מחיר כניסה: <code>${entry:.2f}</code>
-• כמות מניות: <b>{total_shares} מניות</b>
-
----
-<b>🎯 יעד 1 (TP1 - מימוש 50%):</b> <code>${tp1:.2f}</code> (+{trade_plan['tp1_pct']}%)
-• רווח צפוי: ${profit_tp1_usd:.2f} ({profit_tp1_usd * usd_rate:.2f} ₪)
-• 🛡️ <i>העברת סטופ-לוס למחיר כניסה לאחר השגת יעד 1.</i>
-
-<b>🚀 יעד 2 (TP2 - מימוש 50% נותרים):</b> <code>${tp2:.2f}</code> (+{trade_plan['tp2_pct']}%)
-• רווח צפוי: ${profit_tp2_usd:.2f} ({profit_tp2_usd * usd_rate:.2f} ₪)
-
----
-📊 <b>סך רווח צפוי:</b> ${total_profit_usd:.2f} ({total_profit_usd * usd_rate:.2f} ₪)
-🔴 <b>סיכון מרבי בסטופ (${stop:.2f}):</b> ${max_risk_usd:.2f} ({max_risk_usd * usd_rate:.2f} ₪)
-"""
-
-# ------------------------------------------------------------------------------
-# 8. מחולל הדוחות והמקלדת
-# ------------------------------------------------------------------------------
 def create_report_message(symbol: str) -> tuple:
     tech = analyze_technical_patterns(symbol)
     if not tech:
@@ -493,14 +421,69 @@ def create_report_message(symbol: str) -> tuple:
     return msg, markup
 
 # ------------------------------------------------------------------------------
-# 9. ניהול פקודות וסריקה מקבילית (Multithreading Scan)
+# 8. מנוע סריקה אוטומטית שוטפת ברקע (Automated Market Scanner)
+# ------------------------------------------------------------------------------
+def is_market_open() -> bool:
+    israel_tz = pytz.timezone('Asia/Jerusalem')
+    now = datetime.datetime.now(israel_tz)
+    
+    # בורסות ארה"ב סגורות בסופי שבוע (שבת וראשון)
+    if now.weekday() in (5, 6):
+        return False
+
+    # שעות מסחר לפי שעון ישראל: 16:30 עד 23:00
+    start_time = now.replace(hour=16, minute=30, second=0, microsecond=0)
+    end_time = now.replace(hour=23, minute=0, second=0, microsecond=0)
+    
+    return start_time <= now <= end_time
+
+def scan_worker_auto(symbol: str):
+    """בודק מניה ושולח התראה מיידית אם זוהה BUY ולא הציג התראה היום"""
+    if has_alerted_today(symbol):
+        return
+
+    tech = analyze_technical_patterns(symbol)
+    if tech and tech["signal"] == "BUY":
+        users = get_all_users()
+        if not users:
+            return
+
+        msg, markup = create_report_message(symbol)
+        alert_msg = f"🚨 <b>התראת איתות פריצה בזמן אמת!</b>\n{msg}"
+        
+        for chat_id in users:
+            try:
+                bot.send_message(chat_id, alert_msg, parse_mode="HTML", reply_markup=markup)
+            except Exception as e:
+                print(f"[Alert Error] Chat {chat_id}: {e}")
+
+        mark_alerted_today(symbol)
+
+def scheduled_market_scan():
+    """ריצה מחזורית של הסורק ברקע ברציפות במהלך שעות המסחר"""
+    if not is_market_open():
+        return
+
+    print(f"[{datetime.datetime.now()}] 🔄 מתחיל סריקה אוטומטית ברקע...")
+    tickers = fetch_market_tickers()
+    
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        executor.map(scan_worker_auto, tickers)
+
+# הגדרת תזמון סריקה אוטומטית - ריצה כל 15 דקות
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.add_job(scheduled_market_scan, 'interval', minutes=15)
+scheduler.start()
+
+# ------------------------------------------------------------------------------
+# 9. טיפול בפקודות Telegram (סריקות ידניות לפי דרישה)
 # ------------------------------------------------------------------------------
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     add_user(message.chat.id)
-    bot.reply_to(message, "<b>ברוכים הבאים לסורק המניות המתקדם! 🚀</b>\n\nהשתמש ב- /scan לסריקת מדדי S&P 500 ו-NASDAQ.", parse_mode="HTML")
+    bot.reply_to(message, "<b>ברוכים הבאים לסורק המניות האוטומטי! 🚀</b>\n\nהבוט סורק באופן רציף את שוק ההון וישלח לך התראות פריצה בזמן אמת.\nבנוסף, ניתן לבצע סריקה ידנית בכל עת בעזרת הפקודה /scan.", parse_mode="HTML")
 
-def scan_worker(symbol: str) -> tuple:
+def scan_worker_manual(symbol: str) -> tuple:
     tech = analyze_technical_patterns(symbol)
     if tech and tech["signal"] == "BUY":
         return symbol, create_report_message(symbol)
@@ -510,11 +493,11 @@ def scan_worker(symbol: str) -> tuple:
 def cmd_scan(message):
     add_user(message.chat.id)
     tickers = fetch_market_tickers()
-    bot.reply_to(message, f"🔍 מתחיל סריקה אסינכרונית על <b>{len(tickers)} מניות</b> במדדי S&P 500 ו-NASDAQ... אנא המתן כ-30 שניות.", parse_mode="HTML")
+    bot.reply_to(message, f"🔍 מתחיל סריקה ידנית מורחבת על <b>{len(tickers)} מניות</b>... אנא המתן כ-30 שניות.", parse_mode="HTML")
 
     found_any = False
     with ThreadPoolExecutor(max_workers=15) as executor:
-        results = executor.map(scan_worker, tickers)
+        results = executor.map(scan_worker_manual, tickers)
         for symbol, report in results:
             if report and report[1] is not None:
                 msg, markup = report
@@ -535,55 +518,11 @@ def cmd_tech(message):
         bot.reply_to(message, "⚠️ נא לציין סימול מנייה. לדוגמה: <code>/tech AAPL</code>", parse_mode="HTML")
 
 # ------------------------------------------------------------------------------
-# 10. טיפול בלחיצות כפתורים (Callback Queries)
-# ------------------------------------------------------------------------------
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callbacks(call):
-    data = call.data
-    chat_id = call.message.chat.id
-
-    if data.startswith("calc_"):
-        parts = data.split("_")
-        USER_CALC_STATE[chat_id] = {"symbol": parts[1], "entry": float(parts[2]), "stop": float(parts[3])}
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("דולר ($)", callback_data="curr_USD"),
-            InlineKeyboardButton("שקל (₪)", callback_data="curr_ILS")
-        )
-        bot.send_message(chat_id, f"💰 <b>מחשבון עסקה עבור {parts[1]}</b>\nבחר מטבע:", parse_mode="HTML", reply_markup=markup)
-
-    elif data.startswith("curr_"):
-        is_usd = (data == "curr_USD")
-        if chat_id in USER_CALC_STATE:
-            USER_CALC_STATE[chat_id]["is_usd"] = is_usd
-            curr_str = "דולר ($)" if is_usd else "שקלים (₪)"
-            msg = bot.send_message(chat_id, f"רשום את סכום ההשקעה ב-{curr_str}:")
-            bot.register_next_step_handler(msg, process_calculator_amount)
-
-def process_calculator_amount(message):
-    chat_id = message.chat.id
-    if chat_id not in USER_CALC_STATE:
-        bot.reply_to(message, "❌ פג תוקף החישוב, אנא לחץ שוב על 'חישוב עסקה'.")
-        return
-
-    try:
-        amount = float(message.text.replace(",", "").strip())
-        state = USER_CALC_STATE[chat_id]
-        usd_rate = get_usd_ils_rate()
-        plan = calculate_trade_plan(state["entry"], state["stop"])
-        response_text = generate_calculator_response(amount, state["is_usd"], usd_rate, plan)
-        bot.send_message(chat_id, response_text, parse_mode="HTML")
-        del USER_CALC_STATE[chat_id]
-    except ValueError:
-        bot.reply_to(message, "⚠️ נא להזין מספר תקין. נסה שוב:")
-        bot.register_next_step_handler(message, process_calculator_amount)
-
-# ------------------------------------------------------------------------------
-# 11. הרצת השרת והבוט
+# 10. הרצת השרת והבוט
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     threading.Thread(target=keep_alive_ping, daemon=True).start()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False), daemon=True).start()
     
-    print("🤖 Telegram Trading Bot is active...")
+    print("🤖 Telegram Trading Bot with Background Scanner is active...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
