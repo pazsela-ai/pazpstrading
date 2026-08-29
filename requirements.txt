@@ -1,7 +1,7 @@
 pyTelegramBotAPI
 yfinance
 pandas
-git+https://github.com/twopirllc/pandas-ta.git
+pandas_ta
 deep-translator
 requests
 Flask
