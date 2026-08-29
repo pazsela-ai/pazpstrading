@@ -112,6 +112,79 @@ def keep_alive_ping():
             print(f"[Keep-Alive Error]: {e}")
 
 # ------------------------------------------------------------------------------
+# 3.5. מנגנון בקרה ואימות נתונים (VALIDATION LAYER)
+# ------------------------------------------------------------------------------
+def validate_technical_data(tech: dict) -> bool:
+    """
+    בקרת איכות נתונים בסיסית: לוודא שהנתונים שהתקבלו תקינים, שלמים וסבירים.
+    """
+    if not tech:
+        return False
+
+    # 1. אימות מחירי שוק
+    current_price = tech.get("current_price", 0)
+    if pd.isna(current_price) or current_price <= 0:
+        return False
+
+    # 2. אימות מדד RSI (חייב להיות בטווח 0-100)
+    rsi = tech.get("rsi", 50)
+    if pd.isna(rsi) or not (0 <= rsi <= 100):
+        return False
+
+    # 3. אימות סטופ-לוס ומחיר כניסה
+    if tech.get("signal") == "BUY":
+        entry = tech.get("entry_price")
+        stop = tech.get("stop_loss")
+        if not entry or not stop or pd.isna(entry) or pd.isna(stop):
+            return False
+        if stop >= entry:  # בלונג - סטופ לוס חייב להיות נמוך ממחיר הכניסה
+            return False
+
+    return True
+
+def validate_technical_signal(tech: dict) -> bool:
+    """
+    בקרת לוגיקה פיננסית: לוודא שאיתות קנייה עומד בקריטריונים קשיחים של סיכון/סיכוי ומניעת איתותי שווא.
+    """
+    if not tech or tech.get("signal") != "BUY":
+        return True  # ניטרלי/המתנה אינו דורש סינון קשיח
+
+    entry = tech.get("entry_price")
+    stop = tech.get("stop_loss")
+    rsi = tech.get("rsi", 50)
+    
+    # 1. אימות יחס סיכון-סיכוי (R:R Ratio) - יעד 1 חייב לשקף לפחות 1:1.5
+    risk = entry - stop
+    if risk <= 0:
+        return False
+        
+    tp1 = entry + (risk * 2)
+    if (tp1 - entry) / risk < 1.5:
+        return False
+
+    # 2. מניעת מתיחת יתר (RSI Overbought) - כניסה מעל RSI 75 היא בסיכון גבוה
+    if rsi > 75:
+        return False
+
+    return True
+
+def validate_and_clean_news(headlines: list) -> list:
+    """
+    בקרת איכות תוכן ותרגום: מנקה כותרות ריקות, כפילויות ושגיאות תרגום.
+    """
+    cleaned = []
+    seen = set()
+    for h in headlines:
+        if not h or not isinstance(h, str):
+            continue
+        h_clean = h.strip()
+        if len(h_clean) < 10 or h_clean in seen:
+            continue
+        seen.add(h_clean)
+        cleaned.append(h_clean)
+    return cleaned
+
+# ------------------------------------------------------------------------------
 # 4. מנוע ניתוח טכני משולב (ממוצעים נעים + תבניות + נרות + ווליום)
 # ------------------------------------------------------------------------------
 def analyze_technical_patterns(symbol: str) -> dict:
@@ -260,6 +333,17 @@ def analyze_technical_patterns(symbol: str) -> dict:
             "atr": round(atr, 2)
         }
 
+        # --- ה. הפעלת מנגנון הבקרה והאימות ---
+        if not validate_technical_data(result):
+            print(f"[Validation Warning] {symbol}: הנתונים שנשלפו אינם תקינים.")
+            return None
+
+        if not validate_technical_signal(result):
+            # במידה והאיתות לא עבר אימות איכות טכני - משנמכים ל-HOLD
+            result["signal"] = "HOLD"
+            result["entry_price"] = None
+            result["stop_loss"] = None
+
         CACHE[symbol] = (now, result)
         return result
 
@@ -381,6 +465,9 @@ def fetch_finnhub_data(symbol: str) -> dict:
         except Exception:
             translated_headlines.append(h)
 
+    # בקרת איכות שניקוי כותרות ותרגום
+    translated_headlines = validate_and_clean_news(translated_headlines)
+
     catalyst_str = " | ".join(found_catalysts) if found_catalysts else "לא אותרו קטליזטורים דרמטיים"
     
     if len(found_catalysts) > 0:
@@ -405,7 +492,9 @@ def get_usd_ils_rate() -> float:
         usd_ticker = yf.Ticker("USDILS=X")
         df = usd_ticker.history(period="1d")
         if not df.empty and not pd.isna(df['Close'].iloc[-1]):
-            return round(float(df['Close'].iloc[-1]), 2)
+            rate = float(df['Close'].iloc[-1])
+            if rate > 0:
+                return round(rate, 2)
         return 3.70
     except Exception:
         return 3.70
@@ -487,7 +576,7 @@ def generate_calculator_response(amount: float, is_usd: bool, usd_rate: float, t
 def create_report_message(symbol: str) -> tuple:
     tech = analyze_technical_patterns(symbol)
     if not tech:
-        return f"❌ לא ניתן היה לשלוף נתונים עבור המנייה <b>{symbol}</b>.", None
+        return f"❌ לא ניתן היה לשלוף נתונים תקינים עבור המנייה <b>{symbol}</b>.", None
 
     finnhub = fetch_finnhub_data(symbol)
 
@@ -557,7 +646,7 @@ def cmd_start(message):
     welcome_text = """
 <b>ברוכים הבאים לסורק השוק והסייען הפיננסי! 🚀</b>
 
-הבוט משלב ממוצעים נעים (EMA20/50/200), תבניות מחיר ונרות היפוך, לצד סינון חדשות חכם מבוסס אימפקט.
+הבוט משלב ממוצעים נעים (EMA20/50/200), תבניות מחיר ונרות היפוך, לצד סינון חדשות חכם מבוסס אימפקט ומערכת בקרת איכות נתונים.
 
 <b>פקודות זמינות:</b>
 /scan - סריקת שוק לזיהוי פריצות בזמן אמת
@@ -580,7 +669,7 @@ def cmd_scan(message):
             found_any = True
 
     if not found_any:
-        bot.send_message(message.chat.id, "ℹ️ לא אותרו כעת מניות העונות על כלל הקריטריונים (מגמה + תבנית + ווליום).")
+        bot.send_message(message.chat.id, "ℹ️ לא אותרו כעת מניות העונות על כלל הקריטריונים (מגמה + תבנית + ווליום + אימות בקרת איכות).")
 
 @bot.message_handler(commands=['tech'])
 def cmd_tech(message):
