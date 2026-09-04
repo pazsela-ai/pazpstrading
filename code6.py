@@ -34,12 +34,15 @@ translator = GoogleTranslator(source='auto', target='iw')
 # מנגנוני נעילה לגישה בטוחה מרובת תהליכונים
 CACHE_LOCK = threading.Lock()
 DB_LOCK = threading.Lock()
+SECTOR_LOCK = threading.Lock()
 
 CACHE: Dict[str, Tuple[float, dict]] = {}
 CACHE_TTL = 300  # 5 דקות
 
 KNOWN_TICKERS_SET = set()
 KNOWN_COMPANIES_DICT = {}
+SECTOR_INFO_DICT = {}
+SCAN_SECTOR_COUNTER: Dict[str, int] = {}
 
 # ------------------------------------------------------------------------------
 # 2. מודל נתונים ואחדות ניקוד תבניות (Pattern Registry Framework)
@@ -53,10 +56,10 @@ class PatternResult:
     meta: dict            # נתונים גיאומטריים של התבנית
 
 # ------------------------------------------------------------------------------
-# 3. פונקציות זיהוי תבניות עצמאיות (Pattern Detectors)
+# 3. פונקציות זיהוי תבניות עצמאיות (Pattern Detectors) - משופרות ומלאות
 # ------------------------------------------------------------------------------
 def detect_hammer(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """נר פטיש (Hammer) היפוכי - ניקוד דינמי"""
+    """נר פטיש (Hammer) היפוכי - שורי"""
     o1, h1, l1, c1 = float(df['Open'].iloc[-1]), float(df['High'].iloc[-1]), float(df['Low'].iloc[-1]), float(df['Close'].iloc[-1])
     body = abs(c1 - o1)
     lower_shadow = min(o1, c1) - l1
@@ -75,7 +78,7 @@ def detect_hammer(df: pd.DataFrame, current_price: float, volume_spike: bool) ->
             score += 15
         if volume_spike:
             score += 15
-        if l1 <= df['Low'].iloc[-20:].min():  # בתחתית מקומית
+        if l1 <= df['Low'].iloc[-20:].min():
             score += 10
 
     return PatternResult(
@@ -87,7 +90,7 @@ def detect_hammer(df: pd.DataFrame, current_price: float, volume_spike: bool) ->
     )
 
 def detect_bullish_engulfing(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """בליעה שורית (Bullish Engulfing) - ניקוד דינמי"""
+    """בליעה שורית (Bullish Engulfing)"""
     o1, c1 = float(df['Open'].iloc[-1]), float(df['Close'].iloc[-1])
     o2, c2 = float(df['Open'].iloc[-2]), float(df['Close'].iloc[-2])
 
@@ -115,7 +118,7 @@ def detect_bullish_engulfing(df: pd.DataFrame, current_price: float, volume_spik
     )
 
 def detect_cup_and_handle(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """ספל וידית (Cup & Handle) - כולל בדיקת אורך בסיס ובדיקת ידית קפדנית"""
+    """ספל וידית (Cup & Handle) - שורי"""
     if len(df) < 60:
         return PatternResult(0, False, "ספל וידית", True, {})
 
@@ -126,12 +129,10 @@ def detect_cup_and_handle(df: pd.DataFrame, current_price: float, volume_spike: 
     if not (0.08 <= cup_depth <= 0.38):
         return PatternResult(0, False, "ספל וידית", True, {})
 
-    # בדיקת אורך בסיס הספל (מספר הנרות בין השיא לתחתית)
     idx_high = df['High'].iloc[-60:-15].idxmax()
     idx_low = df['Low'].iloc[-60:-10].idxmin()
     base_length = abs((idx_low - idx_high).days) if hasattr((idx_low - idx_high), 'days') else 20
 
-    # בדיקת הידית (Handle): 5 עד 12 נרות אחרונים של דשדוש בנפח יורד
     handle_df = df.iloc[-12:-2]
     handle_vol_avg = handle_df['Volume'].mean()
     prior_vol_avg = df['Volume'].iloc[-30:-12].mean()
@@ -139,7 +140,6 @@ def detect_cup_and_handle(df: pd.DataFrame, current_price: float, volume_spike: 
     handle_retrace = (high_60 - handle_df['Low'].min()) / high_60
     has_valid_handle = (handle_retrace <= (cup_depth * 0.5)) and (handle_vol_avg < prior_vol_avg)
 
-    # פריצה
     prev_price = float(df['Close'].iloc[-2])
     is_breakout = (current_price > high_60) and (prev_price <= high_60)
 
@@ -163,7 +163,7 @@ def detect_cup_and_handle(df: pd.DataFrame, current_price: float, volume_spike: 
     )
 
 def detect_double_bottom(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """תחתית כפולה (Double Bottom)"""
+    """תחתית כפולה (Double Bottom) - שורי"""
     lows = df['Low'].iloc[-50:-10]
     first_bottom = float(lows.min())
     second_candidates = df['Low'].iloc[-20:-2]
@@ -199,7 +199,7 @@ def detect_double_bottom(df: pd.DataFrame, current_price: float, volume_spike: b
     )
 
 def detect_double_top(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """פסגה כפולה (Double Top) - איתות דובי"""
+    """פסגה כפולה (Double Top) - דובי"""
     highs = df['High'].iloc[-50:-10]
     first_top = float(highs.max())
     second_candidates = df['High'].iloc[-20:-2]
@@ -245,7 +245,6 @@ def detect_ma_crosses(df: pd.DataFrame, current_price: float, volume_spike: bool
     if len(ema50) < 5 or len(ema200) < 5:
         return PatternResult(0, False, "חיתוך ממוצעים", True, {})
 
-    # חיתוך מוזהב ב-5 הנרות האחרונים
     golden_cross = (ema50.iloc[-5] < ema200.iloc[-5]) and (ema50.iloc[-1] > ema200.iloc[-1])
     death_cross = (ema50.iloc[-5] > ema200.iloc[-5]) and (ema50.iloc[-1] < ema200.iloc[-1])
 
@@ -269,13 +268,19 @@ def detect_ma_crosses(df: pd.DataFrame, current_price: float, volume_spike: bool
     return PatternResult(0, False, "חיתוך ממוצעים", True, {})
 
 def detect_macd_cross(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """חיתוך קו MACD ואינדיקטור Signal"""
+    """חיתוך MACD ו-Signal בגישה קשיחה לפי שמות עמודות (סעיף 6)"""
     macd_df = ta.macd(df['Close'])
     if macd_df is None or macd_df.empty:
         return PatternResult(0, False, "MACD Cross", True, {})
 
-    macd_line = macd_df.iloc[:, 0]
-    signal_line = macd_df.iloc[:, 2]
+    macd_cols = [c for c in macd_df.columns if c.startswith('MACD_')]
+    signal_cols = [c for c in macd_df.columns if c.startswith('MACDs_')]
+
+    if not macd_cols or not signal_cols:
+        return PatternResult(0, False, "MACD Cross", True, {})
+
+    macd_line = macd_df[macd_cols[0]]
+    signal_line = macd_df[signal_cols[0]]
 
     bull_cross = (macd_line.iloc[-2] < signal_line.iloc[-2]) and (macd_line.iloc[-1] > signal_line.iloc[-1])
     bear_cross = (macd_line.iloc[-2] > signal_line.iloc[-2]) and (macd_line.iloc[-1] < signal_line.iloc[-1])
@@ -302,7 +307,7 @@ def detect_macd_cross(df: pd.DataFrame, current_price: float, volume_spike: bool
     return PatternResult(0, False, "MACD Cross", True, {})
 
 def detect_triangles(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """זיהוי משולשים (Ascending/Descending/Symmetrical) באמצעות רגרסיה ליניארית"""
+    """זיהוי משולשים מעודכן עם נירמול שיפוע באחוזים (סעיפים 4, 5)"""
     if len(df) < 30:
         return PatternResult(0, False, "משולש", True, {})
 
@@ -310,15 +315,24 @@ def detect_triangles(df: pd.DataFrame, current_price: float, volume_spike: bool)
     x = np.arange(len(sub_df))
     highs = sub_df['High'].values
     lows = sub_df['Low'].values
+    mean_price = float(sub_df['Close'].mean())
 
-    slope_high, _ = np.polyfit(x, highs, 1)
-    slope_low, _ = np.polyfit(x, lows, 1)
+    if mean_price == 0:
+        return PatternResult(0, False, "משולש", True, {})
+
+    # נירמול השיפוע כאחוז ממחיר המניה הממוצע
+    raw_slope_high, _ = np.polyfit(x, highs, 1)
+    raw_slope_low, _ = np.polyfit(x, lows, 1)
+
+    norm_slope_high = raw_slope_high / mean_price
+    norm_slope_low = raw_slope_low / mean_price
 
     prev_price = float(df['Close'].iloc[-2])
     res_line = float(highs[-1])
+    sup_line = float(lows[-1])
 
-    # משולש עולה: התנגדות אופקית (שיפוע קרוב ל-0) ותמיכה עולה
-    if abs(slope_high) < 0.05 and slope_low > 0.1:
+    # 1. משולש עולה (Ascending Triangle) - שורי
+    if abs(norm_slope_high) < 0.0015 and norm_slope_low > 0.002:
         if current_price > res_line and prev_price <= res_line:
             score = 70 + (15 if volume_spike else 0)
             return PatternResult(
@@ -326,24 +340,55 @@ def detect_triangles(df: pd.DataFrame, current_price: float, volume_spike: bool)
                 is_valid=score >= 70,
                 label=f"פריצת משולש עולה (Ascending Triangle) [ביטחון: {score}%]",
                 is_bullish=True,
-                meta={"slope_low": round(slope_low, 3)}
+                meta={"norm_slope_low": round(norm_slope_low, 4)}
+            )
+
+    # 2. משולש יורד (Descending Triangle) - דובי
+    if abs(norm_slope_low) < 0.0015 and norm_slope_high < -0.002:
+        if current_price < sup_line and prev_price >= sup_line:
+            score = 70 + (15 if volume_spike else 0)
+            return PatternResult(
+                score=score,
+                is_valid=score >= 70,
+                label=f"שבירת משולש יורד (Descending Triangle) [ביטחון: {score}%]",
+                is_bullish=False,
+                meta={"norm_slope_high": round(norm_slope_high, 4)}
+            )
+
+    # 3. משולש סימטרי (Symmetrical Triangle)
+    if norm_slope_high < -0.0015 and norm_slope_low > 0.0015:
+        if current_price > res_line and prev_price <= res_line:
+            score = 70 + (10 if volume_spike else 0)
+            return PatternResult(
+                score=score,
+                is_valid=score >= 70,
+                label=f"פריצת משולש סימטרי כלפי מעלה (Symmetrical Triangle) [ביטחון: {score}%]",
+                is_bullish=True,
+                meta={"slope_diff": round(norm_slope_low - norm_slope_high, 4)}
+            )
+        elif current_price < sup_line and prev_price >= sup_line:
+            score = 70 + (10 if volume_spike else 0)
+            return PatternResult(
+                score=score,
+                is_valid=score >= 70,
+                label=f"שבירת משולש סימטרי כלפי מטה (Symmetrical Triangle) [ביטחון: {score}%]",
+                is_bullish=False,
+                meta={"slope_diff": round(norm_slope_low - norm_slope_high, 4)}
             )
 
     return PatternResult(0, False, "משולש", True, {})
 
 def detect_flags_pennants(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """תבניות המשך מגמה: דגל / מטוס נייר (Flag/Pennant)"""
+    """תבניות המשך מגמה: דגל (Flag/Pennant) - שורי"""
     if len(df) < 25:
         return PatternResult(0, False, "דגל", True, {})
 
-    # זיהוי תורן: עלייה של מעל 6% ב-5 נרות בנפח גבוה
     pole_df = df.iloc[-20:-10]
     pole_return = (pole_df['Close'].iloc[-1] - pole_df['Close'].iloc[0]) / pole_df['Close'].iloc[0]
 
     if pole_return < 0.06:
         return PatternResult(0, False, "דגל", True, {})
 
-    # דגל: דשדוש מתון 5-10 נרות בנפח יורד
     flag_df = df.iloc[-10:-1]
     flag_vol_avg = flag_df['Volume'].mean()
     pole_vol_avg = pole_df['Volume'].mean()
@@ -365,17 +410,25 @@ def detect_flags_pennants(df: pd.DataFrame, current_price: float, volume_spike: 
     return PatternResult(0, False, "דגל", True, {})
 
 def detect_wedges(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """זיהוי טריז עולה/יורד (Rising/Falling Wedge)"""
+    """זיהוי טריז עולה/יורד מנורמל (סעיפים 4, 5)"""
     if len(df) < 30:
         return PatternResult(0, False, "טריז", True, {})
 
     sub_df = df.iloc[-30:]
     x = np.arange(len(sub_df))
-    slope_high, _ = np.polyfit(x, sub_df['High'].values, 1)
-    slope_low, _ = np.polyfit(x, sub_df['Low'].values, 1)
+    mean_price = float(sub_df['Close'].mean())
 
-    # טריז יורד שורי: שני הקווים יורדים ומתכנסים, והמחיר פורץ כלפי מעלה
-    if slope_high < -0.05 and slope_low < -0.05 and slope_high > slope_low:
+    if mean_price == 0:
+        return PatternResult(0, False, "טריז", True, {})
+
+    raw_slope_high, _ = np.polyfit(x, sub_df['High'].values, 1)
+    raw_slope_low, _ = np.polyfit(x, sub_df['Low'].values, 1)
+
+    norm_slope_high = raw_slope_high / mean_price
+    norm_slope_low = raw_slope_low / mean_price
+
+    # טריז יורד (Falling Wedge) - שורי
+    if norm_slope_high < -0.001 and norm_slope_low < -0.001 and norm_slope_high > norm_slope_low:
         res_line = sub_df['High'].iloc[-3:-1].max()
         if current_price > res_line:
             score = 70 + (10 if volume_spike else 0)
@@ -384,29 +437,42 @@ def detect_wedges(df: pd.DataFrame, current_price: float, volume_spike: bool) ->
                 is_valid=score >= 70,
                 label=f"פריצת טריז יורד שורי (Falling Wedge) [ביטחון: {score}%]",
                 is_bullish=True,
-                meta={"slope_high": round(slope_high, 3)}
+                meta={"norm_slope_high": round(norm_slope_high, 4)}
+            )
+
+    # טריז עולה (Rising Wedge) - דובי
+    if norm_slope_high > 0.001 and norm_slope_low > 0.001 and norm_slope_high < norm_slope_low:
+        sup_line = sub_df['Low'].iloc[-3:-1].min()
+        if current_price < sup_line:
+            score = 70 + (10 if volume_spike else 0)
+            return PatternResult(
+                score=score,
+                is_valid=score >= 70,
+                label=f"שבירת טריז עולה דובי (Rising Wedge) [ביטחון: {score}%]",
+                is_bullish=False,
+                meta={"norm_slope_low": round(norm_slope_low, 4)}
             )
 
     return PatternResult(0, False, "טריז", True, {})
 
 def detect_head_and_shoulders(df: pd.DataFrame, current_price: float, volume_spike: bool) -> PatternResult:
-    """ראש וכתפיים (Head & Shoulders + Inverse)"""
+    """זיהוי ראש וכתפיים רגיל והפוך (סעיף 5)"""
     if len(df) < 60:
         return PatternResult(0, False, "ראש וכתפיים", True, {})
 
-    # זיהוי ראש וכתפיים הפוך (Inverse - שורי)
+    # 1. ראש וכתפיים הפוך (Inverse H&S) - שורי
     lows = df['Low'].iloc[-50:-2]
-    head_idx = lows.idxmin()
-    head_val = lows.min()
+    head_idx_l = lows.idxmin()
+    head_val_l = lows.min()
 
-    left_shoulder = df['Low'].loc[:head_idx].iloc[-15:-2].min() if len(df['Low'].loc[:head_idx]) > 15 else None
-    right_shoulder = df['Low'].loc[head_idx:].iloc[2:15].min() if len(df['Low'].loc[head_idx:]) > 15 else None
+    left_s_l = df['Low'].loc[:head_idx_l].iloc[-15:-2].min() if len(df['Low'].loc[:head_idx_l]) > 15 else None
+    right_s_l = df['Low'].loc[head_idx_l:].iloc[2:15].min() if len(df['Low'].loc[head_idx_l:]) > 15 else None
 
-    if left_shoulder and right_shoulder:
-        if head_val < left_shoulder and head_val < right_shoulder:
-            shoulder_diff = abs(left_shoulder - right_shoulder) / left_shoulder
+    if left_s_l and right_s_l:
+        if head_val_l < left_s_l and head_val_l < right_s_l:
+            shoulder_diff = abs(left_s_l - right_s_l) / left_s_l
             if shoulder_diff <= 0.08:
-                neckline = df['High'].loc[head_idx:].iloc[:15].max()
+                neckline = df['High'].loc[head_idx_l:].iloc[:15].max()
                 if current_price > neckline:
                     score = 80 + (10 if volume_spike else 0)
                     return PatternResult(
@@ -417,11 +483,32 @@ def detect_head_and_shoulders(df: pd.DataFrame, current_price: float, volume_spi
                         meta={"neckline": neckline, "shoulder_diff_pct": round(shoulder_diff * 100, 1)}
                     )
 
+    # 2. ראש וכתפיים רגיל (Standard H&S) - דובי
+    highs = df['High'].iloc[-50:-2]
+    head_idx_h = highs.idxmax()
+    head_val_h = highs.max()
+
+    left_s_h = df['High'].loc[:head_idx_h].iloc[-15:-2].max() if len(df['High'].loc[:head_idx_h]) > 15 else None
+    right_s_h = df['High'].loc[head_idx_h:].iloc[2:15].max() if len(df['High'].loc[head_idx_h:]) > 15 else None
+
+    if left_s_h and right_s_h:
+        if head_val_h > left_s_h and head_val_h > right_s_h:
+            shoulder_diff = abs(left_s_h - right_s_h) / left_s_h
+            if shoulder_diff <= 0.08:
+                neckline = df['Low'].loc[head_idx_h:].iloc[:15].min()
+                if current_price < neckline:
+                    score = 80 + (10 if volume_spike else 0)
+                    return PatternResult(
+                        score=score,
+                        is_valid=score >= 70,
+                        label=f"שבירת ראש וכתפיים רגיל (Standard H&S) [ביטחון: {score}%]",
+                        is_bullish=False,
+                        meta={"neckline": neckline, "shoulder_diff_pct": round(shoulder_diff * 100, 1)}
+                    )
+
     return PatternResult(0, False, "ראש וכתפיים", True, {})
 
-# ------------------------------------------------------------------------------
 # REGISTRY PATTERN REGISTER
-# ------------------------------------------------------------------------------
 PATTERN_DETECTORS = [
     detect_hammer,
     detect_bullish_engulfing,
@@ -462,6 +549,7 @@ def init_db():
                     stop_loss REAL,
                     tp1 REAL,
                     tp2 REAL,
+                    pattern_type TEXT,
                     outcome TEXT DEFAULT 'PENDING'
                 )
             """)
@@ -497,21 +585,60 @@ def mark_alerted_today(symbol: str):
             cursor.execute("INSERT OR IGNORE INTO daily_alerts (symbol, alert_date) VALUES (?, ?)", (symbol, today_str))
             conn.commit()
 
-def log_alert_history(symbol: str, entry: float, sl: float, tp1: float, tp2: float):
+def log_alert_history(symbol: str, entry: float, sl: float, tp1: float, tp2: float, pattern_type: str):
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with DB_LOCK:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO alert_history (symbol, alert_time, entry_price, stop_loss, tp1, tp2)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (symbol, now_str, entry, sl, tp1, tp2))
+                INSERT INTO alert_history (symbol, alert_time, entry_price, stop_loss, tp1, tp2, pattern_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (symbol, now_str, entry, sl, tp1, tp2, pattern_type))
             conn.commit()
+
+# מנגנון עדכון תוצאות אוטומטי (סעיף 3)
+def update_alert_outcomes_job():
+    print(f"[{datetime.datetime.now()}] 🔄 מריץ בדיקת תוצאות התראות (Outcome Tracking)...")
+    with DB_LOCK:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, symbol, entry_price, stop_loss, tp1, tp2 FROM alert_history WHERE outcome = 'PENDING'")
+            pending_alerts = cursor.fetchall()
+
+    if not pending_alerts:
+        return
+
+    for alert_id, symbol, entry, sl, tp1, tp2 in pending_alerts:
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="10d")
+            if df.empty:
+                continue
+
+            max_high = float(df['High'].max())
+            min_low = float(df['Low'].min())
+
+            new_outcome = 'PENDING'
+            if max_high >= tp2:
+                new_outcome = 'TP2_HIT'
+            elif max_high >= tp1:
+                new_outcome = 'TP1_HIT'
+            elif min_low <= sl:
+                new_outcome = 'SL_HIT'
+
+            if new_outcome != 'PENDING':
+                with DB_LOCK:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE alert_history SET outcome = ? WHERE id = ?", (new_outcome, alert_id))
+                        conn.commit()
+        except Exception as e:
+            print(f"[Outcome Update Error] {symbol}: {e}")
 
 init_db()
 
 def fetch_market_tickers() -> list:
-    global KNOWN_TICKERS_SET, KNOWN_COMPANIES_DICT
+    global KNOWN_TICKERS_SET, KNOWN_COMPANIES_DICT, SECTOR_INFO_DICT
     tickers = set()
 
     try:
@@ -521,8 +648,10 @@ def fetch_market_tickers() -> list:
             for _, row in df_sp.iterrows():
                 sym = str(row['Symbol']).replace('.', '-').strip()
                 name = str(row['Security']).split()[0].lower()
+                sector = str(row.get('Sector', 'General'))
                 tickers.add(sym)
                 KNOWN_COMPANIES_DICT[sym] = name
+                SECTOR_INFO_DICT[sym] = sector
             KNOWN_TICKERS_SET = tickers
     except Exception as e:
         print(f"[Ticker Fetch Error]: {e}")
@@ -542,7 +671,7 @@ def fetch_market_tickers() -> list:
 # ------------------------------------------------------------------------------
 @app.route('/')
 def health_check():
-    return "OK - Trading System Engine v2 Active!", 200
+    return "OK - Trading System Engine v3 Fully Patched!", 200
 
 def keep_alive_ping():
     while True:
@@ -556,15 +685,17 @@ def keep_alive_ping():
 # ------------------------------------------------------------------------------
 # 6. מנוע ניתוח טכני מעודכן ומקור מחיר חי
 # ------------------------------------------------------------------------------
-def fetch_ticker_data_with_retry(symbol: str, retries: int = 3) -> Optional[yf.Ticker]:
-    """שליפה מוגנת מרשת בגישת Retries ו-Rate Limit Control"""
+def fetch_history_with_retry(ticker: yf.Ticker, period: str = "1y", retries: int = 3) -> pd.DataFrame:
+    """סעיף 2: עטיפת קריאת history() במנגנון retry"""
     for attempt in range(retries):
         try:
-            ticker = yf.Ticker(symbol)
-            return ticker
-        except Exception:
-            time.sleep(1 + attempt)
-    return None
+            df = ticker.history(period=period)
+            if not df.empty:
+                return df
+        except Exception as e:
+            print(f"[History Fetch Attempt {attempt+1} Failed]: {e}")
+            time.sleep(1 + attempt * 2)
+    return pd.DataFrame()
 
 def analyze_technical_patterns(symbol: str) -> Optional[dict]:
     now = time.time()
@@ -575,15 +706,11 @@ def analyze_technical_patterns(symbol: str) -> Optional[dict]:
                 return cached_data
 
     try:
-        ticker = fetch_ticker_data_with_retry(symbol)
-        if not ticker:
-            return None
-
-        df = ticker.history(period="1y")
+        ticker = yf.Ticker(symbol)
+        df = fetch_history_with_retry(ticker, period="1y")
         if df.empty or len(df) < 100:
             return None
 
-        # מועדף: מחיר בזמן אמת מ-fast_info
         fast_info = getattr(ticker, 'fast_info', {})
         live_price = fast_info.get('lastPrice', None)
         close_price = float(df['Close'].iloc[-1])
@@ -596,7 +723,7 @@ def analyze_technical_patterns(symbol: str) -> Optional[dict]:
             price_source = "מחיר סגירה אחרון"
 
         price_discrepancy = abs(entry_price - close_price) / close_price
-        price_warning = price_discrepancy > 0.008  # אזהרה מעל 0.8% פער
+        price_warning = price_discrepancy > 0.008
 
         data_timestamp = df.index[-1].strftime('%Y-%m-%d %H:%M UTC')
         prev_price = float(df['Close'].iloc[-2])
@@ -620,16 +747,20 @@ def analyze_technical_patterns(symbol: str) -> Optional[dict]:
         curr_vol = df['Volume'].iloc[-1]
         volume_spike = curr_vol > (avg_vol_20 * 1.4)
 
-        # הרצת כל התבניות מה-Registry
-        detected_patterns = []
-        has_bullish_breakout = False
+        # הרצת כל התבניות מה-Registry וסיווגן לפי כיוון (סעיף 1)
+        bullish_patterns = []
+        bearish_patterns = []
+        max_bullish_score = 0
 
         for detector in PATTERN_DETECTORS:
             res: PatternResult = detector(df, entry_price, volume_spike)
             if res.is_valid:
-                detected_patterns.append(res.label)
                 if res.is_bullish:
-                    has_bullish_breakout = True
+                    bullish_patterns.append(res.label)
+                    if res.score > max_bullish_score:
+                        max_bullish_score = res.score
+                else:
+                    bearish_patterns.append(res.label)
 
         stop_loss = round(entry_price - (1.5 * atr), 2)
 
@@ -645,13 +776,16 @@ def analyze_technical_patterns(symbol: str) -> Optional[dict]:
             "ema50": round(ema50, 2),
             "ema200": round(ema200, 2),
             "volume_accumulating": volume_spike,
-            "patterns": detected_patterns,
-            "has_breakout": has_bullish_breakout,
+            "bullish_patterns": bullish_patterns,
+            "bearish_patterns": bearish_patterns,
+            "max_bullish_score": max_bullish_score,
+            "has_breakout": len(bullish_patterns) > 0,
             "is_uptrend": is_uptrend,
             "rsi_valid": 45 <= rsi <= 68,
             "entry_price": round(entry_price, 2),
             "stop_loss": stop_loss,
-            "atr": round(atr, 2)
+            "atr": round(atr, 2),
+            "sector": SECTOR_INFO_DICT.get(symbol, "General")
         }
 
         with CACHE_LOCK:
@@ -706,7 +840,6 @@ def is_headline_relevant_and_fresh(headline: str, symbol: str, company_name: str
     if not (has_exact_symbol or has_company_name):
         return 0, None, False
 
-    # זיהוי ישויות קפדני המונע False Positives ממילים כגון AI, CEO
     tokens = set(re.findall(r'\b[A-Z]{2,5}\b', headline))
     valid_other_tickers = set()
     for t in tokens:
@@ -793,7 +926,7 @@ def fetch_finnhub_data(symbol: str) -> dict:
     }
 
 # ------------------------------------------------------------------------------
-# 8. ניהול סיכונים ובניית הדוח המאוחד
+# 8. ניהול סיכונים ובניית הדוח המאוחד (כולל שיפורי סעיפים 1, 7, 8, 13)
 # ------------------------------------------------------------------------------
 def calculate_trade_plan(entry_price: float, stop_loss: float) -> dict:
     risk_per_share = entry_price - stop_loss
@@ -819,45 +952,64 @@ def create_report_message(symbol: str) -> Tuple[str, Optional[InlineKeyboardMark
 
     finnhub = fetch_finnhub_data(symbol)
 
+    # סעיף 7: ציון ביטחון גבוה (>=80%) נחשב כמרכיב חמישי
+    pattern_score_high = tech["max_bullish_score"] >= 80
+
     checks = [
         tech["is_uptrend"],
         tech["rsi_valid"],
         tech["has_breakout"] or tech["volume_accumulating"],
-        finnhub["has_valid_news"]
+        finnhub["has_valid_news"],
+        pattern_score_high
     ]
     supported_checks = sum(1 for c in checks if c)
 
     if supported_checks >= 4:
-        recommendation_level = "🟢 <b>המלצת קנייה חזקה (4/4 אינדיקטורים תומכים)</b>"
+        recommendation_level = "🟢 <b>המלצת קנייה חזקה</b>"
         signal_type = "BUY"
     elif supported_checks == 3:
-        recommendation_level = "🟡 <b>המלצת קנייה בינונית (3/4 אינדיקטורים תומכים - זהירות)</b>"
+        recommendation_level = "🟡 <b>המלצת קנייה בינונית (זהירות)</b>"
         signal_type = "BUY"
     elif supported_checks == 2:
-        recommendation_level = "🟠 <b>איתות חלש / בהתהוות (2/4 אינדיקטורים - למעקב בלבד)</b>"
+        recommendation_level = "🟠 <b>איתות חלש / בהתהוות (למעקב בלבד)</b>"
         signal_type = "HOLD"
     else:
-        recommendation_level = "🔴 <b>לא מומלץ כעת (פחות מ-2 אינדיקטורים תומכים)</b>"
+        recommendation_level = "🔴 <b>לא מומלץ כעת</b>"
         signal_type = "NEUTRAL"
 
-    patterns_str = ", ".join(tech["patterns"]) if tech["patterns"] else "לא זוהו תבניות מיוחדות"
+    # סעיף 8: הורדת דרגת המלצה כאשר קיים price_warning
+    if tech["price_warning"] and signal_type == "BUY":
+        if "חזקה" in recommendation_level:
+            recommendation_level = "🟡 <b>המלצת קנייה בינונית (הורדה מדרגת חזקה עקב פער מחיר)</b>"
+        else:
+            recommendation_level = "🟠 <b>איתות חלש / בהתהוות (הורדה עקב פער מחיר)</b>"
+
+    # סעיף 1: הצגת תבניות שוריות בלבד בדוח BUY
+    patterns_str = ", ".join(tech["bullish_patterns"]) if tech["bullish_patterns"] else "לא זוהו תבניות שוריות מיוחדות"
     headlines_str = "\n".join([f"• {h}" for h in finnhub["headlines"]]) if finnhub["headlines"] else "• לא אותרו כותרות איכותיות ב-48h האחרונות"
-    warning_text = "\n⚠️ <b>אזהרה:</b> זוהה פער בין מקור המחיר החי למחיר הסגירה. לוודא מחיר פתיחה.\n" if tech["price_warning"] else ""
+    warning_text = "\n⚠️ <b>אזהרה:</b> זוהה פער בין מחיר חי למחיר סגירה (דרגת ההמלצה הותאמה).\n" if tech["price_warning"] else ""
+
+    # סעיף 13: אזהרת ריכוז סיכון סקטוריאלי
+    sector = tech["sector"]
+    sector_warning = ""
+    with SECTOR_LOCK:
+        if SCAN_SECTOR_COUNTER.get(sector, 0) >= 3:
+            sector_warning = f"\n⚠️ <b>אזהרת ריכוז סיכון:</b> זוהו {SCAN_SECTOR_COUNTER[sector]} איתותים מסקטור {sector} בסריקה זו.\n"
 
     msg = f"""
-<b>📊 דוח ניתוח מקיף עבור {symbol}</b>
+<b>📊 דוח ניתוח מקיף עבור {symbol} (סקטור: {sector})</b>
 <i>זמן עדכון: {tech['data_timestamp']} | מקור: {tech['price_source']}</i>
-{warning_text}
+{warning_text}{sector_warning}
 <b>💡 דירוג המלצה:</b>
 {recommendation_level}
-<b>שקיפות מדדים:</b> {supported_checks}/4 קטגוריות תומכות באיתות.
+<b>שקיפות מדדים:</b> {supported_checks}/5 קטגוריות תומכות באיתות (כולל ציון ביטחון תבנית).
 
 ---
 <b>📈 נתונים טכניים ותבניות שנמצאו:</b>
 • מחיר נוכחי: <code>${tech['current_price']}</code> ({'+' if tech['change_pct']>0 else ''}{tech['change_pct']}%)
 • RSI: <code>{tech['rsi']}</code> | EMA20: <code>${tech['ema20']}</code> | EMA50: <code>${tech['ema50']}</code>
 • ATR (14D): <code>${tech['atr']}</code>
-• <b>תבניות שזוהו:</b> {patterns_str}
+• <b>תבניות שוריות שזוהו:</b> {patterns_str}
 • נפח מסחר חורג (Volume Spike): {'כן 🟢' if tech['volume_accumulating'] else 'רגיל ⚪'}
 
 ---
@@ -880,7 +1032,8 @@ def create_report_message(symbol: str) -> Tuple[str, Optional[InlineKeyboardMark
 • ⚖️ <b>יחס סיכון/סיכוי:</b> <code>1:{plan['risk_reward']}</code>
 • 🛡️ <b>גודל פוזיציה מומלץ:</b> <code>{plan['max_position_pct']}</code>
 """
-        log_alert_history(symbol, plan['entry'], plan['stop_loss'], plan['tp1'], plan['tp2'])
+        p_label = tech["bullish_patterns"][0] if tech["bullish_patterns"] else "General BUY"
+        log_alert_history(symbol, plan['entry'], plan['stop_loss'], plan['tp1'], plan['tp2'], p_label)
 
     markup = InlineKeyboardMarkup(row_width=2)
     btn_chart = InlineKeyboardButton("📈 צפייה בגרף", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
@@ -894,23 +1047,34 @@ def create_report_message(symbol: str) -> Tuple[str, Optional[InlineKeyboardMark
     return msg, markup
 
 # ------------------------------------------------------------------------------
-# 9. סורק אוטומטי וטיפול בפקודות טלגרם
+# 9. סורק אוטומטי, הגנה יזומה וטיפול בפקודות (סעיפים 9, 10, 11, 13)
 # ------------------------------------------------------------------------------
 def is_market_open() -> bool:
-    israel_tz = pytz.timezone('Asia/Jerusalem')
-    now = datetime.datetime.now(israel_tz)
-    if now.weekday() in (5, 6):
+    """סעיף 9: חישוב שעות מסחר לפי שעון מזרח ארה"ב (EST/EDT) המטפל בשינויי DST"""
+    us_tz = pytz.timezone('America/New_York')
+    now_us = datetime.datetime.now(us_tz)
+
+    if now_us.weekday() in (5, 6):
         return False
-    start_time = now.replace(hour=16, minute=30, second=0, microsecond=0)
-    end_time = now.replace(hour=23, minute=0, second=0, microsecond=0)
-    return start_time <= now <= end_time
+
+    market_start = now_us.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_end = now_us.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    return market_start <= now_us <= market_end
 
 def scan_worker_auto(symbol: str):
+    time.sleep(0.2)  # סעיף 10: השהיה יזומה למניעת חסימות IP
+
     if has_alerted_today(symbol):
         return
 
     tech = analyze_technical_patterns(symbol)
     if tech and (tech["has_breakout"] or tech["is_uptrend"]):
+        # מעקב סיכון סקטוריאלי (סעיף 13)
+        sector = tech["sector"]
+        with SECTOR_LOCK:
+            SCAN_SECTOR_COUNTER[sector] = SCAN_SECTOR_COUNTER.get(sector, 0) + 1
+
         users = get_all_users()
         if not users:
             return
@@ -931,21 +1095,35 @@ def scheduled_market_scan():
         return
 
     print(f"[{datetime.datetime.now()}] 🔄 מתחיל סריקת שוק אופטימלית...")
+    with SECTOR_LOCK:
+        SCAN_SECTOR_COUNTER.clear()
+
     tickers = fetch_market_tickers()
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # סעיף 10: הגבלת מספר העובדים במקביל ל-5 בלבד
+    with ThreadPoolExecutor(max_workers=5) as executor:
         executor.map(scan_worker_auto, tickers)
 
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(scheduled_market_scan, 'interval', minutes=15)
+scheduler.add_job(update_alert_outcomes_job, 'cron', hour=23, minute=30)  # סעיף 3: בדיקת תוצאות יומית
 scheduler.start()
 
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     add_user(message.chat.id)
-    bot.reply_to(message, "<b>ברוכים הבאים למערכת איתותי המסחר המשופרת (v2)! 🚀</b>\n\nמנוע זיהוי תבניות מתקדם ואימות צולב בשידור חי.\nהשתמש ב- /scan לסריקה מקיפה או ב- /tech [SYMBOL] לבדיקת מניה.", parse_mode="HTML")
+    bot.reply_to(
+        message,
+        "<b>ברוכים הבאים למערכת איתותי המסחר המשופרת (v3)! 🚀</b>\n\n"
+        "• מנוע תבניות מתקדם כולל נירמול קנה מידה וזיהוי דו-כיווני\n"
+        "• מעקב תוצאות וביצועים היסטוריים (/stats)\n"
+        "• בדיקת Backtest היסטורית לכל מניה (/backtest SYMBOL)\n"
+        "• השתמש ב- /scan לסריקה מקיפה או ב- /tech SYMBOL לבדיקה נקודתית.",
+        parse_mode="HTML"
+    )
 
 def scan_worker_manual(symbol: str) -> Tuple[str, Optional[Tuple[str, Any]]]:
+    time.sleep(0.15)
     tech = analyze_technical_patterns(symbol)
     if tech:
         msg, markup = create_report_message(symbol)
@@ -957,10 +1135,13 @@ def scan_worker_manual(symbol: str) -> Tuple[str, Optional[Tuple[str, Any]]]:
 def cmd_scan(message):
     add_user(message.chat.id)
     tickers = fetch_market_tickers()
-    bot.reply_to(message, f"🔍 מתחיל סריקה מרוכזת של <b>{len(tickers)} מניות</b> במנוע Pattern Registry...", parse_mode="HTML")
+    bot.reply_to(message, f"🔍 מתחיל סריקה מרוכזת מוגנת של <b>{len(tickers)} מניות</b>...", parse_mode="HTML")
+
+    with SECTOR_LOCK:
+        SCAN_SECTOR_COUNTER.clear()
 
     found_any = False
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         results = executor.map(scan_worker_manual, tickers)
         for symbol, report in results:
             if report and report[1] is not None:
@@ -981,12 +1162,147 @@ def cmd_tech(message):
     except IndexError:
         bot.reply_to(message, "⚠️ נא לציין סימול מנייה. לדוגמה: <code>/tech AAPL</code>", parse_mode="HTML")
 
+# פקודת דוח אחוזי הצלחה לפי תבנית (סעיף 3)
+@bot.message_handler(commands=['stats'])
+def cmd_stats(message):
+    with DB_LOCK:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT pattern_type, outcome, COUNT(*) 
+                FROM alert_history 
+                WHERE outcome != 'PENDING'
+                GROUP BY pattern_type, outcome
+            """)
+            rows = cursor.fetchall()
+
+    if not rows:
+        bot.reply_to(message, "📊 אין עדיין נתוני היסטוריית תוצאות סגורות במסד הנתונים.")
+        return
+
+    stats_summary = {}
+    for pattern, outcome, count in rows:
+        if pattern not in stats_summary:
+            stats_summary[pattern] = {'TP1_HIT': 0, 'TP2_HIT': 0, 'SL_HIT': 0, 'TOTAL': 0}
+        stats_summary[pattern][outcome] = count
+        stats_summary[pattern]['TOTAL'] += count
+
+    reply = "<b>📊 דוח ביצועים ואחוזי הצלחה היסטוריים:</b>\n\n"
+    for pattern, data in stats_summary.items():
+        wins = data['TP1_HIT'] + data['TP2_HIT']
+        win_rate = round((wins / data['TOTAL']) * 100, 1) if data['TOTAL'] > 0 else 0
+        reply += f"• <b>{pattern}</b>:\n  - סה\"כ איתותים: {data['TOTAL']} | הצלחות: {wins} ({win_rate}%)\n  - TP1: {data['TP1_HIT']} | TP2: {data['TP2_HIT']} | SL: {data['SL_HIT']}\n\n"
+
+    bot.reply_to(message, reply, parse_mode="HTML")
+
+# כלי בדיקה רטרואקטיבית (Backtest System - סעיף 11)
+def run_backtest_simulation(symbol: str) -> str:
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period="2y")
+        if len(df) < 200:
+            return f"❌ אין מספיק נתונים היסטוריים עבור {symbol}."
+
+        df['EMA20'] = ta.ema(df['Close'], length=20)
+        df['EMA50'] = ta.ema(df['Close'], length=50)
+        df['EMA200'] = ta.ema(df['Close'], length=200)
+        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+
+        total_signals = 0
+        tp_hits = 0
+        sl_hits = 0
+
+        for i in range(100, len(df) - 15):
+            sub_df = df.iloc[:i]
+            curr_p = float(sub_df['Close'].iloc[-1])
+            avg_v = sub_df['Volume'].iloc[-20:].mean()
+            vol_spike = sub_df['Volume'].iloc[-1] > (avg_v * 1.4)
+
+            # בדיקת תבניות שוריות
+            has_pattern = False
+            for detector in PATTERN_DETECTORS:
+                res = detector(sub_df, curr_p, vol_spike)
+                if res.is_valid and res.is_bullish:
+                    has_pattern = True
+                    break
+
+            if has_pattern:
+                total_signals += 1
+                atr = float(sub_df['ATR'].iloc[-1]) if not np.isnan(sub_df['ATR'].iloc[-1]) else 1.0
+                target_tp = curr_p + (1.5 * 1.5 * atr)
+                target_sl = curr_p - (1.5 * atr)
+
+                future_df = df.iloc[i:i+15]
+                hit_tp = (future_df['High'] >= target_tp).any()
+                hit_sl = (future_df['Low'] <= target_sl).any()
+
+                if hit_tp:
+                    tp_hits += 1
+                elif hit_sl:
+                    sl_hits += 1
+
+        win_rate = round((tp_hits / max(total_signals, 1)) * 100, 1)
+        return (
+            f"<b>🔬 תוצאות בדיקת Backtest עבור {symbol} (שנתיים אחורה):</b>\n\n"
+            f"• סה\"כ איתותים שנבדקו: <code>{total_signals}</code>\n"
+            f"• פגיעות ביעד (TP): <code>{tp_hits}</code>\n"
+            f"• פגיעות בסטופ (SL): <code>{sl_hits}</code>\n"
+            f"• 🏆 <b>אחוז הצלחה היסטורי: {win_rate}%</b>"
+        )
+    except Exception as e:
+        return f"❌ שגיאה בהרצת Backtest: {e}"
+
+@bot.message_handler(commands=['backtest'])
+def cmd_backtest(message):
+    try:
+        symbol = message.text.split()[1].upper()
+        bot.reply_to(message, f"⏳ מריץ בדיקת רטרואקטיבית (Backtest) עבור {symbol}...", parse_mode="HTML")
+        res_text = run_backtest_simulation(symbol)
+        bot.send_message(message.chat.id, res_text, parse_mode="HTML")
+    except IndexError:
+        bot.reply_to(message, "⚠️ נא לציין סימול מנייה לבדיקה. לדוגמה: <code>/backtest AAPL</code>", parse_mode="HTML")
+
 # ------------------------------------------------------------------------------
-# 10. הרצת השרת והבוט
+# 10. בדיקות אוטומטיות (Unit Tests - סעיף 12)
+# ------------------------------------------------------------------------------
+def run_unit_tests():
+    print("🧪 מריץ סדרת בדיקות יחידה (Unit Tests) לפונקציות הזיהוי...")
+    dates = pd.date_range(start="2023-01-01", periods=100)
+    
+    # 1. בדיקת Hammer
+    data_hammer = {
+        'Open': [100.0]*99 + [100.0],
+        'High': [101.0]*99 + [100.2],
+        'Low': [99.0]*99 + [94.0],
+        'Close': [100.0]*99 + [99.8],
+        'Volume': [1000]*100
+    }
+    df_hammer = pd.DataFrame(data_hammer, index=dates)
+    res_h = detect_hammer(df_hammer, 99.8, True)
+    assert res_h.is_valid and res_h.is_bullish, "Unit Test Failed: Hammer Detection"
+
+    # 2. בדיקת Bullish Engulfing
+    data_engulfing = {
+        'Open': [100.0]*98 + [100.0, 95.0],
+        'High': [101.0]*98 + [100.5, 103.0],
+        'Low': [99.0]*98 + [94.5, 94.0],
+        'Close': [100.0]*98 + [95.0, 102.0],
+        'Volume': [1000]*100
+    }
+    df_engulfing = pd.DataFrame(data_engulfing, index=dates)
+    res_e = detect_bullish_engulfing(df_engulfing, 102.0, True)
+    assert res_e.is_valid and res_e.is_bullish, "Unit Test Failed: Bullish Engulfing Detection"
+
+    print("✅ כל בדיקות היחידה (Unit Tests) עברו בהצלחה!")
+
+# ------------------------------------------------------------------------------
+# 11. הרצת השרת והבוט
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
+    run_unit_tests()  # הרצת בדיקות היחידה בעליית המערכת
+    
     threading.Thread(target=keep_alive_ping, daemon=True).start()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False), daemon=True).start()
 
-    print("🤖 Telegram Trading System Engine v2 is fully active...")
+    print("🤖 Telegram Trading System Engine v3 Fully Active...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
