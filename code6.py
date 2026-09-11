@@ -47,7 +47,6 @@ TICKERS_CACHE: Dict[str, Any] = {"tickers": [], "fetched_at": 0.0}
 
 SCAN_STATS = {"is_running": False, "last_run_start": None}
 
-# תיקון נקודה 3: פונקציית תרגום מוגנת למניעת שגיאות 500
 def safe_translate(text: str) -> str:
     if not text or not isinstance(text, str):
         return ""
@@ -56,7 +55,7 @@ def safe_translate(text: str) -> str:
         return translated if translated else text
     except Exception as e:
         logger.warning(f"Translation error for text '{text[:20]}...': {e}")
-        return text  # החזרת המקור באנגלית במקום קריסת המערכת
+        return text
 
 # ------------------------------------------------------------------------------
 # 2. מסד נתונים SQLite
@@ -155,7 +154,7 @@ def fetch_all_index_tickers() -> List[dict]:
     return results
 
 # ------------------------------------------------------------------------------
-# 4. מנוע ניתוח חדשות (תיקון תקלה 3)
+# 4. מנוע ניתוח חדשות
 # ------------------------------------------------------------------------------
 HIGH_IMPACT_CATALYSTS = {
     "ביטחוני / גיאופוליטי": ["military", "defense", "pentagon", "contract", "war", "sanctions", "army"],
@@ -167,7 +166,6 @@ def analyze_news_catalysts(symbol: str) -> dict:
     raw_articles = []
     clean_symbol = symbol.replace(".TA", "")
 
-    # ניסיון שליפה מ-Finnhub
     if FINNHUB_API_KEY and FINNHUB_API_KEY != "YOUR_FINNHUB_API_KEY":
         try:
             today = datetime.date.today()
@@ -181,14 +179,12 @@ def analyze_news_catalysts(symbol: str) -> dict:
         except Exception as e:
             logger.warning(f"Finnhub fetch error for {symbol}: {e}")
 
-    # ניסיון שליפה מ-yFinance עם טיפול חסין בשגיאות מבנה
     if not raw_articles:
         try:
             news_items = yf.Ticker(symbol).news
             if news_items and isinstance(news_items, list):
                 for item in news_items:
                     if isinstance(item, dict):
-                        # חילוץ בטוח של כותרת
                         title = item.get("title")
                         if not title and "content" in item and isinstance(item["content"], dict):
                             title = item["content"].get("title")
@@ -221,7 +217,7 @@ def analyze_news_catalysts(symbol: str) -> dict:
     }
 
 # ------------------------------------------------------------------------------
-# 5. מנוע ניתוח טכני (תיקון תקלה 2 - מתן נימוק מקיף בכל מצב)
+# 5. מנוע ניתוח טכני
 # ------------------------------------------------------------------------------
 def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Optional[dict]:
     try:
@@ -260,7 +256,6 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
 
         has_passed_all = is_breakout and is_uptrend and is_high_volume and is_valid_price
 
-        # בניית נימוקים מפורטים ומפורשים
         reasons = []
         if not is_breakout:
             reasons.append(f"❌ **אין פריצת שיא:** המחיר ({curr_price:.2f}) נמוך משיא 20 ימים ({high_20:.2f}) ושיא 50 ימים ({high_50:.2f}).")
@@ -307,7 +302,7 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         return {"error": f"אירעה שגיאה בעיבוד הנתונים הטכניים עבור הסימול {symbol}."}
 
 # ------------------------------------------------------------------------------
-# 6. בניית הודעת דוח (תיקון תקלה 2 - הוספת כפתור גרף ונימוקים בכל מצב)
+# 6. בניית הודעת דוח
 # ------------------------------------------------------------------------------
 def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKeyboardMarkup]:
     symbol = ticker_info["symbol"]
