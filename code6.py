@@ -157,7 +157,7 @@ def fetch_all_index_tickers() -> List[dict]:
             if sym not in seen:
                 results.append({"symbol": sym, "index": "S&P 500", "currency": "USD"})
                 seen.add(sym)
-        logger.info(f"Loaded S&P 500 tickers successfully.")
+        logger.info("Loaded S&P 500 tickers successfully.")
     except Exception as e:
         logger.warning(f"Failed loading S&P 500 dynamically: {e}")
 
@@ -170,7 +170,7 @@ def fetch_all_index_tickers() -> List[dict]:
             if sym not in seen:
                 results.append({"symbol": sym, "index": "NASDAQ 100", "currency": "USD"})
                 seen.add(sym)
-        logger.info(f"Loaded NASDAQ 100 tickers successfully.")
+        logger.info("Loaded NASDAQ 100 tickers successfully.")
     except Exception as e:
         logger.warning(f"Failed loading NASDAQ 100 dynamically: {e}")
 
@@ -467,7 +467,7 @@ def run_scan_process(target_chat_id: Optional[int] = None):
         SCAN_STATS["last_run_start"] = datetime.datetime.now()
         SCAN_STATS["last_run_status"] = "סורק כעת..."
 
-    logger.info("🚀 מתחיל סריקת מניות ברקע (S&P 500, NASDAQ 100, ת"א 125)...")
+    logger.info("🚀 מתחיל סריקת מניות ברקע (S&P 500, NASDAQ 100, תל אביב 125)...")
     found_count = 0
     
     try:
