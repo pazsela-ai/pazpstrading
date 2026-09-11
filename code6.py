@@ -47,7 +47,7 @@ TICKERS_CACHE: Dict[str, Any] = {"tickers": [], "fetched_at": 0.0}
 
 SCAN_STATS = {"is_running": False, "last_run_start": None}
 
-# פונקציית תרגום מוגנת עם מנגנון Fallback לפתרון שגיאות 500
+# פונקציית תרגום מוגנת למניעת שגיאות 500/קריסות
 def safe_translate(text: str) -> str:
     if not text:
         return text
@@ -56,7 +56,7 @@ def safe_translate(text: str) -> str:
         return translated if translated else text
     except Exception as e:
         logger.warning(f"Translation failed for text: '{text[:20]}...'. Error: {e}")
-        return text  # החזרת הטקסט המקורי באנגלית במקום קריסת המערכת או שגיאת 500
+        return text  # החזרת הטקסט המקורי באנגלית במידה והתרגום נכשל
 
 # ------------------------------------------------------------------------------
 # 2. מסד נתונים SQLite (bot_database.db)
@@ -167,31 +167,38 @@ def analyze_news_catalysts(symbol: str) -> dict:
     raw_articles = []
     clean_symbol = symbol.replace(".TA", "")
 
+    # שליפה מ-Finnhub
     if FINNHUB_API_KEY and FINNHUB_API_KEY != "YOUR_FINNHUB_API_KEY":
         try:
             today = datetime.date.today()
             from_date = (today - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
             news_url = f"https://finnhub.io/api/v1/company-news?symbol={clean_symbol}&from={from_date}&to={today.strftime('%Y-%m-%d')}&token={FINNHUB_API_KEY}"
-            res = requests.get(news_url, timeout=3)
+            res = requests.get(news_url, timeout=4)
             if res.status_code == 200:
                 for item in res.json():
-                    if item.get("headline"): raw_articles.append(item.get("headline"))
-        except Exception: pass
+                    if isinstance(item, dict) and item.get("headline"):
+                        raw_articles.append(item.get("headline"))
+        except Exception as e:
+            logger.warning(f"Finnhub fetch error for {symbol}: {e}")
 
+    # שליפה מגיבוי yFinance (מטפל במבני נתונים שונים למניעת שגיאת 500)
     if not raw_articles:
         try:
             news_items = yf.Ticker(symbol).news
-            if news_items:
+            if news_items and isinstance(news_items, list):
                 for item in news_items:
-                    title = item.get("title", "")
-                    if title: raw_articles.append(title)
-        except Exception: pass
+                    if isinstance(item, dict):
+                        title = item.get("title") or (item.get("content", {}).get("title") if isinstance(item.get("content"), dict) else None)
+                        if title:
+                            raw_articles.append(str(title))
+        except Exception as e:
+            logger.warning(f"yFinance news fetch error for {symbol}: {e}")
 
     matched_categories = set()
     meaningful_headlines = []
 
-    for headline in raw_articles[:4]:
-        headline_lower = headline.lower()
+    for headline in raw_articles[:5]:
+        headline_lower = str(headline).lower()
         for cat, keywords in HIGH_IMPACT_CATALYSTS.items():
             if any(kw in headline_lower for kw in keywords):
                 matched_categories.add(cat)
@@ -201,7 +208,7 @@ def analyze_news_catalysts(symbol: str) -> dict:
     selected_headlines = meaningful_headlines[:2] if meaningful_headlines else raw_articles[:2]
     
     for h in selected_headlines:
-        translated_headlines.append(safe_translate(h))
+        translated_headlines.append(safe_translate(str(h)))
 
     return {
         "category": ", ".join(matched_categories) if matched_categories else "כללי / ללא זרז חריג",
@@ -233,8 +240,8 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
 
-        ema20 = float(df['EMA20'].iloc[-1])
-        ema50 = float(df['EMA50'].iloc[-1])
+        ema20 = float(df['EMA20'].iloc[-1]) if not pd.isna(df['EMA20'].iloc[-1]) else curr_price
+        ema50 = float(df['EMA50'].iloc[-1]) if not pd.isna(df['EMA50'].iloc[-1]) else curr_price
         rsi = float(df['RSI'].iloc[-1]) if not pd.isna(df['RSI'].iloc[-1]) else 50.0
         atr = float(df['ATR'].iloc[-1]) if not pd.isna(df['ATR'].iloc[-1]) else (curr_price * 0.02)
 
@@ -437,9 +444,9 @@ def handle_start(message):
         "הבוט מחובר כעת וסורק ברקע את המדדים <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b>. "
         "בכל פעם שתזוהה פריצה טכנית איכותית, תשלח התראה אוטומטית לפה!\n\n"
         "📋 <b>הנה כל הפקודות שתוכלי להזין בבוט:</b>\n\n"
-        "• /start - הצגת הודעת פתיחה ותפריט הפקודות\n"
+        "• /start - הצגת הודעת פתיחה זו ותפריט הפקודות\n"
         "• /scan - הפעלת סריקה ידנית מיידית ברקע על כל המדדים\n"
-        "• /tech <SYMBOL> - ניתוח טכני ממוקד. אם אין פריצה – תקבלי **נימוקים מפורטים וגרף** (לדוגמה: <code>/tech AAPL</code>)\n"
+        "• /tech <SYMBOL> - ניתוח טכני ממוקד. כולל **נימוקים מפורטים וגרף** בכל מצב (לדוגמה: <code>/tech AAPL</code>)\n"
         "• /news <SYMBOL> - סריקת חדשות, כותרות וקטליזטורים בזמן אמת בתרגום לעברית (לדוגמה: <code>/news TSLA</code>)\n"
         "• /status - בדיקת סטטוס סורק הרקע וזמני הריצה"
     )
@@ -491,10 +498,11 @@ def handle_news(message):
     bot.reply_to(message, f"📰 סורק חדשות וזרזים עבור <b>{symbol}</b>...", parse_mode="HTML")
 
     def run_news_single():
-        news_data = analyze_news_catalysts(symbol)
-        news_str = "\n".join([f"• {h}" for h in news_data["headlines"]]) if news_data["headlines"] else "• לא נמצאו חדשות אחרונות."
+        try:
+            news_data = analyze_news_catalysts(symbol)
+            news_str = "\n".join([f"• {h}" for h in news_data["headlines"]]) if news_data["headlines"] else "• לא נמצאו חדשות אחרונות."
 
-        msg = f"""
+            msg = f"""
 📰 <b>סריקת חדשות וקטליזטורים עבור {symbol}</b>
 
 • <b>סיווג זרז חריג:</b> {news_data['category']}
@@ -502,11 +510,14 @@ def handle_news(message):
 <b>כותרות אחרונות (מתורגם):</b>
 {news_str}
 """
-        markup = InlineKeyboardMarkup()
-        btn_chart = InlineKeyboardButton("📈 צפייה בגרף ב-TradingView", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
-        markup.add(btn_chart)
+            markup = InlineKeyboardMarkup()
+            btn_chart = InlineKeyboardButton("📈 צפייה בגרף ב-TradingView", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
+            markup.add(btn_chart)
 
-        bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
+            bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
+        except Exception as e:
+            logger.error(f"Error processing /news command: {e}")
+            bot.send_message(message.chat.id, f"❌ אירעה שגיאה בעת שליפת החדשות עבור <b>{symbol}</b>.", parse_mode="HTML")
 
     threading.Thread(target=run_news_single, daemon=True).start()
 
