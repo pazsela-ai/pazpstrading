@@ -188,7 +188,7 @@ def analyze_news_catalysts(symbol: str) -> dict:
                 meaningful_headlines.append(headline)
 
     translated_headlines = []
-    for h in (meaningful_headlines[:2] if meaningful_headlines else raw_articles[:1]):
+    for h in (meaningful_headlines[:2] if meaningful_headlines else raw_articles[:2]):
         try:
             trans = translator.translate(h)
             translated_headlines.append(trans)
@@ -209,13 +209,12 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
             return None
 
         df = yf.Ticker(symbol).history(period="6m")
-        if df.empty or len(df) < 50: return None
+        if df.empty or len(df) < 50: 
+            return {"error": "לא נמצאו מספיק נתוני מסחר היסטוריים עבור מניה זו."}
 
         curr_price = float(df['Close'].iloc[-1])
         prev_price = float(df['Close'].iloc[-2])
         change_pct = ((curr_price - prev_price) / prev_price) * 100
-
-        if curr_price < CONFIG["MIN_PRICE"]: return None
 
         avg_vol_20 = df['Volume'].iloc[-21:-1].mean()
         curr_vol = df['Volume'].iloc[-1]
@@ -237,13 +236,28 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         is_breakout = curr_price >= high_20 or curr_price >= high_50
         is_uptrend = curr_price > ema20 > ema50
         is_high_volume = vol_ratio >= 1.2
+        is_valid_price = curr_price >= CONFIG["MIN_PRICE"]
 
-        if ignore_cooldown:
-            if not (is_breakout or (is_uptrend and is_high_volume)):
-                return None
+        has_passed_all = is_breakout and is_uptrend and is_high_volume and is_valid_price
+
+        reasons = []
+        if not is_breakout:
+            reasons.append(f"❌ <b>אין פריצת שיא:</b> המחיר ({curr_price:.2f}) נמוך משיא 20 ימים ({high_20:.2f}) ושיא 50 ימים ({high_50:.2f}).")
         else:
-            if not (is_breakout and is_uptrend and is_high_volume):
-                return None
+            reasons.append(f"✅ <b>זוהתה פריצה:</b> המחיר פרץ שיא {'50' if curr_price >= high_50 else '20'} ימים.")
+
+        if not is_uptrend:
+            reasons.append(f"❌ <b>מגמה לא תואמת:</b> השרשרת Price > EMA20 > EMA50 אינה מתקיימת (EMA20={ema20:.2f}, EMA50={ema50:.2f}).")
+        else:
+            reasons.append(f"✅ <b>מגמה עולה:</b> המחיר מעל ממוצעים 20 ו-50.")
+
+        if not is_high_volume:
+            reasons.append(f"❌ <b>מחזור מסחר נמוך:</b> RVOL עומד על {vol_ratio:.2f}x (נדרש לפחות 1.2x).")
+        else:
+            reasons.append(f"✅ <b>מחזור חזק:</b> RVOL עומד על {vol_ratio:.2f}x.")
+
+        if not is_valid_price:
+            reasons.append(f"❌ <b>מחיר נמוך:</b> {curr_price:.2f} (סף מינימלי {CONFIG['MIN_PRICE']}).")
 
         news_data = analyze_news_catalysts(symbol)
 
@@ -253,6 +267,8 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
 
         return {
             "symbol": symbol,
+            "is_valid": has_passed_all,
+            "reasons": reasons,
             "price": round(curr_price, 2),
             "change_pct": round(change_pct, 2),
             "rsi": round(rsi, 1),
@@ -269,7 +285,7 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         return None
 
 # ------------------------------------------------------------------------------
-# 6. בניית הודעת התראה
+# 6. בניית הודעת התראה וניתוח
 # ------------------------------------------------------------------------------
 def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKeyboardMarkup]:
     symbol = ticker_info["symbol"]
@@ -277,7 +293,8 @@ def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKey
 
     news_str = "\n".join([f"• {h}" for h in data["news"]["headlines"]]) if data["news"]["headlines"] else "• לא זוהה זרז חדשותי חריג."
 
-    msg = f"""
+    if data.get("is_valid", True):
+        msg = f"""
 🌟 <b>התראת פריצה טכנית - {symbol}</b>
 <b>מדד:</b> {ticker_info.get('index', 'כללי')}
 
@@ -301,11 +318,31 @@ def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKey
 • 🚀 יעד 1 (TP1 - 1.5R): <code>{curr_symbol}{data['tp1']}</code>
 • 🚀 יעד 2 (TP2 - 2.5R): <code>{curr_symbol}{data['tp2']}</code>
 """
+        markup = InlineKeyboardMarkup(row_width=2)
+        btn_chart = InlineKeyboardButton("📈 צפייה בגרף", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
+        btn_calc = InlineKeyboardButton("💰 חישוב עסקה", callback_data=f"calc_{symbol}_{data['entry']}_{data['stop_loss']}")
+        markup.add(btn_chart, btn_calc)
+    else:
+        reasons_text = "\n".join(data["reasons"])
+        msg = f"""
+🔎 <b>תוצאות ניתוח טכני עבור - {symbol}</b>
 
-    markup = InlineKeyboardMarkup(row_width=2)
-    btn_chart = InlineKeyboardButton("📈 צפייה בגרף", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
-    btn_calc = InlineKeyboardButton("💰 חישוב עסקה", callback_data=f"calc_{symbol}_{data['entry']}_{data['stop_loss']}")
-    markup.add(btn_chart, btn_calc)
+⚠️ <b>המניה לא הגיעה לסף פריצה מלא. נימוקים:</b>
+{reasons_text}
+
+---
+📊 <b>נתונים טכניים כעת:</b>
+• מחיר נוכחי: <code>{curr_symbol}{data['price']}</code> ({'+' if data['change_pct']>0 else ''}{data['change_pct']}%)
+• נפח מסחר יחסי (RVOL): <b>{data['vol_ratio']}x</b>
+• RSI: <code>{data['rsi']}</code>
+
+---
+📰 <b>חדשות אחרונות:</b>
+{news_str}
+"""
+        markup = InlineKeyboardMarkup()
+        btn_chart = InlineKeyboardButton("📈 צפייה בגרף ב-TradingView", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
+        markup.add(btn_chart)
 
     return msg, markup
 
@@ -330,7 +367,7 @@ def run_scan_process(target_chat_id: Optional[int] = None):
         def check_and_send(item):
             nonlocal found_count
             res = analyze_stock_breakout(item["symbol"], ignore_cooldown=(target_chat_id is not None))
-            if res:
+            if res and res.get("is_valid", False):
                 found_count += 1
                 msg, markup = build_breakout_report(item, res)
                 
@@ -358,7 +395,7 @@ def run_scan_process(target_chat_id: Optional[int] = None):
         with SCAN_LOCK:
             SCAN_STATS["is_running"] = False
 
-# תזמון סריקה אוטומטית ברקע - מריץ ושולח מניות באופן יזום!
+# תזמון סריקה אוטומטית ברקע
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(lambda: run_scan_process(), 'interval', minutes=15)
 scheduler.start()
@@ -378,19 +415,21 @@ def keep_alive_ping():
         except Exception: pass
 
 # ------------------------------------------------------------------------------
-# 9. פקודות טלגרם (עם טיפול מיידי ב-/start)
+# 9. פקודות טלגרם 
 # ------------------------------------------------------------------------------
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     add_user(message.chat.id)
     welcome_text = (
         "👋 <b>ברוכים הבאים לבוט סורק המניות האוטומטי!</b>\n\n"
-        "נרשמת בהצלחה לקבלת התראות בזמן אמת! הבוט סורק ברקע את המדדים <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b> "
-        "ויקפיץ לך הודעה אוטומטית בכל פעם שתזוהה פריצה איכותית (Price > EMA20 > EMA50, RVOL > 1.2x ושיאי 20/50 ימים).\n\n"
-        "📋 <b>פקודות זמינות:</b>\n"
-        "• /scan - הפעלת סריקה ידנית מיידית ברקע (Non-blocking)\n"
-        "• /tech <SYMBOL> - ניתוח טכני וחדשותי ממוקד למניה (לדוגמה: <code>/tech AAPL</code> או <code>/tech TEVA.TA</code>)\n"
-        "• /status - בדיקת סטטוס סורק הרקע"
+        "נרשמת בהצלחה לקבלת התראות! הבוט סורק ברקע את המדדים <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b> "
+        "ויקפיץ לך התראה אוטומטית בכל פעם שתזוהה פריצה טכנית איכותית.\n\n"
+        "📋 <b>פקודות זמינות בבוט:</b>\n"
+        "• /start - הצגת הודעת פתיחה ותפריט הפקודות\n"
+        "• /scan - הפעלת סריקה ידנית מיידית ברקע על כל המדדים\n"
+        "• /tech <SYMBOL> - ניתוח טכני וחדשותי ממוקד מלווה בנימוקים וגרף (למשל: <code>/tech AAPL</code>)\n"
+        "• /news <SYMBOL> - סריקה ידנית חדשותית ותרגום כותרות בזמן אמת (למשל: <code>/news TSLA</code>)\n"
+        "• /status - בדיקת סטטוס סורק הרקע וזמני ריצה"
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode="HTML")
 
@@ -409,12 +448,12 @@ def handle_tech(message):
         return
 
     symbol = parts[1].upper().strip()
-    bot.reply_to(message, f"🔍 מריץ ניתוח עבור <b>{symbol}</b>...", parse_mode="HTML")
+    bot.reply_to(message, f"🔍 מריץ ניתוח טכני עבור <b>{symbol}</b>...", parse_mode="HTML")
 
     def run_single():
         res = analyze_stock_breakout(symbol, ignore_cooldown=True)
-        if not res:
-            bot.send_message(message.chat.id, f"❌ לא זוהתה פריצה טכנית מובהקת עבור <b>{symbol}</b> ברגע זה.", parse_mode="HTML")
+        if not res or "error" in res:
+            bot.send_message(message.chat.id, f"❌ שגיאה בניתוח <b>{symbol}</b>: {res.get('error', 'לא התקבלו נתונים')}", parse_mode="HTML")
             return
 
         item = {
@@ -426,6 +465,37 @@ def handle_tech(message):
         bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
 
     threading.Thread(target=run_single, daemon=True).start()
+
+@bot.message_handler(commands=['news'])
+def handle_news(message):
+    add_user(message.chat.id)
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ נא להזין סימול מניה לסריקת חדשות. לדוגמה: <code>/news AAPL</code>", parse_mode="HTML")
+        return
+
+    symbol = parts[1].upper().strip()
+    bot.reply_to(message, f"📰 סורק חדשות וזרזים עבור <b>{symbol}</b>...", parse_mode="HTML")
+
+    def run_news_single():
+        news_data = analyze_news_catalysts(symbol)
+        news_str = "\n".join([f"• {h}" for h in news_data["headlines"]]) if news_data["headlines"] else "• לא נמצאו חדשות אחרונות."
+
+        msg = f"""
+📰 <b>סריקת חדשות וקטליזטורים עבור {symbol}</b>
+
+• <b>סיווג זרז חריג:</b> {news_data['category']}
+
+<b>כותרות אחרונות (מתורגם):</b>
+{news_str}
+"""
+        markup = InlineKeyboardMarkup()
+        btn_chart = InlineKeyboardButton("📈 צפייה בגרף ב-TradingView", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
+        markup.add(btn_chart)
+
+        bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
+
+    threading.Thread(target=run_news_single, daemon=True).start()
 
 @bot.message_handler(commands=['status'])
 def handle_status(message):
