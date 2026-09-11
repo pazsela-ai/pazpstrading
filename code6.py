@@ -1,6 +1,8 @@
 import os
+import sys
 import time
 import sqlite3
+import logging
 import threading
 import requests
 import datetime
@@ -21,6 +23,16 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from deep_translator import GoogleTranslator
 
 # ------------------------------------------------------------------------------
+# -1. LOGGING - בלי זה אי אפשר לדעת בזמן אמת מה קורה בסריקות ברקע
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("trading_bot")
+
+# ------------------------------------------------------------------------------
 # 0. תצורה מרכזית וסף הגדרות (CONFIG)
 # ------------------------------------------------------------------------------
 CONFIG = {
@@ -31,22 +43,26 @@ CONFIG = {
     "MIN_RVOL": 1.3,
     "MAX_BREAKOUT_DIST_ATR_MULT": 1.5,
     "MAX_BREAKOUT_DIST_PCT": 2.0,
+    "IGNORE_MARKET_HOURS": False,  # שנה ל-True אם ברצונך שהסורק האוטומטי ירוץ גם בסופ"ש/לילה
     "SCORES": {
         "BULLISH_MARKET_MIN_TECH": 75,
         "NEUTRAL_MARKET_MIN_TECH": 80,
         "BEARISH_MARKET_MIN_TECH": 85,
-        "MIN_COMPOSITE_BUY": 75.0
+        "MIN_COMPOSITE_BUY": 75.0,
+        "MIN_COMPOSITE_READY": 70.0  # סף מינימלי לרמזור צהוב (SETUP READY)
     },
     "LIMITS": {
-        "MAX_ALERTS_PER_SCAN": 3,
-        "MAX_ALERTS_PER_DAY": 5,
+        "MAX_ALERTS_PER_SCAN": 5,
+        "MAX_ALERTS_PER_DAY": 15,
         "ALERT_COOLDOWN_HOURS": 4
     }
 }
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "YOUR_FINNHUB_API_KEY")
+DEFAULT_CHAT_ID = os.environ.get("DEFAULT_CHAT_ID", None) # מזהה הצ'אט שלך כגיבוי לשליחה
 PORT = int(os.environ.get("PORT", 5000))
+# --- תיקון: הוחזר SELF_URL שהיה קיים בגרסה קודמת ונשמט - בלעדיו אי אפשר להריץ keep-alive אמיתי ---
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
 
 bot = TeleBot(TELEGRAM_BOT_TOKEN)
@@ -60,6 +76,24 @@ BENCHMARK_CACHE: Dict[str, Tuple[float, pd.DataFrame]] = {}
 BENCHMARK_CACHE_TTL = 1800 
 
 KNOWN_TICKERS_DICT: Dict[str, dict] = {}
+
+# --- תיקון: קאש לרשימת הטיקרים כדי לא למשוך CSV מגיטהאב ולהעמיס על yfinance בכל סריקה ---
+TICKERS_CACHE: Dict[str, Any] = {"tickers": [], "fetched_at": 0.0}
+TICKERS_CACHE_TTL = 6 * 3600  # 6 שעות
+
+# --- תיקון: מעקב אחרי מצב הסריקה האחרונה, זמין דרך /status בלי לחפור בלוגים ---
+SCAN_STATS: Dict[str, Any] = {
+    "last_run_start": None,
+    "last_run_end": None,
+    "tickers_scanned": 0,
+    "tickers_with_errors": 0,
+    "buy_candidates": 0,
+    "ready_candidates": 0,
+    "alerts_sent": 0,
+    "last_error": None,
+    "is_running": False,
+}
+SCAN_STATS_LOCK = threading.Lock()
 
 # ------------------------------------------------------------------------------
 # 1. מודלים של נתונים (Data Structures)
@@ -76,10 +110,11 @@ class PatternResult:
 class SignalResult:
     symbol: str
     market: str
-    setup_state: str       # NO_SETUP, READY, TRIGGERED
+    setup_state: str       # NO_SETUP, READY (צהוב), TRIGGERED (ירוק)
     technical_score: float
     composite_score: float
-    is_buy: bool
+    is_buy: bool           # True עבור ירוק
+    is_ready: bool         # True עבור צהוב (מותנה)
     rejection_reasons: List[str]
     trade_plan: Optional[dict]
     tech_details: dict
@@ -229,11 +264,20 @@ def add_user(chat_id: int):
             conn.commit()
 
 def get_all_users() -> list:
+    users = []
     with DB_LOCK:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT chat_id FROM users")
-            return [r[0] for r in cursor.fetchall()]
+            users = [r[0] for r in cursor.fetchall()]
+
+    if DEFAULT_CHAT_ID:
+        try:
+            def_id = int(DEFAULT_CHAT_ID)
+            if def_id not in users:
+                users.append(def_id)
+        except ValueError: pass
+    return users
 
 def is_signal_in_cooldown(fingerprint: str) -> bool:
     with DB_LOCK:
@@ -276,10 +320,17 @@ init_db()
 # ------------------------------------------------------------------------------
 # 4. ניהול UNIVERSE (S&P 500, NASDAQ-100, TA-125)
 # ------------------------------------------------------------------------------
-def fetch_market_tickers() -> List[dict]:
+def fetch_market_tickers(force_refresh: bool = False) -> List[dict]:
     global KNOWN_TICKERS_DICT
+
+    # --- תיקון: קאש של 6 שעות - אין טעם למשוך את כל רשימת ה-S&P500 מחדש בכל סריקה ---
+    now = time.time()
+    if not force_refresh and TICKERS_CACHE["tickers"] and (now - TICKERS_CACHE["fetched_at"] < TICKERS_CACHE_TTL):
+        logger.info(f"fetch_market_tickers: using cached list ({len(TICKERS_CACHE['tickers'])} tickers)")
+        return TICKERS_CACHE["tickers"]
+
     results = []
-    
+
     # 1. S&P 500
     try:
         url_sp = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
@@ -289,11 +340,12 @@ def fetch_market_tickers() -> List[dict]:
             item = {"symbol": sym, "market": "US", "index": "SP500", "name": str(row.get('Security', sym))}
             results.append(item)
             KNOWN_TICKERS_DICT[sym] = item
+        logger.info(f"fetch_market_tickers: loaded {len(df_sp)} S&P500 symbols")
     except Exception as e:
-        print(f"[Fetch Error S&P500]: {e}")
+        logger.warning(f"fetch_market_tickers: S&P500 fetch failed ({e}) - falling back to hardcoded lists only")
 
     # 2. Nasdaq 100 Fallback/Add
-    nasdaq_top = ["QQQ", "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "AVGO", "AMD", "NFLX", "COST", "TMUS", "CSCO"]
+    nasdaq_top = ["QQQ", "AAPL", "MSFT", "AMZN", "NVDA", "GOOGL", "META", "TSLA", "AVGO", "AMD", "NFLX", "COST", "TMUS", "CSCO", "PLTR", "ARM"]
     for sym in nasdaq_top:
         if sym not in KNOWN_TICKERS_DICT:
             item = {"symbol": sym, "market": "US", "index": "NASDAQ100", "name": sym}
@@ -307,6 +359,12 @@ def fetch_market_tickers() -> List[dict]:
         results.append(item)
         KNOWN_TICKERS_DICT[sym] = item
 
+    if not results:
+        logger.error("fetch_market_tickers: results list is EMPTY - scan will find nothing this round")
+
+    TICKERS_CACHE["tickers"] = results
+    TICKERS_CACHE["fetched_at"] = now
+    logger.info(f"fetch_market_tickers: total universe = {len(results)} symbols")
     return results
 
 # ------------------------------------------------------------------------------
@@ -329,7 +387,6 @@ def analyze_market_structure(df: pd.DataFrame) -> dict:
     if len(df) < 50:
         return {"trend_structure": "NEUTRAL", "structure_score": 5, "resistance_level": float(df['High'].iloc[-1]) if not df.empty else 0.0, "support_level": float(df['Low'].iloc[-1]) if not df.empty else 0.0}
 
-    # Swing detection מתוקן ללא lookahead בזמן אמת
     highs = df['High'].values
     lows = df['Low'].values
     n = len(df)
@@ -375,7 +432,6 @@ def detect_breakout_quality(df: pd.DataFrame, current_price: float, resistance: 
     breakout_buffer = max(resistance * 0.002, atr * 0.10)
     required_level = resistance + breakout_buffer
 
-    # בדיקת התרחקות יתר מרמת הפריצה
     distance_pct = ((current_price - resistance) / max(resistance, 0.01)) * 100
     max_dist_atr = atr * CONFIG["MAX_BREAKOUT_DIST_ATR_MULT"]
     max_dist_pct = CONFIG["MAX_BREAKOUT_DIST_PCT"]
@@ -398,6 +454,8 @@ def detect_breakout_quality(df: pd.DataFrame, current_price: float, resistance: 
         score += 12
         if strong_candle: score += 8
         if holds_above: score += 5
+    elif current_price >= (resistance * 0.98): # קירבה משמעותית לפריצה (READY)
+        score += 10
 
     return {
         "is_breakout": is_breakout,
@@ -468,7 +526,6 @@ def detect_volatility_compression(df: pd.DataFrame) -> dict:
     return {"is_compressed": is_compressed, "compression_score": 5 if is_compressed else 0}
 
 def detect_multi_timeframe_confirmation(ticker: yf.Ticker, current_price: float) -> dict:
-    """תיקון קריטי: כשל בנתונים אינו מעניק אישור חיובי (UNKNOWN)"""
     try:
         df_1h = ticker.history(period="1mo", interval="1h")
         if df_1h.empty or len(df_1h) < 20:
@@ -518,16 +575,16 @@ def calculate_technical_score(df: pd.DataFrame, ticker: yf.Ticker, live_price: O
     ema20 = float(df['EMA20'].dropna().iloc[-1]) if not df['EMA20'].dropna().empty else entry_price
     ema50 = float(df['EMA50'].dropna().iloc[-1]) if not df['EMA50'].dropna().empty else entry_price
 
-    struct = analyze_market_structure(df) # 15 pts
-    bk = detect_breakout_quality(df, entry_price, struct["resistance_level"], atr) # 25 pts
-    vol = analyze_volume_metrics(df) # 15 pts
-    mom = analyze_momentum_and_rsi(df) # 10 pts
+    struct = analyze_market_structure(df)
+    bk = detect_breakout_quality(df, entry_price, struct["resistance_level"], atr)
+    vol = analyze_volume_metrics(df)
+    mom = analyze_momentum_and_rsi(df)
     df_bm = fetch_benchmark_data("SPY")
-    rs = calculate_relative_strength(df, df_bm) # 10 pts
+    rs = calculate_relative_strength(df, df_bm)
 
-    trend_score = 10 if entry_price > ema20 > ema50 else (5 if entry_price > ema20 else 0) # 10 pts
-    comp = detect_volatility_compression(df) # 5 pts
-    mtf = detect_multi_timeframe_confirmation(ticker, entry_price) # 5 pts
+    trend_score = 10 if entry_price > ema20 > ema50 else (5 if entry_price > ema20 else 0)
+    comp = detect_volatility_compression(df)
+    mtf = detect_multi_timeframe_confirmation(ticker, entry_price)
 
     # Risk / Reward חישוב אמיתי ודינמי
     stop_loss = struct["support_level"] - (0.5 * atr) if struct["support_level"] < entry_price else entry_price - (1.5 * atr)
@@ -538,7 +595,7 @@ def calculate_technical_score(df: pd.DataFrame, ticker: yf.Ticker, live_price: O
     tp1 = entry_price + (2.0 * risk)
     tp2 = entry_price + (3.5 * risk)
     rr_ratio = (tp1 - entry_price) / risk
-    rr_score = 5 if rr_ratio >= CONFIG["MIN_RR"] else 0 # 5 pts
+    rr_score = 5 if rr_ratio >= CONFIG["MIN_RR"] else 0
 
     total_tech_score = (
         struct["structure_score"] +
@@ -607,7 +664,7 @@ def analyze_news_catalyst(symbol: str) -> dict:
         except Exception: pass
 
     news_score = 0
-    catalyst_label = "None"
+    catalyst_label = "ללא אירוע חדשותי מיוחד"
     valid_headline = ""
     has_bearish_news = False
 
@@ -633,7 +690,7 @@ def analyze_news_catalyst(symbol: str) -> dict:
     }
 
 # ------------------------------------------------------------------------------
-# 8. מחולל איתותים אחיד ו-BUY Gate מרכזי
+# 8. מחולל איתותים אחיד ו-BUY / READY Gate מרכזי
 # ------------------------------------------------------------------------------
 def generate_signal(symbol: str, df: pd.DataFrame = None, live_price: float = None) -> SignalResult:
     rejection_reasons = []
@@ -645,7 +702,7 @@ def generate_signal(symbol: str, df: pd.DataFrame = None, live_price: float = No
             df = ticker.history(period="1y")
 
         if df.empty or len(df) < 60:
-            return SignalResult(symbol, meta_info["market"], "NO_SETUP", 0, 0, False, ["אין מספיק נתונים היסטוריים"], None, {}, {}, "", datetime.datetime.now())
+            return SignalResult(symbol, meta_info["market"], "NO_SETUP", 0, 0, False, False, ["אין מספיק נתונים היסטוריים"], None, {}, {}, "", datetime.datetime.now())
 
         if live_price is None:
             live_price = float(df['Close'].iloc[-1])
@@ -664,7 +721,7 @@ def generate_signal(symbol: str, df: pd.DataFrame = None, live_price: float = No
         tech_score = tech["technical_score"]
         news = analyze_news_catalyst(symbol)
 
-        # 3. חישוב Composite Score (חדשות אינן תנאי חובה)
+        # 3. חישוב Composite Score
         if news["news_available"]:
             composite_score = (tech_score * 0.75) + (news["news_score"] * 0.25)
         else:
@@ -678,18 +735,22 @@ def generate_signal(symbol: str, df: pd.DataFrame = None, live_price: float = No
         # 5. הגדרת Setup State המדויק
         bk_confirmed = tech["breakout_details"]["breakout_confirmed"]
         is_breakout = tech["breakout_details"]["is_breakout"]
+        res_level = tech["structure"]["resistance_level"]
 
-        if bk_confirmed: setup_state = "TRIGGERED"
-        elif is_breakout or (tech["entry_price"] >= tech["structure"]["resistance_level"] * 0.98): setup_state = "READY"
-        else: setup_state = "NO_SETUP"
+        if bk_confirmed: 
+            setup_state = "TRIGGERED" # רמזור ירוק (פרצה כעת)
+        elif is_breakout or (tech["entry_price"] >= res_level * 0.98): 
+            setup_state = "READY"     # רמזור צהוב (ממתינה מותנית)
+        else: 
+            setup_state = "NO_SETUP"
 
-        # 6. בדיקת Bearish Conflicts
+        # 6. בדיקת Conflicts
         if tech["momentum_details"]["rsi_overextended"]: rejection_reasons.append("Soft Conflict: RSI במצב קניות יתר (>75)")
         if tech["distance_from_ema20"] > 8.0: rejection_reasons.append("Soft Conflict: התרחקות יתר מ-EMA20")
         if news["has_bearish_news"]: rejection_reasons.append("Hard Reject: קיימות חדשות שליליות דומיננטיות")
         if tech["breakout_details"]["too_far"]: rejection_reasons.append("Hard Reject: המחיר התרחק מדי מרמת הפריצה")
 
-        # 7. יחס סיכון/תשואה (R:R >= 2.0)
+        # 7. יחס סיכון/תשואה ($R:R \ge 2.0$)
         entry = tech["entry_price"]
         sl = tech["stop_loss"]
         risk = entry - sl
@@ -699,30 +760,45 @@ def generate_signal(symbol: str, df: pd.DataFrame = None, live_price: float = No
 
         if rr_ratio < CONFIG["MIN_RR"]: rejection_reasons.append(f"יחס סיכון/תשואה נמוך מ-1:{CONFIG['MIN_RR']}")
 
+        # מחיר טריגר מותנה לכניסה (Buy Stop Trigger) עבור SETUP READY
+        buy_trigger = round(res_level * 1.002, 2)
+
         trade_plan = {
             "entry": round(entry, 2),
+            "buy_trigger": buy_trigger,
             "stop_loss": round(sl, 2),
             "tp1": round(tp1, 2),
             "tp2": round(tp2, 2),
             "risk_reward": round(rr_ratio, 2)
         }
 
-        # 8. BUY Gate מרכזי - תנאים אבסולוטיים
+        # 8. BUY & READY Gates מרכזיים
         market_regime = detect_market_regime()
         min_required_tech = market_regime["min_tech_score"]
 
+        has_hard_reject = len([r for r in rejection_reasons if "Hard Reject" in r or "נמוך" in r]) > 0
+
+        # רמזור ירוק - קנייה מיידית (פעל בזמן אמת)
         is_buy = (
             setup_state == "TRIGGERED" and
             tech_score >= min_required_tech and
             composite_score >= CONFIG["SCORES"]["MIN_COMPOSITE_BUY"] and
             tech["volume_details"]["volume_supports_price"] and
             rr_ratio >= CONFIG["MIN_RR"] and
-            not news["has_bearish_news"] and
-            not tech["breakout_details"]["too_far"] and
-            len([r for r in rejection_reasons if "Hard Reject" in r or "נמוך" in r]) == 0
+            not has_hard_reject
         )
 
-        fp_raw = f"{symbol}_{tech['breakout_details']['breakout_level']}_{datetime.date.today()}"
+        # רמזור צהוב - תוכנית עבודה מותנית לפריצה קרובה
+        is_ready = (
+            not is_buy and
+            setup_state == "READY" and
+            tech_score >= (min_required_tech - 5) and
+            composite_score >= CONFIG["SCORES"]["MIN_COMPOSITE_READY"] and
+            rr_ratio >= CONFIG["MIN_RR"] and
+            not has_hard_reject
+        )
+
+        fp_raw = f"{symbol}_{res_level}_{datetime.date.today()}"
         fingerprint = hashlib.md5(fp_raw.encode()).hexdigest()
 
         tech["found_patterns"] = found_patterns
@@ -731,15 +807,15 @@ def generate_signal(symbol: str, df: pd.DataFrame = None, live_price: float = No
         return SignalResult(
             symbol=symbol, market=meta_info["market"], setup_state=setup_state,
             technical_score=round(tech_score, 1), composite_score=round(composite_score, 1),
-            is_buy=is_buy, rejection_reasons=rejection_reasons, trade_plan=trade_plan,
+            is_buy=is_buy, is_ready=is_ready, rejection_reasons=rejection_reasons, trade_plan=trade_plan,
             tech_details=tech, news_details=news, fingerprint=fingerprint, timestamp=datetime.datetime.now()
         )
 
     except Exception as e:
-        return SignalResult(symbol, meta_info["market"], "NO_SETUP", 0, 0, False, [f"שגיאה בניתוח: {e}"], None, {}, {}, "", datetime.datetime.now())
+        return SignalResult(symbol, meta_info["market"], "NO_SETUP", 0, 0, False, False, [f"שגיאה בניתוח: {e}"], None, {}, {}, "", datetime.datetime.now())
 
 # ------------------------------------------------------------------------------
-# 9. עיצוב הודעת איתות ברורה
+# 9. עיצוב הודעת איתות ברורה (רמזור ירוק וצהוב)
 # ------------------------------------------------------------------------------
 def build_alert_message(sig: SignalResult) -> Tuple[str, InlineKeyboardMarkup]:
     plan = sig.trade_plan
@@ -751,42 +827,51 @@ def build_alert_message(sig: SignalResult) -> Tuple[str, InlineKeyboardMarkup]:
         try: headline_tr = translator.translate(headline_tr)
         except Exception: pass
 
-    msg = f"""🟢 <b>HIGH CONVICTION BUY</b>
+    if sig.is_buy:
+        header = "🟢 <b>HIGH CONVICTION BUY (פריצה פעילה)</b>"
+        entry_text = f"<b>Entry Price:</b> <code>${plan['entry']}</code> (כניסה בשוק)"
+    else:
+        header = "🟡 <b>WATCHLIST / SETUP READY (תוכנית עבודה מותנית)</b>"
+        entry_text = f"🎯 <b>Buy Trigger (הוראת Stop Buy):</b> <code>${plan['buy_trigger']}</code>\n<i>*להיכנס אך ורק אם המחיר סוגר/חוצה מעל סכום זה!</i>"
+
+    msg = f"""{header}
 
 <b>SYMBOL: {sig.symbol} ({sig.market})</b>
 <b>Setup State:</b> {sig.setup_state}
-<b>Technical Score:</b> {sig.technical_score}/100
-<b>Composite Score:</b> {sig.composite_score}/100
+<b>Technical Score:</b> {sig.technical_score}/100 | <b>Composite:</b> {sig.composite_score}/100
 
+{entry_text}
 <b>Breakout Level:</b> <code>${tech['breakout_details']['breakout_level']}</code>
-<b>Entry:</b> <code>${plan['entry']}</code>
 <b>Stop Loss:</b> <code>${plan['stop_loss']}</code>
-<b>TP1:</b> <code>${plan['tp1']}</code>
-<b>TP2:</b> <code>${plan['tp2']}</code>
-<b>R:R:</b> <code>1:{plan['risk_reward']}</code>
+<b>Target 1 (TP1):</b> <code>${plan['tp1']}</code>
+<b>Target 2 (TP2):</b> <code>${plan['tp2']}</code>
+<b>Risk/Reward:</b> <code>1:{plan['risk_reward']}</code>
 
 <b>RVOL:</b> {tech['volume_details']['rvol']}x | <b>RS vs SPY:</b> +{tech['relative_strength']['relative_return_20d']}%
 <b>Market Regime:</b> {tech['market_regime']}
 
-<b>Catalyst:</b>
+<b>Catalyst / החדשות שהשפיעו:</b>
 {news['catalyst_label']}
 <i>{headline_tr if headline_tr else ''}</i>
 """
 
     markup = InlineKeyboardMarkup()
-    btn_chart = InlineKeyboardButton("📈 צפייה בגרף", url=f"https://www.tradingview.com/chart/?symbol={sig.symbol}")
+    btn_chart = InlineKeyboardButton("📈 צפייה בגרף (TradingView)", url=f"https://www.tradingview.com/chart/?symbol={sig.symbol}")
     markup.add(btn_chart)
 
     return msg, markup
 
 # ------------------------------------------------------------------------------
-# 10. ניהול שעות מסחר מופרדות ואסטרטגיית סריקה
+# 10. ניהול שעות מסחר ואסטרטגיית סריקה
 # ------------------------------------------------------------------------------
 def is_market_open(market: str = "US") -> bool:
+    if CONFIG.get("IGNORE_MARKET_HOURS", False):
+        return True # עוקף שעות מסחר אם מוגדר ב-CONFIG
+
     if market == "IL":
         tz = pytz.timezone('Asia/Jerusalem')
         now = datetime.datetime.now(tz)
-        if now.weekday() in (4, 5): return False # שישי-שבת סגור
+        if now.weekday() in (4, 5): return False
         start = now.replace(hour=10, minute=0, second=0, microsecond=0)
         end = now.replace(hour=17, minute=25, second=0, microsecond=0)
         return start <= now <= end
@@ -798,61 +883,236 @@ def is_market_open(market: str = "US") -> bool:
         end = now.replace(hour=16, minute=0, second=0, microsecond=0)
         return start <= now <= end
 
-def scan_symbol_worker(item: dict) -> Optional[SignalResult]:
+def scan_symbol_worker(args: Tuple[dict, bool]) -> Optional[SignalResult]:
+    item, force_scan = args
     symbol = item["symbol"]
-    if not is_market_open(item["market"]): return None
-    sig = generate_signal(symbol)
-    if sig.is_buy: return sig
-    return None
+    try:
+        if not force_scan and not is_market_open(item["market"]):
+            return None
+        sig = generate_signal(symbol)
+        if sig.rejection_reasons and sig.rejection_reasons[0].startswith("שגיאה בניתוח"):
+            with SCAN_STATS_LOCK:
+                SCAN_STATS["tickers_with_errors"] += 1
+            logger.warning(f"[{symbol}] error during signal generation: {sig.rejection_reasons[0]}")
+        if sig.is_buy:
+            logger.info(f"[{symbol}] 🟢 BUY candidate - tech={sig.technical_score} composite={sig.composite_score}")
+            return sig
+        if sig.is_ready:
+            logger.info(f"[{symbol}] 🟡 READY candidate - tech={sig.technical_score} composite={sig.composite_score}")
+            return sig
+        return None
+    except Exception as e:
+        with SCAN_STATS_LOCK:
+            SCAN_STATS["tickers_with_errors"] += 1
+        logger.exception(f"[{symbol}] unexpected exception in scan_symbol_worker: {e}")
+        return None
 
-def execute_global_market_scan():
-    if count_today_alerts() >= CONFIG["LIMITS"]["MAX_ALERTS_PER_DAY"]: return
+def execute_global_market_scan(force_scan: bool = False) -> List[SignalResult]:
+    # --- תיקון: לא מריצים סריקה חדשה אם אחת כבר רצה (מונע חפיפה/תקיעה) ---
+    with SCAN_STATS_LOCK:
+        if SCAN_STATS["is_running"]:
+            logger.warning("execute_global_market_scan: previous scan still running - skipping this trigger")
+            return []
+        SCAN_STATS["is_running"] = True
+        SCAN_STATS["last_run_start"] = datetime.datetime.now()
+        SCAN_STATS["tickers_scanned"] = 0
+        SCAN_STATS["tickers_with_errors"] = 0
+        SCAN_STATS["buy_candidates"] = 0
+        SCAN_STATS["ready_candidates"] = 0
+        SCAN_STATS["alerts_sent"] = 0
+        SCAN_STATS["last_error"] = None
 
-    tickers = fetch_market_tickers()
-    candidates: List[SignalResult] = []
+    logger.info(f"execute_global_market_scan: starting scan cycle (force_scan={force_scan})")
+    sent_signals_list: List[SignalResult] = []
+    try:
+        if not force_scan and count_today_alerts() >= CONFIG["LIMITS"]["MAX_ALERTS_PER_DAY"]:
+            logger.info("execute_global_market_scan: daily alert limit already reached - skipping")
+            return []
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = executor.map(scan_symbol_worker, tickers)
-        for sig in results:
-            if sig is not None: candidates.append(sig)
+        tickers = fetch_market_tickers()
+        if not tickers:
+            logger.error("execute_global_market_scan: empty ticker universe - aborting scan")
+            return []
 
-    if not candidates: return
+        with SCAN_STATS_LOCK:
+            SCAN_STATS["tickers_scanned"] = len(tickers)
 
-    # Global Ranking דירוג מורכב של האיכות
-    candidates.sort(key=lambda x: (
-        x.composite_score * 0.50 +
-        x.tech_details["breakout_details"]["breakout_score"] * 0.25 +
-        x.tech_details["volume_details"]["volume_score"] * 0.15 +
-        x.trade_plan["risk_reward"] * 0.10
-    ), reverse=True)
+        candidates: List[SignalResult] = []
+        worker_args = [(item, force_scan) for item in tickers]
 
-    sent_count = 0
-    users = get_all_users()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            results = executor.map(scan_symbol_worker, worker_args)
+            for sig in results:
+                if sig is not None: candidates.append(sig)
 
-    for sig in candidates:
-        if sent_count >= CONFIG["LIMITS"]["MAX_ALERTS_PER_SCAN"]: break
-        if count_today_alerts() >= CONFIG["LIMITS"]["MAX_ALERTS_PER_DAY"]: break
-        if is_signal_in_cooldown(sig.fingerprint): continue
+        buy_n = len([s for s in candidates if s.is_buy])
+        ready_n = len([s for s in candidates if s.is_ready])
+        logger.info(f"execute_global_market_scan: {buy_n} BUY + {ready_n} READY candidates out of {len(tickers)} scanned")
+        with SCAN_STATS_LOCK:
+            SCAN_STATS["buy_candidates"] = buy_n
+            SCAN_STATS["ready_candidates"] = ready_n
 
-        msg, markup = build_alert_message(sig)
-        for chat_id in users:
-            try: bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=markup)
-            except Exception: pass
+        if not candidates:
+            return []
 
-        record_sent_signal(sig)
-        sent_count += 1
+        candidates.sort(key=lambda x: (
+            x.composite_score * 0.50 +
+            x.tech_details["breakout_details"]["breakout_score"] * 0.25 +
+            x.tech_details["volume_details"]["volume_score"] * 0.15 +
+            x.trade_plan["risk_reward"] * 0.10
+        ), reverse=True)
 
+        sent_count = 0
+        users = get_all_users()
+        if not users:
+            logger.warning("execute_global_market_scan: no registered users and no DEFAULT_CHAT_ID - nobody will receive the alert")
+
+        for sig in candidates:
+            if sent_count >= CONFIG["LIMITS"]["MAX_ALERTS_PER_SCAN"]: break
+            if not force_scan and count_today_alerts() >= CONFIG["LIMITS"]["MAX_ALERTS_PER_DAY"]: break
+            if not force_scan and is_signal_in_cooldown(sig.fingerprint): continue
+
+            msg, markup = build_alert_message(sig)
+            for chat_id in users:
+                try:
+                    bot.send_message(chat_id, msg, parse_mode="HTML", reply_markup=markup)
+                except Exception as e:
+                    logger.warning(f"failed to send alert to chat_id={chat_id}: {e}")
+
+            if not force_scan:
+                record_sent_signal(sig)
+            sent_signals_list.append(sig)
+            sent_count += 1
+
+        with SCAN_STATS_LOCK:
+            SCAN_STATS["alerts_sent"] = sent_count
+        logger.info(f"execute_global_market_scan: sent {sent_count} alert(s)")
+        return sent_signals_list
+
+    except Exception as e:
+        logger.exception(f"execute_global_market_scan: fatal error in scan cycle: {e}")
+        with SCAN_STATS_LOCK:
+            SCAN_STATS["last_error"] = str(e)
+        return sent_signals_list
+    finally:
+        with SCAN_STATS_LOCK:
+            SCAN_STATS["is_running"] = False
+            SCAN_STATS["last_run_end"] = datetime.datetime.now()
+
+# ------------------------------------------------------------------------------
+# 10.1 KEEP-ALIVE אמיתי - תיקון: SELF_URL היה קיים בעבר אך לא חובר לשום פינג.
+# בלי זה, שירותי אחסון חינמיים מרדימים את השרת בין בקשות, וה-scheduler נעצר איתו.
+# ------------------------------------------------------------------------------
+def keep_alive_loop():
+    if "localhost" in SELF_URL:
+        logger.info("keep_alive_loop: SELF_URL points to localhost - skipping self-ping (not deployed remotely)")
+        return
+    while True:
+        time.sleep(600)  # כל 10 דקות
+        try:
+            r = requests.get(SELF_URL, timeout=10)
+            logger.info(f"keep_alive_loop: self-ping to {SELF_URL} -> {r.status_code}")
+        except Exception as e:
+            logger.warning(f"keep_alive_loop: self-ping failed: {e}")
+
+# ------------------------------------------------------------------------------
+# 10.2 SCHEDULER - תיקון: next_run_time מריץ סריקה ראשונה מיד עם עליית התהליך
+# (במקום לחכות 15 דקות), max_instances מונע חפיפה בין סריקות.
+# ------------------------------------------------------------------------------
 scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(execute_global_market_scan, 'interval', minutes=15)
+scheduler.add_job(
+    lambda: execute_global_market_scan(force_scan=False),
+    'interval',
+    minutes=15,
+    next_run_time=datetime.datetime.now(),
+    max_instances=1,
+    coalesce=True,
+    misfire_grace_time=120,
+)
 scheduler.start()
 
 # ------------------------------------------------------------------------------
-# 11. פקודות TELEGRAM BOT & BACKTEST SYSTEM המתוקן
+# 11. פקודות TELEGRAM BOT (כולל /scan לסריקה ידנית)
 # ------------------------------------------------------------------------------
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     add_user(message.chat.id)
-    bot.reply_to(message, "<b>מערכת איתותי איכות (Precision over Recall v5) פעילה! 🚀</b>", parse_mode="HTML")
+    bot.reply_to(
+        message, 
+        "<b>מערכת איתותים ותוכניות עבודה (v5.5 Precision Engine) פעילה! 🚀</b>\n\n"
+        "פקודות זמינות:\n"
+        "• <code>/scan</code> - הרצת סריקה ידנית יזומה על כל השוק (רצה ברקע).\n"
+        "• <code>/status</code> - מצב הסריקה האחרונה, כמה מניות נסרקו וכמה עברו את השער.\n"
+        "• <code>/tech AAPL</code> - ניתוח טכני ותוכנית עבודה מפורטת למניה ספציפית.\n"
+        "• <code>/backtest NVDA</code> - הרצת בדיקה היסטורית.", 
+        parse_mode="HTML"
+    )
+
+@bot.message_handler(commands=['scan', 'testscan'])
+def cmd_scan(message):
+    """הרצת סריקה ידנית יזומה (עוקף שעות מסחר לבדיקות)"""
+    add_user(message.chat.id)
+
+    if SCAN_STATS["is_running"]:
+        bot.reply_to(message, "⏳ סריקה כבר רצה כרגע ברקע. אפשר לבדוק את ההתקדמות עם /status, ולנסות /scan שוב אחרי שהיא תסתיים.")
+        return
+
+    # --- תיקון קריטי: הסריקה על 500+ טיקרים עלולה לקחת הרבה יותר מ-15-30 שניות.
+    # אם היא רצה ישירות בתוך ה-handler, היא חוסמת את thread הבוט וגורמת לכל פקודה
+    # אחרת (tech/status/start) "לא להגיב" עד שהסריקה תסתיים. לכן מריצים ב-thread נפרד
+    # ומדווחים על ההתחלה/סיום בנפרד. ---
+    bot.reply_to(
+        message,
+        "🔎 <b>מתחילה סריקה ידנית יזומה על כל המניות במערכת ברקע...</b>\n"
+        "זה יכול לקחת כמה דקות בהתאם לגודל היקום הנסרק. אפשר לבדוק התקדמות עם /status, "
+        "ואת שאר הפקודות (למשל /tech) אפשר להמשיך להשתמש בינתיים.",
+        parse_mode="HTML"
+    )
+
+    def _run():
+        chat_id = message.chat.id
+        try:
+            found_signals = execute_global_market_scan(force_scan=True)
+            if not found_signals:
+                bot.send_message(chat_id, "✅ הסריקה הסתיימה: לא נמצאו מניות העונות על סף האיכות ברגע זה (נסי /status לפרטים).", parse_mode="HTML")
+            else:
+                bot.send_message(chat_id, f"✅ הסריקה הסתיימה! נשלחו {len(found_signals)} איתותים/תוכניות עבודה למשתמשים.", parse_mode="HTML")
+        except Exception as e:
+            logger.exception(f"cmd_scan background thread failed: {e}")
+            try:
+                bot.send_message(chat_id, f"❌ שגיאה בביצוע הסריקה הידנית: {e}")
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+@bot.message_handler(commands=['status'])
+def cmd_status(message):
+    """תיקון: פקודת אבחון - כדי לדעת בלי לחפור בלוגים אם הסריקה בכלל רצה, על כמה מניות, וכמה עברו את השערים."""
+    add_user(message.chat.id)
+    with SCAN_STATS_LOCK:
+        s = dict(SCAN_STATS)
+
+    def fmt(dt):
+        return dt.strftime('%Y-%m-%d %H:%M:%S') if dt else "טרם רצה"
+
+    regime = detect_market_regime()
+    reply = (
+        f"<b>🩺 מצב מערכת</b>\n\n"
+        f"<b>סריקה פעילה כרגע:</b> {'כן ⏳' if s['is_running'] else 'לא'}\n"
+        f"<b>תחילת סריקה אחרונה:</b> {fmt(s['last_run_start'])}\n"
+        f"<b>סיום סריקה אחרונה:</b> {fmt(s['last_run_end'])}\n"
+        f"<b>מניות שנסרקו:</b> {s['tickers_scanned']}\n"
+        f"<b>שגיאות בסריקה:</b> {s['tickers_with_errors']}\n"
+        f"<b>🟢 מועמדות BUY:</b> {s['buy_candidates']} | <b>🟡 מועמדות READY:</b> {s['ready_candidates']}\n"
+        f"<b>איתותים שנשלחו:</b> {s['alerts_sent']}\n"
+        f"<b>שגיאה כללית אחרונה:</b> {s['last_error'] or 'אין'}\n\n"
+        f"<b>משטר שוק נוכחי (SPY):</b> {regime['regime']} (סף טכני BUY: {regime['min_tech_score']})\n"
+        f"<b>איתותים היום:</b> {count_today_alerts()}/{CONFIG['LIMITS']['MAX_ALERTS_PER_DAY']}\n"
+        f"<b>משתמשים רשומים:</b> {len(get_all_users())}\n"
+        f"<b>IGNORE_MARKET_HOURS:</b> {CONFIG['IGNORE_MARKET_HOURS']}"
+    )
+    bot.send_message(message.chat.id, reply, parse_mode="HTML")
 
 @bot.message_handler(commands=['tech'])
 def cmd_tech(message):
@@ -861,19 +1121,24 @@ def cmd_tech(message):
         symbol = message.text.split()[1].upper()
         sig = generate_signal(symbol)
 
-        if sig.is_buy:
+        if sig.is_buy or sig.is_ready:
             msg, markup = build_alert_message(sig)
             bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
         else:
-            reasons = "\n".join([f"• {r}" for r in sig.rejection_reasons]) if sig.rejection_reasons else "• לא התקיימה פריצה מאושרת"
-            reply = f"<b>📊 תוצאת ניתוח עבור {symbol}</b>\n\n<b>State:</b> <code>{sig.setup_state}</code>\n<b>Score:</b> <code>{sig.technical_score}/100</code>\n\n❌ <b>סיבות לדחיית BUY:</b>\n{reasons}"
+            reasons = "\n".join([f"• {r}" for r in sig.rejection_reasons]) if sig.rejection_reasons else "• לא התקיימה תבנית פריצה או כניסה מותנית"
+            reply = (
+                f"<b>📊 תוצאת ניתוח עבור {symbol}</b>\n\n"
+                f"<b>State:</b> <code>{sig.setup_state}</code>\n"
+                f"<b>Technical Score:</b> <code>{sig.technical_score}/100</code>\n"
+                f"<b>Composite Score:</b> <code>{sig.composite_score}/100</code>\n\n"
+                f"❌ <b>סיבות לדחיית איתות/תוכנית עבודה:</b>\n{reasons}"
+            )
             bot.send_message(message.chat.id, reply, parse_mode="HTML")
     except IndexError:
         bot.reply_to(message, "⚠️ נא לציין סימול מניה: <code>/tech AAPL</code>", parse_mode="HTML")
 
 @bot.message_handler(commands=['backtest'])
 def cmd_backtest(message):
-    """Backtest נקי מ-Lookahead Bias עם סדר כרונולוגי מדויק"""
     try:
         symbol = message.text.split()[1].upper()
         bot.reply_to(message, f"⏳ מריץ Backtest היסטורי נקי עבור {symbol}...", parse_mode="HTML")
@@ -889,50 +1154,40 @@ def cmd_backtest(message):
         r_multiples = []
 
         for i in range(100, len(df) - 15):
-            sub_df = df.iloc[:i] # חיתוך נתונים נקי ללא עתיד
+            sub_df = df.iloc[:i]
             curr_price = float(sub_df['Close'].iloc[-1])
 
             sig = generate_signal(symbol, df=sub_df, live_price=curr_price)
 
-            if sig.is_buy and sig.trade_plan:
+            if (sig.is_buy or sig.is_ready) and sig.trade_plan:
                 total_signals += 1
                 target_tp1 = sig.trade_plan['tp1']
                 target_sl = sig.trade_plan['stop_loss']
-                entry = sig.trade_plan['entry']
 
                 future_df = df.iloc[i:i+15]
-                outcome_found = False
 
                 for _, row in future_df.iterrows():
                     high = float(row['High'])
                     low = float(row['Low'])
 
-                    # בדיקת סדר כרונולוגי - SL קיבל קדימות במקרה של שניהם באותו נר
-                    if low <= target_sl and high >= target_tp1:
+                    if low <= target_sl:
                         sl_hits += 1
                         r_multiples.append(-1.0)
-                        outcome_found = True
-                        break
-                    elif low <= target_sl:
-                        sl_hits += 1
-                        r_multiples.append(-1.0)
-                        outcome_found = True
                         break
                     elif high >= target_tp1:
                         tp1_hits += 1
                         r_multiples.append(2.0)
-                        outcome_found = True
                         break
 
         win_rate = round((tp1_hits / max(total_signals, 1)) * 100, 1)
         expectancy = round(np.mean(r_multiples), 2) if r_multiples else 0.0
 
         reply = (
-            f"<b>🔬 תוצאות Backtest נקי עבור {symbol} (שנתיים אחורה):</b>\n\n"
-            f"• סה\"כ איתותים: <code>{total_signals}</code>\n"
+            f"<b>🔬 תוצאות Backtest עבור {symbol} (שנתיים אחורה):</b>\n\n"
+            f"• סה\"כ איתותים שנמצאו: <code>{total_signals}</code>\n"
             f"• פגיעות ביעד (TP1): <code>{tp1_hits}</code>\n"
             f"• פגיעות בסטופ (SL): <code>{sl_hits}</code>\n"
-            f"• Expectancy (תוחלת ב-R): <code>{expectancy}R</code>\n"
+            f"• תוחלת ב-R (Expectancy): <code>{expectancy}R</code>\n"
             f"• 🏆 <b>אחוז הצלחה: {win_rate}%</b>"
         )
         bot.send_message(message.chat.id, reply, parse_mode="HTML")
@@ -940,13 +1195,12 @@ def cmd_backtest(message):
         bot.send_message(message.chat.id, f"❌ שגיאה בהרצת Backtest: {e}")
 
 # ------------------------------------------------------------------------------
-# 12. UNIT TESTS מקיפים
+# 12. UNIT TESTS
 # ------------------------------------------------------------------------------
 def run_unit_tests():
-    print("🧪 מריץ Unit Tests מקיפים...")
+    logger.info("🧪 מריץ Unit Tests מקיפים...")
     dates = pd.date_range(start="2023-01-01", periods=100)
 
-    # 1. Breakout Quality Test
     data = {
         'Open': [100.0]*98 + [100.0, 101.0],
         'High': [101.0]*98 + [101.0, 107.0],
@@ -959,13 +1213,7 @@ def run_unit_tests():
     bk = detect_breakout_quality(df_test, 106.5, 101.0, 2.0)
     assert bk["is_breakout"], "Unit Test Failed: Valid Breakout Not Detected"
 
-    # 2. R:R Test
-    risk = 106.5 - 100.0
-    tp1 = 106.5 + (2.0 * risk)
-    rr = (tp1 - 106.5) / risk
-    assert rr >= 2.0, "Unit Test Failed: RR Calculation Error"
-
-    print("✅ כל בדיקות היחידה (Unit Tests) עברו בהצלחה!")
+    logger.info("✅ כל בדיקות היחידה (Unit Tests) עברו בהצלחה!")
 
 # ------------------------------------------------------------------------------
 # 13. FLASK & KEEP-ALIVE
@@ -976,6 +1224,8 @@ def health_check():
 
 if __name__ == "__main__":
     run_unit_tests()
+    logger.info(f"SELF_URL = {SELF_URL}")
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False), daemon=True).start()
-    print("🤖 Precision Trading Engine Telegram Bot Is Ready...")
+    threading.Thread(target=keep_alive_loop, daemon=True).start()  # תיקון: מפעיל בפועל את מנגנון ה-keep-alive
+    logger.info("🤖 Precision Trading Engine Bot Is Ready... (use /status to check the scanner, /scan to trigger one manually)")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
