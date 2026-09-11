@@ -39,7 +39,6 @@ SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
 
 bot = TeleBot(TELEGRAM_BOT_TOKEN, threaded=True)
 app = Flask(__name__)
-translator = GoogleTranslator(source='auto', target='iw')
 
 USER_CALC_STATE = {}
 DB_LOCK = threading.Lock()
@@ -47,6 +46,17 @@ SCAN_LOCK = threading.Lock()
 TICKERS_CACHE: Dict[str, Any] = {"tickers": [], "fetched_at": 0.0}
 
 SCAN_STATS = {"is_running": False, "last_run_start": None}
+
+# פונקציית תרגום מוגנת עם מנגנון Fallback לפתרון שגיאות 500
+def safe_translate(text: str) -> str:
+    if not text:
+        return text
+    try:
+        translated = GoogleTranslator(source='auto', target='iw').translate(text)
+        return translated if translated else text
+    except Exception as e:
+        logger.warning(f"Translation failed for text: '{text[:20]}...'. Error: {e}")
+        return text  # החזרת הטקסט המקורי באנגלית במקום קריסת המערכת או שגיאת 500
 
 # ------------------------------------------------------------------------------
 # 2. מסד נתונים SQLite (bot_database.db)
@@ -188,12 +198,10 @@ def analyze_news_catalysts(symbol: str) -> dict:
                 meaningful_headlines.append(headline)
 
     translated_headlines = []
-    for h in (meaningful_headlines[:2] if meaningful_headlines else raw_articles[:2]):
-        try:
-            trans = translator.translate(h)
-            translated_headlines.append(trans)
-        except Exception:
-            translated_headlines.append(h)
+    selected_headlines = meaningful_headlines[:2] if meaningful_headlines else raw_articles[:2]
+    
+    for h in selected_headlines:
+        translated_headlines.append(safe_translate(h))
 
     return {
         "category": ", ".join(matched_categories) if matched_categories else "כללי / ללא זרז חריג",
@@ -210,7 +218,7 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
 
         df = yf.Ticker(symbol).history(period="6m")
         if df.empty or len(df) < 50: 
-            return {"error": "לא נמצאו מספיק נתוני מסחר היסטוריים עבור מניה זו."}
+            return {"error": f"לא נמצאו מספיק נתוני מסחר היסטוריים עבור הסימול {symbol}."}
 
         curr_price = float(df['Close'].iloc[-1])
         prev_price = float(df['Close'].iloc[-2])
@@ -242,7 +250,7 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
 
         reasons = []
         if not is_breakout:
-            reasons.append(f"❌ <b>אין פריצת שיא:</b> המחיר ({curr_price:.2f}) נמוך משיא 20 ימים ({high_20:.2f}) ושיא 50 ימים ({high_50:.2f}).")
+            reasons.append(f"❌ <b>אין פריצת שיא:</b> המחיר כעת ({curr_price:.2f}) נמוך משיא 20 ימים ({high_20:.2f}) ושיא 50 ימים ({high_50:.2f}).")
         else:
             reasons.append(f"✅ <b>זוהתה פריצה:</b> המחיר פרץ שיא {'50' if curr_price >= high_50 else '20'} ימים.")
 
@@ -252,7 +260,7 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
             reasons.append(f"✅ <b>מגמה עולה:</b> המחיר מעל ממוצעים 20 ו-50.")
 
         if not is_high_volume:
-            reasons.append(f"❌ <b>מחזור מסחר נמוך:</b> RVOL עומד על {vol_ratio:.2f}x (נדרש לפחות 1.2x).")
+            reasons.append(f"❌ <b>מחזור מסחר נמוך:</b> נפח יחסי (RVOL) עומד על {vol_ratio:.2f}x (נדרש לפחות 1.2x).")
         else:
             reasons.append(f"✅ <b>מחזור חזק:</b> RVOL עומד על {vol_ratio:.2f}x.")
 
@@ -282,7 +290,7 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         }
     except Exception as e:
         logger.error(f"Error analyzing {symbol}: {e}")
-        return None
+        return {"error": f"אירעה שגיאה בעיבוד הנתונים עבור {symbol}."}
 
 # ------------------------------------------------------------------------------
 # 6. בניית הודעת התראה וניתוח
@@ -293,7 +301,7 @@ def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKey
 
     news_str = "\n".join([f"• {h}" for h in data["news"]["headlines"]]) if data["news"]["headlines"] else "• לא זוהה זרז חדשותי חריג."
 
-    if data.get("is_valid", True):
+    if data.get("is_valid", False):
         msg = f"""
 🌟 <b>התראת פריצה טכנית - {symbol}</b>
 <b>מדד:</b> {ticker_info.get('index', 'כללי')}
@@ -327,14 +335,14 @@ def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKey
         msg = f"""
 🔎 <b>תוצאות ניתוח טכני עבור - {symbol}</b>
 
-⚠️ <b>המניה לא הגיעה לסף פריצה מלא. נימוקים:</b>
+⚠️ <b>המניה לא עמדה בכל תנאי הפריצה! נימוקים מפורטים:</b>
 {reasons_text}
 
 ---
-📊 <b>נתונים טכניים כעת:</b>
+📊 <b>נתונים טכניים נוכחיים:</b>
 • מחיר נוכחי: <code>{curr_symbol}{data['price']}</code> ({'+' if data['change_pct']>0 else ''}{data['change_pct']}%)
 • נפח מסחר יחסי (RVOL): <b>{data['vol_ratio']}x</b>
-• RSI: <code>{data['rsi']}</code>
+• מדד חוזק יחסי (RSI): <code>{data['rsi']}</code>
 
 ---
 📰 <b>חדשות אחרונות:</b>
@@ -419,17 +427,21 @@ def keep_alive_ping():
 # ------------------------------------------------------------------------------
 @bot.message_handler(commands=['start'])
 def handle_start(message):
-    add_user(message.chat.id)
+    try:
+        add_user(message.chat.id)
+    except Exception as e:
+        logger.error(f"Error adding user on start: {e}")
+        
     welcome_text = (
         "👋 <b>ברוכים הבאים לבוט סורק המניות האוטומטי!</b>\n\n"
-        "נרשמת בהצלחה לקבלת התראות! הבוט סורק ברקע את המדדים <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b> "
-        "ויקפיץ לך התראה אוטומטית בכל פעם שתזוהה פריצה טכנית איכותית.\n\n"
-        "📋 <b>פקודות זמינות בבוט:</b>\n"
+        "הבוט מחובר כעת וסורק ברקע את המדדים <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b>. "
+        "בכל פעם שתזוהה פריצה טכנית איכותית, תשלח התראה אוטומטית לפה!\n\n"
+        "📋 <b>הנה כל הפקודות שתוכלי להזין בבוט:</b>\n\n"
         "• /start - הצגת הודעת פתיחה ותפריט הפקודות\n"
         "• /scan - הפעלת סריקה ידנית מיידית ברקע על כל המדדים\n"
-        "• /tech <SYMBOL> - ניתוח טכני וחדשותי ממוקד מלווה בנימוקים וגרף (למשל: <code>/tech AAPL</code>)\n"
-        "• /news <SYMBOL> - סריקה ידנית חדשותית ותרגום כותרות בזמן אמת (למשל: <code>/news TSLA</code>)\n"
-        "• /status - בדיקת סטטוס סורק הרקע וזמני ריצה"
+        "• /tech <SYMBOL> - ניתוח טכני ממוקד. אם אין פריצה – תקבלי **נימוקים מפורטים וגרף** (לדוגמה: <code>/tech AAPL</code>)\n"
+        "• /news <SYMBOL> - סריקת חדשות, כותרות וקטליזטורים בזמן אמת בתרגום לעברית (לדוגמה: <code>/news TSLA</code>)\n"
+        "• /status - בדיקת סטטוס סורק הרקע וזמני הריצה"
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode="HTML")
 
@@ -453,7 +465,8 @@ def handle_tech(message):
     def run_single():
         res = analyze_stock_breakout(symbol, ignore_cooldown=True)
         if not res or "error" in res:
-            bot.send_message(message.chat.id, f"❌ שגיאה בניתוח <b>{symbol}</b>: {res.get('error', 'לא התקבלו נתונים')}", parse_mode="HTML")
+            err_msg = res.get('error', 'לא התקבלו נתונים') if res else 'לא התקבלו נתונים'
+            bot.send_message(message.chat.id, f"❌ שגיאה בניתוח <b>{symbol}</b>: {err_msg}", parse_mode="HTML")
             return
 
         item = {
