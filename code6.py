@@ -37,7 +37,7 @@ DEFAULT_CHAT_ID = os.environ.get("DEFAULT_CHAT_ID", None)
 PORT = int(os.environ.get("PORT", 5000))
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
 
-bot = TeleBot(TELEGRAM_BOT_TOKEN)
+bot = TeleBot(TELEGRAM_BOT_TOKEN, threaded=True)
 app = Flask(__name__)
 translator = GoogleTranslator(source='auto', target='iw')
 
@@ -68,26 +68,32 @@ def init_db():
             conn.commit()
 
 def add_user(chat_id: int):
-    with DB_LOCK:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-            conn.commit()
+    try:
+        with DB_LOCK:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Error adding user {chat_id}: {e}")
 
 def get_all_users() -> list:
     users = []
-    with DB_LOCK:
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT chat_id FROM users")
-            users = [r[0] for r in cursor.fetchall()]
+    try:
+        with DB_LOCK:
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT chat_id FROM users")
+                users = [r[0] for r in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Error fetching users: {e}")
 
     if DEFAULT_CHAT_ID:
         try:
             def_id = int(DEFAULT_CHAT_ID)
             if def_id not in users: users.append(def_id)
         except ValueError: pass
-    return users
+    return list(set(users))
 
 def is_in_cooldown(symbol: str) -> bool:
     with DB_LOCK:
@@ -228,12 +234,8 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         high_20 = float(df['High'].iloc[-21:-1].max())
         high_50 = float(df['High'].iloc[-51:-1].max())
 
-        # קריטריוני הליבה:
-        # 1. פריצת שיא 20 או 50 ימים
         is_breakout = curr_price >= high_20 or curr_price >= high_50
-        # 2. מגמה עולה: Price > EMA20 > EMA50
         is_uptrend = curr_price > ema20 > ema50
-        # 3. RVOL >= 1.2
         is_high_volume = vol_ratio >= 1.2
 
         if ignore_cooldown:
@@ -337,7 +339,7 @@ def run_scan_process(target_chat_id: Optional[int] = None):
                     try:
                         bot.send_message(cid, msg, parse_mode="HTML", reply_markup=markup)
                     except Exception as e:
-                        logger.error(f"Error sending to {cid}: {e}")
+                        logger.error(f"Error sending alert to {cid}: {e}")
                 
                 if not target_chat_id:
                     record_signal(item["symbol"])
@@ -356,7 +358,7 @@ def run_scan_process(target_chat_id: Optional[int] = None):
         with SCAN_LOCK:
             SCAN_STATS["is_running"] = False
 
-# תזמון סריקה אוטומטית ברקע (APScheduler)
+# תזמון סריקה אוטומטית ברקע - מריץ ושולח מניות באופן יזום!
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(lambda: run_scan_process(), 'interval', minutes=15)
 scheduler.start()
@@ -376,30 +378,30 @@ def keep_alive_ping():
         except Exception: pass
 
 # ------------------------------------------------------------------------------
-# 9. פקודות טלגרם ואינטראקטיביות (סדר Handlers מוקפד לבקשתך!)
+# 9. פקודות טלגרם (עם טיפול מיידי ב-/start)
 # ------------------------------------------------------------------------------
 @bot.message_handler(commands=['start'])
-def cmd_start(message):
+def handle_start(message):
     add_user(message.chat.id)
     welcome_text = (
         "👋 <b>ברוכים הבאים לבוט סורק המניות האוטומטי!</b>\n\n"
-        "הבוט סורק בזמן אמת את המדדים <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b> "
-        "ומאתר פריצות טכניות (Price > EMA20 > EMA50, RVOL > 1.2x ושיאי 20/50 ימים).\n\n"
+        "נרשמת בהצלחה לקבלת התראות בזמן אמת! הבוט סורק ברקע את המדדים <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b> "
+        "ויקפיץ לך הודעה אוטומטית בכל פעם שתזוהה פריצה איכותית (Price > EMA20 > EMA50, RVOL > 1.2x ושיאי 20/50 ימים).\n\n"
         "📋 <b>פקודות זמינות:</b>\n"
         "• /scan - הפעלת סריקה ידנית מיידית ברקע (Non-blocking)\n"
         "• /tech <SYMBOL> - ניתוח טכני וחדשותי ממוקד למניה (לדוגמה: <code>/tech AAPL</code> או <code>/tech TEVA.TA</code>)\n"
         "• /status - בדיקת סטטוס סורק הרקע"
     )
-    bot.reply_to(message, welcome_text, parse_mode="HTML")
+    bot.send_message(message.chat.id, welcome_text, parse_mode="HTML")
 
 @bot.message_handler(commands=['scan'])
-def cmd_scan(message):
+def handle_scan(message):
     add_user(message.chat.id)
     bot.reply_to(message, "🔍 <b>סריקה ידנית הופעלה ברקע!</b>\nהמערכת סורקת כעת את הנכסים ותשלח התראות במידה ותזהה הזדמנויות...", parse_mode="HTML")
     threading.Thread(target=run_scan_process, args=(message.chat.id,), daemon=True).start()
 
 @bot.message_handler(commands=['tech'])
-def cmd_tech(message):
+def handle_tech(message):
     add_user(message.chat.id)
     parts = message.text.split()
     if len(parts) < 2:
@@ -426,7 +428,7 @@ def cmd_tech(message):
     threading.Thread(target=run_single, daemon=True).start()
 
 @bot.message_handler(commands=['status'])
-def cmd_status(message):
+def handle_status(message):
     add_user(message.chat.id)
     with SCAN_LOCK:
         is_run = SCAN_STATS["is_running"]
@@ -435,7 +437,7 @@ def cmd_status(message):
     bot.reply_to(message, f"🩺 <b>סטטוס מערכת:</b>\n• סורק פעיל ברגע זה: {'כן ⏳' if is_run else 'לא 🟢'}\n• זמן ריצה אחרון: {last_str}", parse_mode="HTML")
 
 # ------------------------------------------------------------------------------
-# לוכדי אירועים פנימיים (Callback & Text Inputs)
+# 10. אירועי אינטראקציה ומחשבון
 # ------------------------------------------------------------------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("calc_"))
 def handle_calc_callback(call):
@@ -455,7 +457,7 @@ def handle_calc_callback(call):
     except Exception as e:
         logger.error(f"Callback error: {e}")
 
-@bot.message_handler(func=lambda msg: msg.chat.id in USER_CALC_STATE and USER_CALC_STATE[msg.chat.id] is not None and not msg.text.startswith("/"))
+@bot.message_handler(func=lambda msg: not msg.text.startswith("/") and msg.chat.id in USER_CALC_STATE and USER_CALC_STATE[msg.chat.id] is not None)
 def handle_calc_input(message):
     try:
         state = USER_CALC_STATE.pop(message.chat.id)
@@ -493,10 +495,10 @@ def handle_calc_input(message):
         bot.reply_to(message, "⚠️ נא להזין מספר בלבד.")
 
 # ------------------------------------------------------------------------------
-# 10. הרצה ראשית
+# 11. הרצה ראשית
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     threading.Thread(target=keep_alive_ping, daemon=True).start()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False), daemon=True).start()
-    logger.info("🤖 Stock Breakout Bot is active and running...")
+    logger.info("🤖 Bot is up, start listening...")
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
