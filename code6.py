@@ -49,7 +49,7 @@ TICKERS_CACHE: Dict[str, Any] = {"tickers": [], "fetched_at": 0.0}
 SCAN_STATS = {"is_running": False, "last_run_start": None}
 
 # ------------------------------------------------------------------------------
-# 2. מסד נתונים SQLite
+# 2. מסד נתונים SQLite (bot_database.db)
 # ------------------------------------------------------------------------------
 DB_FILE = "bot_database.db"
 
@@ -139,7 +139,7 @@ def fetch_all_index_tickers() -> List[dict]:
     return results
 
 # ------------------------------------------------------------------------------
-# 4. מנוע ניתוח חדשות מתורגם
+# 4. מנוע ניתוח חדשות מתורגם (News & Catalyst Filter)
 # ------------------------------------------------------------------------------
 HIGH_IMPACT_CATALYSTS = {
     "ביטחוני / גיאופוליטי": ["military", "defense", "pentagon", "contract", "war", "sanctions", "army"],
@@ -195,7 +195,7 @@ def analyze_news_catalysts(symbol: str) -> dict:
     }
 
 # ------------------------------------------------------------------------------
-# 5. מנוע ניתוח טכני וסינון פריצות
+# 5. מנוע ניתוח טכני וסינון פריצות (Technical Analysis Engine)
 # ------------------------------------------------------------------------------
 def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Optional[dict]:
     try:
@@ -236,7 +236,6 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         # 3. RVOL >= 1.2
         is_high_volume = vol_ratio >= 1.2
 
-        # בסריקה ידנית מורידים מעט רף כדי להציג תוצאות אם אין פריצות מלאות
         if ignore_cooldown:
             if not (is_breakout or (is_uptrend and is_high_volume)):
                 return None
@@ -333,7 +332,6 @@ def run_scan_process(target_chat_id: Optional[int] = None):
                 found_count += 1
                 msg, markup = build_breakout_report(item, res)
                 
-                # אם הפקודה הופעלה ידנית - שלח ישירות למבקשת, אחרת לכל הרשומים
                 recipients = [target_chat_id] if target_chat_id else get_all_users()
                 for cid in recipients:
                     try:
@@ -358,13 +356,13 @@ def run_scan_process(target_chat_id: Optional[int] = None):
         with SCAN_LOCK:
             SCAN_STATS["is_running"] = False
 
-# תזמון סריקה אוטומטית ברקע
+# תזמון סריקה אוטומטית ברקע (APScheduler)
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(lambda: run_scan_process(), 'interval', minutes=15)
 scheduler.start()
 
 # ------------------------------------------------------------------------------
-# 8. שרת Web (Keep-Alive)
+# 8. שרת Web (Flask Keep-Alive)
 # ------------------------------------------------------------------------------
 @app.route('/')
 def home():
@@ -378,7 +376,7 @@ def keep_alive_ping():
         except Exception: pass
 
 # ------------------------------------------------------------------------------
-# 9. פקודות טלגרם ואינטראקטיביות
+# 9. פקודות טלגרם ואינטראקטיביות (סדר Handlers מוקפד לבקשתך!)
 # ------------------------------------------------------------------------------
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
@@ -436,6 +434,9 @@ def cmd_status(message):
     last_str = last.strftime('%Y-%m-%d %H:%M:%S') if last else "טרם בוצעה"
     bot.reply_to(message, f"🩺 <b>סטטוס מערכת:</b>\n• סורק פעיל ברגע זה: {'כן ⏳' if is_run else 'לא 🟢'}\n• זמן ריצה אחרון: {last_str}", parse_mode="HTML")
 
+# ------------------------------------------------------------------------------
+# לוכדי אירועים פנימיים (Callback & Text Inputs)
+# ------------------------------------------------------------------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith("calc_"))
 def handle_calc_callback(call):
     try:
@@ -454,7 +455,7 @@ def handle_calc_callback(call):
     except Exception as e:
         logger.error(f"Callback error: {e}")
 
-@bot.message_handler(func=lambda msg: msg.chat.id in USER_CALC_STATE and USER_CALC_STATE[msg.chat.id] is not None)
+@bot.message_handler(func=lambda msg: msg.chat.id in USER_CALC_STATE and USER_CALC_STATE[msg.chat.id] is not None and not msg.text.startswith("/"))
 def handle_calc_input(message):
     try:
         state = USER_CALC_STATE.pop(message.chat.id)
