@@ -6,6 +6,9 @@ import logging
 import threading
 import requests
 import datetime
+from typing import Dict, List, Any, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -26,7 +29,7 @@ CONFIG = {
     "MIN_PRICE": 3.0,               # מחיר מינימלי למניה
     "MIN_DAILY_VALUE_USD": 2000000, # מחזור כספי יומי ממוצע מינימלי (2 מיליון $)
     "SCORE_THRESHOLD": 75,          # רף סף קשיח לשליחת התראה (מתוך 100)
-    "ALERT_COOLDOWN_HOURS": 6
+    "ALERT_COOLDOWN_HOURS": 4
 }
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
@@ -116,7 +119,7 @@ def record_signal(symbol: str):
 init_db()
 
 # ------------------------------------------------------------------------------
-# 3. רשימת נכסים
+# 3. רשימת נכסים (S&P 500, NASDAQ 100, TA-125)
 # ------------------------------------------------------------------------------
 TA_125_TICKERS = [
     "TEVA.TA", "ICL.TA", "NICE.TA", "LUMI.TA", "POLI.TA", "MZR.TA", "FIBI.TA",
@@ -135,16 +138,16 @@ def fetch_all_index_tickers() -> List[dict]:
         df_sp = pd.read_csv(url_sp)
         for _, row in df_sp.iterrows():
             sym = str(row['Symbol']).replace('.', '-').strip()
-            results.append({"symbol": sym, "index": "S&P 500", "currency": "USD"})
+            results.append({"symbol": sym, "index": "S&P 500 / NASDAQ 100", "currency": "USD"})
     except Exception as e:
-        logger.warning(f"Failed loading S&P500: {e}")
+        logger.warning(f"Failed loading S&P500/NASDAQ: {e}")
 
     TICKERS_CACHE["tickers"] = results
     TICKERS_CACHE["fetched_at"] = now
     return results
 
 # ------------------------------------------------------------------------------
-# 4. מנוע זיהוי תבניות מתקדם
+# 4. מנוע ניתוח טכני וזיהוי תבניות
 # ------------------------------------------------------------------------------
 def detect_candlestick_patterns(df: pd.DataFrame) -> List[str]:
     patterns = []
@@ -180,19 +183,19 @@ def detect_chart_patterns(df: pd.DataFrame) -> List[str]:
         if handle_low > cup_bottom and closes[-1] >= right_rim * 0.98:
             patterns.append("ספל וידית (Cup and Handle) ☕")
 
-    pole_move = (closes[-20] - closes[-40]) / closes[-40]
+    pole_move = (closes[-20] - closes[-40]) / closes[-40] if closes[-40] > 0 else 0
     if pole_move > 0.08 and ((max(highs[-15:]) - min(lows[-15:])) / closes[-1]) < 0.05:
         patterns.append("דגל שורי (Bull Flag) 🚩")
 
     return patterns
 
 # ------------------------------------------------------------------------------
-# 5. ניתוח חדשות ממוקד קטליזטורים (קטגוריות איכות בלבד)
+# 5. ניתוח חדשות ממוקד קטליזטורים ותרגום
 # ------------------------------------------------------------------------------
 HIGH_IMPACT_CATALYSTS = {
-    "אישור/ניסוי FDA": ["fda approval", "phase 3", "clinical trial results", "fda grants", "breakthrough therapy"],
-    "דוחות מעל התחזיות": ["earnings beat", "eps beat", "raises guidance", "record revenue", "q1 beat", "q2 beat", "q3 beat", "q4 beat"],
-    "עסקאות ענק / מיזוגים": ["to be acquired", "merger agreement", "buyout", "billion contract", "pentagon contract"]
+    "ביטחוני / גיאופוליטי": ["military", "defense", "pentagon", "contract", "war", "sanctions", "army", "navy"],
+    "אישור/ניסוי FDA": ["fda", "fda approval", "phase 2", "phase 3", "clinical trial", "patent", "breakthrough therapy"],
+    "עסקאות / דוחות": ["acquisition", "merger", "buyout", "earnings beat", "eps beat", "revenue", "investment"]
 }
 
 def analyze_news_catalysts(symbol: str) -> dict:
@@ -281,28 +284,27 @@ def analyze_and_score_stock(symbol: str) -> Optional[dict]:
         df['EMA200'] = ta.ema(scaled_close, length=200)
         df['ATR'] = ta.atr(scaled_high, scaled_low, scaled_close, length=14)
 
-        ema20 = float(df['EMA20'].iloc[-1])
-        ema50 = float(df['EMA50'].iloc[-1])
+        ema20 = float(df['EMA20'].iloc[-1]) if not pd.isna(df['EMA20'].iloc[-1]) else 0
+        ema50 = float(df['EMA50'].iloc[-1]) if not pd.isna(df['EMA50'].iloc[-1]) else 0
         ema200 = float(df['EMA200'].iloc[-1]) if not pd.isna(df['EMA200'].iloc[-1]) else 0
-        rsi = float(df['RSI'].iloc[-1])
-        atr = float(df['ATR'].iloc[-1])
+        rsi = float(df['RSI'].iloc[-1]) if not pd.isna(df['RSI'].iloc[-1]) else 50
+        atr = float(df['ATR'].iloc[-1]) if not pd.isna(df['ATR'].iloc[-1]) else (curr_price * 0.02)
 
         high_20 = float(scaled_high.iloc[-21:-1].max())
         high_50 = float(scaled_high.iloc[-51:-1].max())
 
-        # --- חישוב ניקוד משוקלל ---
         total_score = 0
         score_breakdown = []
 
-        # 1. מגמה טכנית (עד 15 נק')
+        # 1. מגמה טכנית (EMA20 > EMA50)
         if curr_price > ema20 > ema50 > ema200:
             total_score += 15
             score_breakdown.append("מגמה שורית מושלמת (15/15)")
         elif curr_price > ema20 > ema50:
             total_score += 10
-            score_breakdown.append("מגמה שורית בינונית (10/15)")
+            score_breakdown.append("מגמה שורית ברורה (10/15)")
 
-        # 2. איכות פריצה (עד 20 נק')
+        # 2. איכות פריצה (שיא 20 / 50 ימים)
         is_breakout = curr_price > high_20
         is_major_breakout = curr_price > high_50
         
@@ -318,9 +320,9 @@ def analyze_and_score_stock(symbol: str) -> Optional[dict]:
             score_breakdown.append("פריצת שיא 20 ימים בנר עוצמתי (15/20)")
         elif is_breakout:
             total_score += 8
-            score_breakdown.append("פריצה טכנית קלה (8/20)")
+            score_breakdown.append("פריצה טכנית (8/20)")
 
-        # 3. תבניות משלימות (עד 15 נק')
+        # 3. תבניות משלימות
         chart_p = detect_chart_patterns(df)
         candle_p = detect_candlestick_patterns(df)
         all_patterns = chart_p + candle_p
@@ -332,27 +334,27 @@ def analyze_and_score_stock(symbol: str) -> Optional[dict]:
             total_score += 8
             score_breakdown.append("תבנית ניתוח טכני בודדת (8/15)")
 
-        # 4. נפח מסחר יחסי - RVOL (עד 30 נק')
+        # 4. נפח מסחר יחסי - RVOL (חריגה מ-1.2x)
         if vol_ratio >= 2.5:
             total_score += 30
             score_breakdown.append(f"נפח חריג מאוד RVOL {vol_ratio:.1f}x (30/30)")
         elif vol_ratio >= 1.8:
             total_score += 20
             score_breakdown.append(f"נפח מסחר חזק RVOL {vol_ratio:.1f}x (20/30)")
-        elif vol_ratio >= 1.3:
+        elif vol_ratio >= 1.2:
             total_score += 10
-            score_breakdown.append(f"נפח מסחר בינוני RVOL {vol_ratio:.1f}x (10/30)")
+            score_breakdown.append(f"נפח מסחר חריג RVOL {vol_ratio:.1f}x (10/30)")
 
-        # 5. ניקוד חדשותי (עד 20 נק')
+        # 5. ניקוד חדשותי
         news_data = analyze_news_catalysts(symbol)
         total_score += news_data["score"]
         if news_data["score"] > 0:
             score_breakdown.append(f"זרז חדשותי: {news_data['category']} ({news_data['score']}/20)")
 
-        # 🎯 רף סף קשיח להתרעה!
         if total_score >= CONFIG["SCORE_THRESHOLD"]:
             stop_loss = round(curr_price - (1.5 * atr), 2)
             if stop_loss >= curr_price: stop_loss = round(curr_price * 0.95, 2)
+            risk = curr_price - stop_loss
 
             return {
                 "symbol": symbol,
@@ -366,8 +368,8 @@ def analyze_and_score_stock(symbol: str) -> Optional[dict]:
                 "news": news_data,
                 "entry": round(curr_price, 2),
                 "stop_loss": stop_loss,
-                "tp1": round(curr_price + (1.5 * (curr_price - stop_loss)), 2),
-                "tp2": round(curr_price + (2.5 * (curr_price - stop_loss)), 2)
+                "tp1": round(curr_price + (1.5 * risk), 2),
+                "tp2": round(curr_price + (2.5 * risk), 2)
             }
         return None
     except Exception as e:
@@ -379,14 +381,14 @@ def analyze_and_score_stock(symbol: str) -> Optional[dict]:
 # ------------------------------------------------------------------------------
 def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKeyboardMarkup]:
     symbol = ticker_info["symbol"]
-    curr_symbol = "$" if ticker_info.get("currency") == "USD" else "₪"
+    curr_symbol = "₪" if symbol.endswith(".TA") else "$"
     
     breakdown_str = "\n".join([f"• {b}" for b in data["score_breakdown"]])
     news_str = "\n".join([f"• {h}" for h in data["news"]["headlines"]]) if data["news"]["headlines"] else "• לא זוהה זרז חדשותי חריג ב-72 השעות האחרונות."
 
     msg = f"""
-🌟 <b>התראת איכות גבוהה - {symbol}</b> (ציון: <b>{data['score']}/100</b>)
-<b>מדד שיוך:</b> {ticker_info.get('index', 'כללי')}
+🌟 <b>התראת פריצה - {symbol}</b> (ציון: <b>{data['score']}/100</b>)
+<b>מדד:</b> {ticker_info.get('index', 'כללי')}
 
 ---
 🏆 <b>שילוב פרמטרים שנמצאו:</b>
@@ -399,7 +401,7 @@ def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKey
 • RSI: <code>{data['rsi']}</code>
 
 ---
-📰 <b>חדשות ואירועים:</b>
+📰 <b>חדשות ואירועים (מתורגם):</b>
 • קטגוריית זרז: <b>{data['news']['category']}</b>
 {news_str}
 
@@ -407,8 +409,8 @@ def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKey
 🎯 <b>תוכנית מסחר מוצעת:</b>
 • 🎯 מחיר כניסה: <code>{curr_symbol}{data['entry']}</code>
 • 🛑 סטופ לוס: <code>{curr_symbol}{data['stop_loss']}</code>
-• 🚀 יעד 1 (TP1): <code>{curr_symbol}{data['tp1']}</code>
-• 🚀 יעד 2 (TP2): <code>{curr_symbol}{data['tp2']}</code>
+• 🚀 יעד 1 (TP1): <code>{curr_symbol}{data['tp1']}</code> (1.5R)
+• 🚀 יעד 2 (TP2): <code>{curr_symbol}{data['tp2']}</code> (2.5R)
 """
 
     markup = InlineKeyboardMarkup(row_width=2)
@@ -458,7 +460,21 @@ scheduler.add_job(run_auto_scan_job, 'interval', minutes=15)
 scheduler.start()
 
 # ------------------------------------------------------------------------------
-# 9. מחשבון ופקודות טלגרם
+# 9. שרת Web לשמירה על אפליקציה פעילה 24/7 (Flask Keep-Alive)
+# ------------------------------------------------------------------------------
+@app.route('/')
+def home():
+    return "Bot status: Active 24/7", 200
+
+def keep_alive_ping():
+    while True:
+        time.sleep(600)
+        try:
+            if "localhost" not in SELF_URL: requests.get(SELF_URL, timeout=10)
+        except Exception: pass
+
+# ------------------------------------------------------------------------------
+# 10. מחשבון ופקודות טלגרם
 # ------------------------------------------------------------------------------
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
@@ -522,11 +538,11 @@ def cmd_start(message):
     bot.reply_to(
         message,
         "<b>בוט סריקת מניות מבוסס מנוע ניקוד (Scoring Engine) פעיל! 🚀</b>\n\n"
-        "המערכת מתריעה רק על מניות שקיבלו ציון משוקלל של <b>75 מתוך 100</b> ומעלה ברמת איכות גבוהה.\n\n"
-        "💡 <b>פקודות:</b>\n"
-        "/scan - הרצת סריקה ידנית ברקע\n"
-        "/tech SYMBOL - ניתוח ושיקלול למניה בודדת (למשל: <code>/tech AAPL</code>)\n"
-        "/status - בדיקת סטטוס המערכת",
+        "המערכת מתריעה בלייב על מניות מתוך S&P 500, NASDAQ 100 ותל אביב 125 שקיבלו ציון משוקלל של <b>75 מתוך 100</b> ומעלה.\n\n"
+        "💡 <b>פקודות נתמכות:</b>\n"
+        "/scan - הרצת סריקה ידנית ברקע (Non-blocking)\n"
+        "/tech <SYMBOL> - ניתוח ושיקלול למניה בודדת (למשל: <code>/tech AAPL</code> או <code>/tech TEVA.TA</code>)\n"
+        "/status - בדיקת סטטוס הסורק האוטומטי",
         parse_mode="HTML"
     )
 
@@ -544,12 +560,12 @@ def cmd_tech(message):
     def run_single():
         res = analyze_and_score_stock(symbol)
         if not res:
-            bot.send_message(message.chat.id, f"❌ המניה <b>{symbol}</b> לא עברה את רף האיכות (קיבלה מתחת ל-75 נקודות או שאינה נזילה מספיק).", parse_mode="HTML")
+            bot.send_message(message.chat.id, f"❌ המניה <b>{symbol}</b> לא עברה את רף האיכות (מתחת ל-75 נקודות או חסרת נזילות).", parse_mode="HTML")
             return
 
         item = {
             "symbol": symbol,
-            "index": "תל אביב 125" if symbol.endswith(".TA") else "ארה\"ב",
+            "index": "תל אביב 125" if symbol.endswith(".TA") else "S&P 500 / NASDAQ 100",
             "currency": "ILS" if symbol.endswith(".TA") else "USD"
         }
         msg, markup = build_breakout_report(item, res)
@@ -560,7 +576,7 @@ def cmd_tech(message):
 @bot.message_handler(commands=['scan'])
 def cmd_scan(message):
     add_user(message.chat.id)
-    bot.reply_to(message, "🔍 מפעיל סריקה משוקללת ברקע... התראות יישלחו רק על מניות בציון 75+.")
+    bot.reply_to(message, "🔍 מפעיל סריקה ידנית ברקע (Non-blocking)... התראות יישלחו רק על מניות שחוצות את רף הציון 75.")
     threading.Thread(target=run_auto_scan_job, daemon=True).start()
 
 @bot.message_handler(commands=['status'])
@@ -569,18 +585,11 @@ def cmd_status(message):
     with SCAN_LOCK:
         is_run = SCAN_STATS["is_running"]
         last = SCAN_STATS["last_run_start"]
-    bot.reply_to(message, f"🩺 <b>סטטוס סורק:</b>\n• סריקה ברקע כעת: {'כן ⏳' if is_run else 'לא'}\n• ריצה אחרונה: {last or 'טרם רצה'}", parse_mode="HTML")
+    bot.reply_to(message, f"🩺 <b>סטטוס סורק:</b>\n• סריקה פעילה כעת: {'כן ⏳' if is_run else 'לא'}\n• ריצה אחרונה: {last or 'טרם רצה'}", parse_mode="HTML")
 
 # ------------------------------------------------------------------------------
-# 10. הרצה
+# 11. הרצה הראשית
 # ------------------------------------------------------------------------------
-def keep_alive_ping():
-    while True:
-        time.sleep(600)
-        try:
-            if "localhost" not in SELF_URL: requests.get(SELF_URL, timeout=10)
-        except Exception: pass
-
 if __name__ == "__main__":
     threading.Thread(target=keep_alive_ping, daemon=True).start()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False), daemon=True).start()
