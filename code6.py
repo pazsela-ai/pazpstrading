@@ -100,8 +100,10 @@ def get_all_users() -> list:
     if DEFAULT_CHAT_ID:
         try:
             def_id = int(DEFAULT_CHAT_ID)
-            if def_id not in users: users.append(def_id)
-        except ValueError: pass
+            if def_id not in users: 
+                users.append(def_id)
+        except ValueError: 
+            pass
     return list(set(users))
 
 def is_in_cooldown(symbol: str) -> bool:
@@ -110,7 +112,8 @@ def is_in_cooldown(symbol: str) -> bool:
             cursor = conn.cursor()
             cursor.execute("SELECT alert_time FROM sent_signals WHERE symbol = ? ORDER BY alert_time DESC LIMIT 1", (symbol,))
             row = cursor.fetchone()
-            if not row: return False
+            if not row: 
+                return False
             alert_time = datetime.datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
             return (datetime.datetime.now() - alert_time).total_seconds() < (CONFIG["ALERT_COOLDOWN_HOURS"] * 3600)
 
