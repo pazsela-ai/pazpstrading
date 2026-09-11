@@ -47,19 +47,19 @@ TICKERS_CACHE: Dict[str, Any] = {"tickers": [], "fetched_at": 0.0}
 
 SCAN_STATS = {"is_running": False, "last_run_start": None}
 
-# פונקציית תרגום מוגנת למניעת שגיאות 500/קריסות
+# תיקון נקודה 3: פונקציית תרגום מוגנת למניעת שגיאות 500
 def safe_translate(text: str) -> str:
-    if not text:
-        return text
+    if not text or not isinstance(text, str):
+        return ""
     try:
         translated = GoogleTranslator(source='auto', target='iw').translate(text)
         return translated if translated else text
     except Exception as e:
-        logger.warning(f"Translation failed for text: '{text[:20]}...'. Error: {e}")
-        return text  # החזרת הטקסט המקורי באנגלית במידה והתרגום נכשל
+        logger.warning(f"Translation error for text '{text[:20]}...': {e}")
+        return text  # החזרת המקור באנגלית במקום קריסת המערכת
 
 # ------------------------------------------------------------------------------
-# 2. מסד נתונים SQLite (bot_database.db)
+# 2. מסד נתונים SQLite
 # ------------------------------------------------------------------------------
 DB_FILE = "bot_database.db"
 
@@ -127,7 +127,7 @@ def record_signal(symbol: str):
 init_db()
 
 # ------------------------------------------------------------------------------
-# 3. רשימת נכסים (S&P 500, NASDAQ 100, TA-125)
+# 3. רשימת נכסים
 # ------------------------------------------------------------------------------
 TA_125_TICKERS = [
     "TEVA.TA", "ICL.TA", "NICE.TA", "LUMI.TA", "POLI.TA", "MZR.TA", "FIBI.TA",
@@ -155,7 +155,7 @@ def fetch_all_index_tickers() -> List[dict]:
     return results
 
 # ------------------------------------------------------------------------------
-# 4. מנוע ניתוח חדשות מתורגם (News & Catalyst Filter)
+# 4. מנוע ניתוח חדשות (תיקון תקלה 3)
 # ------------------------------------------------------------------------------
 HIGH_IMPACT_CATALYSTS = {
     "ביטחוני / גיאופוליטי": ["military", "defense", "pentagon", "contract", "war", "sanctions", "army"],
@@ -167,48 +167,53 @@ def analyze_news_catalysts(symbol: str) -> dict:
     raw_articles = []
     clean_symbol = symbol.replace(".TA", "")
 
-    # שליפה מ-Finnhub
+    # ניסיון שליפה מ-Finnhub
     if FINNHUB_API_KEY and FINNHUB_API_KEY != "YOUR_FINNHUB_API_KEY":
         try:
             today = datetime.date.today()
             from_date = (today - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
             news_url = f"https://finnhub.io/api/v1/company-news?symbol={clean_symbol}&from={from_date}&to={today.strftime('%Y-%m-%d')}&token={FINNHUB_API_KEY}"
             res = requests.get(news_url, timeout=4)
-            if res.status_code == 200:
+            if res.status_code == 200 and isinstance(res.json(), list):
                 for item in res.json():
                     if isinstance(item, dict) and item.get("headline"):
-                        raw_articles.append(item.get("headline"))
+                        raw_articles.append(str(item.get("headline")))
         except Exception as e:
             logger.warning(f"Finnhub fetch error for {symbol}: {e}")
 
-    # שליפה מגיבוי yFinance (מטפל במבני נתונים שונים למניעת שגיאת 500)
+    # ניסיון שליפה מ-yFinance עם טיפול חסין בשגיאות מבנה
     if not raw_articles:
         try:
             news_items = yf.Ticker(symbol).news
             if news_items and isinstance(news_items, list):
                 for item in news_items:
                     if isinstance(item, dict):
-                        title = item.get("title") or (item.get("content", {}).get("title") if isinstance(item.get("content"), dict) else None)
+                        # חילוץ בטוח של כותרת
+                        title = item.get("title")
+                        if not title and "content" in item and isinstance(item["content"], dict):
+                            title = item["content"].get("title")
                         if title:
                             raw_articles.append(str(title))
         except Exception as e:
-            logger.warning(f"yFinance news fetch error for {symbol}: {e}")
+            logger.warning(f"yFinance news error for {symbol}: {e}")
 
     matched_categories = set()
     meaningful_headlines = []
 
     for headline in raw_articles[:5]:
-        headline_lower = str(headline).lower()
+        headline_lower = headline.lower()
         for cat, keywords in HIGH_IMPACT_CATALYSTS.items():
             if any(kw in headline_lower for kw in keywords):
                 matched_categories.add(cat)
                 meaningful_headlines.append(headline)
 
     translated_headlines = []
-    selected_headlines = meaningful_headlines[:2] if meaningful_headlines else raw_articles[:2]
-    
+    selected_headlines = meaningful_headlines[:3] if meaningful_headlines else raw_articles[:3]
+
     for h in selected_headlines:
-        translated_headlines.append(safe_translate(str(h)))
+        translated = safe_translate(h)
+        if translated:
+            translated_headlines.append(translated)
 
     return {
         "category": ", ".join(matched_categories) if matched_categories else "כללי / ללא זרז חריג",
@@ -216,7 +221,7 @@ def analyze_news_catalysts(symbol: str) -> dict:
     }
 
 # ------------------------------------------------------------------------------
-# 5. מנוע ניתוח טכני וסינון פריצות (Technical Analysis Engine)
+# 5. מנוע ניתוח טכני (תיקון תקלה 2 - מתן נימוק מקיף בכל מצב)
 # ------------------------------------------------------------------------------
 def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Optional[dict]:
     try:
@@ -255,29 +260,31 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
 
         has_passed_all = is_breakout and is_uptrend and is_high_volume and is_valid_price
 
+        # בניית נימוקים מפורטים ומפורשים
         reasons = []
         if not is_breakout:
-            reasons.append(f"❌ <b>אין פריצת שיא:</b> המחיר כעת ({curr_price:.2f}) נמוך משיא 20 ימים ({high_20:.2f}) ושיא 50 ימים ({high_50:.2f}).")
+            reasons.append(f"❌ <b>אין פריצת שיא:</b> המחיר ({curr_price:.2f}) נמוך משיא 20 ימים ({high_20:.2f}) ושיא 50 ימים ({high_50:.2f}).")
         else:
             reasons.append(f"✅ <b>זוהתה פריצה:</b> המחיר פרץ שיא {'50' if curr_price >= high_50 else '20'} ימים.")
 
         if not is_uptrend:
-            reasons.append(f"❌ <b>מגמה לא תואמת:</b> השרשרת Price > EMA20 > EMA50 אינה מתקיימת (EMA20={ema20:.2f}, EMA50={ema50:.2f}).")
+            reasons.append(f"❌ <b>מגמה שאינה עולה:</b> לא מתקיים הכלל Price > EMA20 > EMA50 (מחיר: {curr_price:.2f}, EMA20: {ema20:.2f}, EMA50: {ema50:.2f}).")
         else:
-            reasons.append(f"✅ <b>מגמה עולה:</b> המחיר מעל ממוצעים 20 ו-50.")
+            reasons.append(f"✅ <b>מגמה עולה:</b> המחיר נמצא מעל הממוצעים הנעים (EMA20 & EMA50).")
 
         if not is_high_volume:
-            reasons.append(f"❌ <b>מחזור מסחר נמוך:</b> נפח יחסי (RVOL) עומד על {vol_ratio:.2f}x (נדרש לפחות 1.2x).")
+            reasons.append(f"❌ <b>נפח מסחר חלש:</b> יחס נפח המסחר (RVOL) הינו {vol_ratio:.2f}x (נדרש לפחות 1.2x).")
         else:
-            reasons.append(f"✅ <b>מחזור חזק:</b> RVOL עומד על {vol_ratio:.2f}x.")
+            reasons.append(f"✅ <b>נפח מסחר חזק:</b> RVOL עומד על {vol_ratio:.2f}x.")
 
         if not is_valid_price:
-            reasons.append(f"❌ <b>מחיר נמוך:</b> {curr_price:.2f} (סף מינימלי {CONFIG['MIN_PRICE']}).")
+            reasons.append(f"❌ <b>מחיר נמוך מדי:</b> {curr_price:.2f} (נדרש לפחות {CONFIG['MIN_PRICE']}$).")
 
         news_data = analyze_news_catalysts(symbol)
 
         stop_loss = round(curr_price - (1.5 * atr), 2)
-        if stop_loss >= curr_price: stop_loss = round(curr_price * 0.95, 2)
+        if stop_loss >= curr_price: 
+            stop_loss = round(curr_price * 0.95, 2)
         risk = curr_price - stop_loss
 
         return {
@@ -297,16 +304,16 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         }
     except Exception as e:
         logger.error(f"Error analyzing {symbol}: {e}")
-        return {"error": f"אירעה שגיאה בעיבוד הנתונים עבור {symbol}."}
+        return {"error": f"אירעה שגיאה בעיבוד הנתונים הטכניים עבור הסימול {symbol}."}
 
 # ------------------------------------------------------------------------------
-# 6. בניית הודעת התראה וניתוח
+# 6. בניית הודעת דוח (תיקון תקלה 2 - הוספת כפתור גרף ונימוקים בכל מצב)
 # ------------------------------------------------------------------------------
 def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKeyboardMarkup]:
     symbol = ticker_info["symbol"]
     curr_symbol = "₪" if symbol.endswith(".TA") else "$"
 
-    news_str = "\n".join([f"• {h}" for h in data["news"]["headlines"]]) if data["news"]["headlines"] else "• לא זוהה זרז חדשותי חריג."
+    news_str = "\n".join([f"• {h}" for h in data["news"]["headlines"]]) if data["news"]["headlines"] else "• לא נמצאו חדשות חריגות כעת."
 
     if data.get("is_valid", False):
         msg = f"""
@@ -322,16 +329,16 @@ def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKey
 • מגמה: <b>Price > EMA20 > EMA50 🟢</b>
 
 ---
-📰 <b>חדשות וקטליזטורים (מתורגם):</b>
+📰 <b>חדשות וקטליזטורים:</b>
 • סוג זרז: <b>{data['news']['category']}</b>
 {news_str}
 
 ---
 🎯 <b>תוכנית מסחר מוצעת:</b>
 • 🎯 מחיר כניסה: <code>{curr_symbol}{data['entry']}</code>
-• 🛑 סטופ לוס (1.5xATR): <code>{curr_symbol}{data['stop_loss']}</code>
-• 🚀 יעד 1 (TP1 - 1.5R): <code>{curr_symbol}{data['tp1']}</code>
-• 🚀 יעד 2 (TP2 - 2.5R): <code>{curr_symbol}{data['tp2']}</code>
+• 🛑 סטופ לוס: <code>{curr_symbol}{data['stop_loss']}</code>
+• 🚀 יעד 1 (TP1): <code>{curr_symbol}{data['tp1']}</code>
+• 🚀 יעד 2 (TP2): <code>{curr_symbol}{data['tp2']}</code>
 """
         markup = InlineKeyboardMarkup(row_width=2)
         btn_chart = InlineKeyboardButton("📈 צפייה בגרף", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
@@ -340,21 +347,22 @@ def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKey
     else:
         reasons_text = "\n".join(data["reasons"])
         msg = f"""
-🔎 <b>תוצאות ניתוח טכני עבור - {symbol}</b>
+🔎 <b>תוצאות ניתוח טכני ממוקד עבור {symbol}</b>
 
-⚠️ <b>המניה לא עמדה בכל תנאי הפריצה! נימוקים מפורטים:</b>
+⚠️ <b>המניה אינה עומדת בתנאי פריצה כעת. נימוקים:</b>
 {reasons_text}
 
 ---
-📊 <b>נתונים טכניים נוכחיים:</b>
-• מחיר נוכחי: <code>{curr_symbol}{data['price']}</code> ({'+' if data['change_pct']>0 else ''}{data['change_pct']}%)
+📊 <b>נתוני מסחר נוכחיים:</b>
+• מחיר: <code>{curr_symbol}{data['price']}</code> ({'+' if data['change_pct']>0 else ''}{data['change_pct']}%)
 • נפח מסחר יחסי (RVOL): <b>{data['vol_ratio']}x</b>
-• מדד חוזק יחסי (RSI): <code>{data['rsi']}</code>
+• מדד חוזק (RSI): <code>{data['rsi']}</code>
 
 ---
-📰 <b>חדשות אחרונות:</b>
+📰 <b>חדשות וקטליזטורים:</b>
 {news_str}
 """
+        # כפתור צפייה בגרף גם כאשר אין פריצה
         markup = InlineKeyboardMarkup()
         btn_chart = InlineKeyboardButton("📈 צפייה בגרף ב-TradingView", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
         markup.add(btn_chart)
@@ -368,7 +376,7 @@ def run_scan_process(target_chat_id: Optional[int] = None):
     with SCAN_LOCK:
         if SCAN_STATS["is_running"]: 
             if target_chat_id:
-                bot.send_message(target_chat_id, "⏳ סריקה כבר רצה ברקע, אנא המתיני לסיום.")
+                bot.send_message(target_chat_id, "⏳ סריקה כבר מורצת ברקע, אנא המתיני לסיומה.")
             return
         SCAN_STATS["is_running"] = True
         SCAN_STATS["last_run_start"] = datetime.datetime.now()
@@ -400,17 +408,16 @@ def run_scan_process(target_chat_id: Optional[int] = None):
             executor.map(check_and_send, tickers)
 
         if target_chat_id and found_count == 0:
-            bot.send_message(target_chat_id, "🔍 הסריקה הידנית הושלמה. לא נמצאו מניות שענו באופן מלא על כל תנאי הפריצה כעת.")
+            bot.send_message(target_chat_id, "🔍 הסריקה הידנית הושלמה. לא נמצאו מניות שענו על כל תנאי הפריצה ברגע זה.")
 
     except Exception as e:
         logger.error(f"Error during scan: {e}")
         if target_chat_id:
-            bot.send_message(target_chat_id, "❌ אירעה שגיאה במהלך הסריקה.")
+            bot.send_message(target_chat_id, "❌ אירעה שגיאה במהלך ביצוע הסריקה.")
     finally:
         with SCAN_LOCK:
             SCAN_STATS["is_running"] = False
 
-# תזמון סריקה אוטומטית ברקע
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(lambda: run_scan_process(), 'interval', minutes=15)
 scheduler.start()
@@ -430,24 +437,20 @@ def keep_alive_ping():
         except Exception: pass
 
 # ------------------------------------------------------------------------------
-# 9. פקודות טלגרם 
+# 9. פקודות טלגרם (תיקון תקלה 1: הודעת /start מלאה + תיקון פקודות)
 # ------------------------------------------------------------------------------
 @bot.message_handler(commands=['start'])
 def handle_start(message):
-    try:
-        add_user(message.chat.id)
-    except Exception as e:
-        logger.error(f"Error adding user on start: {e}")
-        
+    add_user(message.chat.id)
     welcome_text = (
-        "👋 <b>ברוכים הבאים לבוט סורק המניות האוטומטי!</b>\n\n"
-        "הבוט מחובר כעת וסורק ברקע את המדדים <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b>. "
-        "בכל פעם שתזוהה פריצה טכנית איכותית, תשלח התראה אוטומטית לפה!\n\n"
-        "📋 <b>הנה כל הפקודות שתוכלי להזין בבוט:</b>\n\n"
-        "• /start - הצגת הודעת פתיחה זו ותפריט הפקודות\n"
+        "👋 <b>ברוכים הבאים לבוט סריקת המניות והפריצות הטכניות!</b>\n\n"
+        "הבוט סורק באופן רציף וברקע את מדדי <b>S&P 500, NASDAQ 100 ו-תל אביב 125</b> "
+        "כדי לאתר מניות המציגות פריצה טכנית, נפח מסחר חורג (RVOL) וקטליזטורים חדשותיים.\n\n"
+        "🛠️ <b>רשימת הפקודות הזמינות בבוט:</b>\n\n"
+        "• /start - הצגת הודעת פתיחה זו והסבר על הפיצ'רים\n"
         "• /scan - הפעלת סריקה ידנית מיידית ברקע על כל המדדים\n"
-        "• /tech <SYMBOL> - ניתוח טכני ממוקד. כולל **נימוקים מפורטים וגרף** בכל מצב (לדוגמה: <code>/tech AAPL</code>)\n"
-        "• /news <SYMBOL> - סריקת חדשות, כותרות וקטליזטורים בזמן אמת בתרגום לעברית (לדוגמה: <code>/news TSLA</code>)\n"
+        "• /tech <SYMBOL> - ניתוח טכני ממוקד עבור מניה. יספק נימוקים מפורטים וקישור לגרף בכל מקרה (לדוגמה: <code>/tech AAPL</code> או <code>/tech TEVA.TA</code>)\n"
+        "• /news <SYMBOL> - סריקת חדשות וכותרות אחרונות בתרגום לעברית (לדוגמה: <code>/news TSLA</code>)\n"
         "• /status - בדיקת סטטוס סורק הרקע וזמני הריצה"
     )
     bot.send_message(message.chat.id, welcome_text, parse_mode="HTML")
@@ -455,7 +458,7 @@ def handle_start(message):
 @bot.message_handler(commands=['scan'])
 def handle_scan(message):
     add_user(message.chat.id)
-    bot.reply_to(message, "🔍 <b>סריקה ידנית הופעלה ברקע!</b>\nהמערכת סורקת כעת את הנכסים ותשלח התראות במידה ותזהה הזדמנויות...", parse_mode="HTML")
+    bot.reply_to(message, "🔍 <b>סריקה ידנית הופעלה ברקע!</b>\nהמערכת מעבדת כעת את המניות ותשלח התראות במידה ותזהה הזדמנויות...", parse_mode="HTML")
     threading.Thread(target=run_scan_process, args=(message.chat.id,), daemon=True).start()
 
 @bot.message_handler(commands=['tech'])
@@ -516,7 +519,7 @@ def handle_news(message):
 
             bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
         except Exception as e:
-            logger.error(f"Error processing /news command: {e}")
+            logger.error(f"Error handling /news command for {symbol}: {e}")
             bot.send_message(message.chat.id, f"❌ אירעה שגיאה בעת שליפת החדשות עבור <b>{symbol}</b>.", parse_mode="HTML")
 
     threading.Thread(target=run_news_single, daemon=True).start()
