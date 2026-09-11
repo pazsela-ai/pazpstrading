@@ -26,8 +26,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("trading_bot")
 
 CONFIG = {
-    "MIN_PRICE": 1.0,               # מחיר מינימלי למניה
-    "MIN_DAILY_VALUE_USD": 500000,  # מחזור כספי יומי ממוצע מינימלי
+    "MIN_PRICE": 1.0,
+    "MIN_DAILY_VALUE_USD": 500000,
     "ALERT_COOLDOWN_HOURS": 4
 }
 
@@ -305,15 +305,304 @@ def analyze_stock_breakout(symbol: str, ignore_cooldown: bool = False) -> Option
         return {"error": f"אירעה שגיאה בעיבוד הנתונים הטכניים עבור הסימול {symbol}."}
 
 # ------------------------------------------------------------------------------
-# 6. בניית הודעת דוח
+# 6. בניית הודעת דוח (בניית המחרוזת בצורה בטוחה ללא תווים נסתרים)
 # ------------------------------------------------------------------------------
 def build_breakout_report(ticker_info: dict, data: dict) -> Tuple[str, InlineKeyboardMarkup]:
     symbol = ticker_info["symbol"]
     curr_symbol = "₪" if symbol.endswith(".TA") else "$"
 
-    news_str = "\n".join([f"• {h}" for h in data["news"]["headlines"]]) if data["news"]["headlines"] else "• לא נמצאו חדשות חריגות כעת."
+    headlines = data["news"]["headlines"]
+    news_str = "\n".join(["• " + h for h in headlines]) if headlines else "• לא נמצאו חדשות חריגות כעת."
 
     if data.get("is_valid", False):
-        msg = f"""
-🌟 **התראת פריצה טכנית - {symbol}**
-**מדד:** {ticker_info.get('index', 'כללי')}
+        chg_sign = "+" if data["change_pct"] > 0 else ""
+        lines = [
+            f"🌟 **התראת פריצה טכנית - {symbol}**",
+            f"**מדד:** {ticker_info.get('index', 'כללי')}",
+            "",
+            "---",
+            "📈 **נתונים טכניים:**",
+            f"• סוג פריצה: **פריצת שיא {data['high_type']}**",
+            f"• מחיר נוכחי: `{curr_symbol}{data['price']}` ({chg_sign}{data['change_pct']}%)",
+            f"• נפח מסחר יחסי (RVOL): **{data['vol_ratio']}x**",
+            f"• RSI: `{data['rsi']}`",
+            "• מגמה: **Price > EMA20 > EMA50 🟢**",
+            "",
+            "---",
+            "📰 **חדשות וקטליזטורים:**",
+            f"• סוג זרז: **{data['news']['category']}**",
+            news_str,
+            "",
+            "---",
+            "🎯 **תוכנית מסחר מוצעת:**",
+            f"• 🎯 מחיר כניסה: `{curr_symbol}{data['entry']}`",
+            f"• 🛑 סטופ לוס: `{curr_symbol}{data['stop_loss']}`",
+            f"• 🚀 יעד 1 (TP1): `{curr_symbol}{data['tp1']}`",
+            f"• 🚀 יעד 2 (TP2): `{curr_symbol}{data['tp2']}`"
+        ]
+        msg = "\n".join(lines)
+        markup = InlineKeyboardMarkup(row_width=2)
+        btn_chart = InlineKeyboardButton("📈 צפייה בגרף", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
+        btn_calc = InlineKeyboardButton("💰 חישוב עסקה", callback_data=f"calc_{symbol}_{data['entry']}_{data['stop_loss']}")
+        markup.add(btn_chart, btn_calc)
+    else:
+        reasons_text = "\n".join(data["reasons"])
+        chg_sign = "+" if data["change_pct"] > 0 else ""
+        lines = [
+            f"🔎 **תוצאות ניתוח טכני ממוקד עבור {symbol}**",
+            "",
+            "⚠️ **המניה אינה עומדת בתנאי פריצה כעת. נימוקים:**",
+            reasons_text,
+            "",
+            "---",
+            "📊 **נתוני מסחר נוכחיים:**",
+            f"• מחיר: `{curr_symbol}{data['price']}` ({chg_sign}{data['change_pct']}%)",
+            f"• נפח מסחר יחסי (RVOL): **{data['vol_ratio']}x**",
+            f"• מדד חוזק (RSI): `{data['rsi']}`",
+            "",
+            "---",
+            "📰 **חדשות וקטליזטורים:**",
+            news_str
+        ]
+        msg = "\n".join(lines)
+        markup = InlineKeyboardMarkup()
+        btn_chart = InlineKeyboardButton("📈 צפייה בגרף ב-TradingView", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
+        markup.add(btn_chart)
+
+    return msg, markup
+
+# ------------------------------------------------------------------------------
+# 7. מנוע סריקה
+# ------------------------------------------------------------------------------
+def run_scan_process(target_chat_id: Optional[int] = None):
+    with SCAN_LOCK:
+        if SCAN_STATS["is_running"]: 
+            if target_chat_id:
+                bot.send_message(target_chat_id, "⏳ סריקה כבר מורצת ברקע, אנא המתיני לסיומה.")
+            return
+        SCAN_STATS["is_running"] = True
+        SCAN_STATS["last_run_start"] = datetime.datetime.now()
+
+    logger.info("🚀 מתחיל סריקת מניות ברקע...")
+    found_count = 0
+    
+    try:
+        tickers = fetch_all_index_tickers()
+        
+        def check_and_send(item):
+            nonlocal found_count
+            res = analyze_stock_breakout(item["symbol"], ignore_cooldown=(target_chat_id is not None))
+            if res and res.get("is_valid", False):
+                found_count += 1
+                msg, markup = build_breakout_report(item, res)
+                
+                recipients = [target_chat_id] if target_chat_id else get_all_users()
+                for cid in recipients:
+                    try:
+                        bot.send_message(cid, msg, parse_mode="HTML", reply_markup=markup)
+                    except Exception as e:
+                        logger.error(f"Error sending alert to {cid}: {e}")
+                
+                if not target_chat_id:
+                    record_signal(item["symbol"])
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            executor.map(check_and_send, tickers)
+
+        if target_chat_id and found_count == 0:
+            bot.send_message(target_chat_id, "🔍 הסריקה הידנית הושלמה. לא נמצאו מניות שענו על כל תנאי הפריצה ברגע זה.")
+
+    except Exception as e:
+        logger.error(f"Error during scan: {e}")
+        if target_chat_id:
+            bot.send_message(target_chat_id, "❌ אירעה שגיאה במהלך ביצוע הסריקה.")
+    finally:
+        with SCAN_LOCK:
+            SCAN_STATS["is_running"] = False
+
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.add_job(lambda: run_scan_process(), 'interval', minutes=15)
+scheduler.start()
+
+# ------------------------------------------------------------------------------
+# 8. שרת Web (Flask Keep-Alive)
+# ------------------------------------------------------------------------------
+@app.route('/')
+def home():
+    return "Bot is running 24/7", 200
+
+def keep_alive_ping():
+    while True:
+        time.sleep(600)
+        try:
+            if "localhost" not in SELF_URL: 
+                requests.get(SELF_URL, timeout=10)
+        except Exception: 
+            pass
+
+# ------------------------------------------------------------------------------
+# 9. פקודות טלגרם
+# ------------------------------------------------------------------------------
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    add_user(message.chat.id)
+    welcome_text = (
+        "👋 **ברוכים הבאים לבוט סריקת המניות והפריצות הטכניות!**\n\n"
+        "הבוט סורק באופן רציף וברקע את מדדי **S&P 500, NASDAQ 100 ו-תל אביב 125** "
+        "כדי לאתר מניות המציגות פריצה טכנית, נפח מסחר חורג (RVOL) וקטליזטורים חדשותיים.\n\n"
+        "🛠️ **רשימת הפקודות הזמינות בבוט:**\n\n"
+        "• /start - הצגת הודעת פתיחה זו והסבר על הפיצ'רים\n"
+        "• /scan - הפעלת סריקה ידנית מיידית ברקע על כל המדדים\n"
+        "• /tech  - ניתוח טכני ממוקד עבור מניה (לדוגמה: `/tech AAPL` או `/tech TEVA.TA`)\n"
+        "• /news  - סריקת חדשות וכותרות אחרונות בתרגום לעברית (לדוגמה: `/news TSLA`)\n"
+        "• /status - בדיקת סטטוס סורק הרקע וזמני הריצה"
+    )
+    bot.send_message(message.chat.id, welcome_text, parse_mode="HTML")
+
+@bot.message_handler(commands=['scan'])
+def handle_scan(message):
+    add_user(message.chat.id)
+    bot.reply_to(message, "🔍 **סריקה ידנית הופעלה ברקע!**\nהמערכת מעבדת כעת את המניות ותשלח התראות במידה ותזהה הזדמנויות...", parse_mode="HTML")
+    threading.Thread(target=run_scan_process, args=(message.chat.id,), daemon=True).start()
+
+@bot.message_handler(commands=['tech'])
+def handle_tech(message):
+    add_user(message.chat.id)
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ נא להזין סימול מניה. לדוגמה: `/tech AAPL`", parse_mode="HTML")
+        return
+
+    symbol = parts[1].upper().strip()
+    bot.reply_to(message, f"🔍 מריץ ניתוח טכני עבור **{symbol}**...", parse_mode="HTML")
+
+    def run_single():
+        res = analyze_stock_breakout(symbol, ignore_cooldown=True)
+        if not res or "error" in res:
+            err_msg = res.get('error', 'לא התקבלו נתונים') if res else 'לא התקבלו נתונים'
+            bot.send_message(message.chat.id, f"❌ שגיאה בניתוח **{symbol}**: {err_msg}", parse_mode="HTML")
+            return
+
+        item = {
+            "symbol": symbol,
+            "index": "תל אביב 125" if symbol.endswith(".TA") else "S&P 500 / NASDAQ 100",
+            "currency": "ILS" if symbol.endswith(".TA") else "USD"
+        }
+        msg, markup = build_breakout_report(item, res)
+        bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
+
+    threading.Thread(target=run_single, daemon=True).start()
+
+@bot.message_handler(commands=['news'])
+def handle_news(message):
+    add_user(message.chat.id)
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "⚠️ נא להזין סימול מניה לסריקת חדשות. לדוגמה: `/news AAPL`", parse_mode="HTML")
+        return
+
+    symbol = parts[1].upper().strip()
+    bot.reply_to(message, f"📰 סורק חדשות וזרזים עבור **{symbol}**...", parse_mode="HTML")
+
+    def run_news_single():
+        try:
+            news_data = analyze_news_catalysts(symbol)
+            headlines = news_data["headlines"]
+            news_str = "\n".join(["• " + h for h in headlines]) if headlines else "• לא נמצאו חדשות אחרונות."
+
+            lines = [
+                f"📰 **סריקת חדשות וקטליזטורים עבור {symbol}**",
+                "",
+                f"• **סיווג זרז חריג:** {news_data['category']}",
+                "",
+                "**כותרות אחרונות (מתורגם):**",
+                news_str
+            ]
+            msg = "\n".join(lines)
+            markup = InlineKeyboardMarkup()
+            btn_chart = InlineKeyboardButton("📈 צפייה בגרף ב-TradingView", url=f"https://www.tradingview.com/chart/?symbol={symbol}")
+            markup.add(btn_chart)
+
+            bot.send_message(message.chat.id, msg, parse_mode="HTML", reply_markup=markup)
+        except Exception as e:
+            logger.error(f"Error handling /news command for {symbol}: {e}")
+            bot.send_message(message.chat.id, f"❌ אירעה שגיאה בעת שליפת החדשות עבור **{symbol}**.", parse_mode="HTML")
+
+    threading.Thread(target=run_news_single, daemon=True).start()
+
+@bot.message_handler(commands=['status'])
+def handle_status(message):
+    add_user(message.chat.id)
+    with SCAN_LOCK:
+        is_run = SCAN_STATS["is_running"]
+        last = SCAN_STATS["last_run_start"]
+    last_str = last.strftime('%Y-%m-%d %H:%M:%S') if last else "טרם בוצעה"
+    bot.reply_to(message, f"🩺 **סטטוס מערכת:**\n• סורק פעיל ברגע זה: {'כן ⏳' if is_run else 'לא 🟢'}\n• זמן ריצה אחרון: {last_str}", parse_mode="HTML")
+
+# ------------------------------------------------------------------------------
+# 10. אירועי אינטראקציה ומחשבון
+# ------------------------------------------------------------------------------
+@bot.callback_query_handler(func=lambda call: call.data.startswith("calc_"))
+def handle_calc_callback(call):
+    try:
+        _, symbol, entry, sl = call.data.split("_")
+        USER_CALC_STATE[call.message.chat.id] = {"symbol": symbol, "entry": float(entry), "sl": float(sl)}
+        curr_symbol = "₪" if symbol.endswith(".TA") else "$"
+        
+        bot.send_message(
+            call.message.chat.id,
+            f"💰 **מחשבון סימולציית עסקה עבור {symbol}**\n\n"
+            f"מחיר כניסה: `{curr_symbol}{entry}` | סטופ לוס: `{curr_symbol}{sl}`\n\n"
+            f"אנא הזיני את תקציב ההשקעה בדולרים/שקלים (לדוגמה: `2500`):",
+            parse_mode="HTML"
+        )
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
+
+@bot.message_handler(func=lambda msg: not msg.text.startswith("/") and msg.chat.id in USER_CALC_STATE and USER_CALC_STATE[msg.chat.id] is not None)
+def handle_calc_input(message):
+    try:
+        state = USER_CALC_STATE.pop(message.chat.id)
+        budget = float(message.text.replace("$", "").replace("₪", "").strip())
+        entry, sl = state["entry"], state["sl"]
+
+        shares = int(budget // entry)
+        if shares == 0:
+            bot.reply_to(message, "⚠️ התקציב שהוזן נמוך ממחיר מניה אחת.")
+            return
+
+        total_inv = shares * entry
+        risk_per_share = entry - sl
+        total_risk = shares * risk_per_share
+        
+        tp1 = entry + (1.5 * risk_per_share)
+        tp2 = entry + (2.5 * risk_per_share)
+
+        curr_symbol = "₪" if state['symbol'].endswith(".TA") else "$"
+
+        lines = [
+            f"📐 **תוצאות סימולציית קנייה עבור {state['symbol']}**",
+            "",
+            f"• **כמות מניות לקנייה:** `{shares}` מניות",
+            f"• **סך השקעה בפועל:** {curr_symbol}{total_inv:,.2f}",
+            f"• **סיכון כולל בסטופ לוס:** -{curr_symbol}{total_risk:,.2f}",
+            "",
+            "---",
+            "**🎯 צפי רווח ביעדים:**",
+            f"• **יעד 1 ({curr_symbol}{tp1:.2f}):** רווח של **+{curr_symbol}{(shares * (tp1 - entry)):,.2f}**",
+            f"• **יעד 2 ({curr_symbol}{tp2:.2f}):** רווח של **+{curr_symbol}{(shares * (tp2 - entry)):,.2f}**"
+        ]
+        reply = "\n".join(lines)
+        bot.send_message(message.chat.id, reply, parse_mode="HTML")
+    except ValueError:
+        bot.reply_to(message, "⚠️ נא להזין מספר בלבד.")
+
+# ------------------------------------------------------------------------------
+# 11. הרצה ראשית
+# ------------------------------------------------------------------------------
+if __name__ == "__main__":
+    threading.Thread(target=keep_alive_ping, daemon=True).start()
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT, use_reloader=False), daemon=True).start()
+    logger.info("🤖 Bot is up, start listening...")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
