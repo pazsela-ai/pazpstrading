@@ -3,6 +3,7 @@ import sqlite3
 import datetime
 import pytz
 import logging
+import threading
 import requests
 import pandas as pd
 import numpy as np
@@ -11,6 +12,7 @@ import telebot
 from telebot.types import BotCommand
 from apscheduler.schedulers.background import BackgroundScheduler
 from deep_translator import GoogleTranslator
+from flask import Flask
 
 # try importing psycopg2 for PostgreSQL support in production
 try:
@@ -21,6 +23,13 @@ except ImportError:
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- FLASK APP FOR RENDER HEALTH CHECK ---
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Bot is running successfully!", 200
 
 # --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
@@ -45,10 +54,8 @@ def init_db():
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
     
-    param = "%s" if db_type == "postgres" else "?"
-    
     # Registered Users
-    cursor.execute(f"""
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id BIGINT PRIMARY KEY,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -56,7 +63,7 @@ def init_db():
     """)
     
     # Alert History Cooldown
-    cursor.execute(f"""
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS alert_history (
             symbol VARCHAR(20) PRIMARY KEY,
             last_alert_time TIMESTAMP,
@@ -65,7 +72,7 @@ def init_db():
     """)
     
     # User Watchlist
-    cursor.execute(f"""
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS watchlists (
             chat_id BIGINT,
             symbol VARCHAR(20),
@@ -111,7 +118,6 @@ def get_tase_tickers():
     except Exception as e:
         logging.warning(f"TASE API fetch failed ({e}). Falling back to static list.")
     
-    # Fallback default TASE 35 list
     return ["NICE.TA", "TEVA.TA", "LUMI.TA", "POLI.TA", "ICL.TA", "ALHE.TA", "ELBT.TA", "MZTF.TA"]
 
 def get_us_sp500_tickers():
@@ -133,13 +139,9 @@ def get_all_tickers():
 
 # --- TECHNICAL ANALYSIS & SIGNALS ---
 def analyze_stock_data(symbol, df):
-    """
-    Analyzes historical stock data for breakout signals, ATR stop-loss, and volume confirmation.
-    """
     if df is None or len(df) < 50:
         return None
     
-    # Clean data structure
     if isinstance(df.columns, pd.MultiIndex):
         df = df.xs(symbol, level=1, axis=1) if symbol in df.columns.levels[1] else df
 
@@ -156,11 +158,9 @@ def analyze_stock_data(symbol, df):
     current_volume = volume.iloc[-1]
     avg_volume_20 = volume.iloc[-21:-1].mean()
 
-    # Volume Confirmation (>150% of 20-day average)
     if current_volume < (1.5 * avg_volume_20):
         return None
 
-    # Calculate 20-day and 50-day Highs (excluding current day)
     high_20 = high.iloc[-21:-1].max()
     high_50 = high.iloc[-51:-1].max()
 
@@ -180,13 +180,10 @@ def analyze_stock_data(symbol, df):
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().iloc[-1]
 
-    # Enhanced Risk Management: Combined ATR + Lowest Low (10-day)
     lowest_low_10 = low.iloc[-10:].min()
     atr_stop = current_price - (1.5 * atr)
     
-    # Take the safer (lower) support level between ATR and natural price support
     stop_loss = min(atr_stop, lowest_low_10)
-    
     risk = current_price - stop_loss
     if risk <= 0:
         return None
@@ -203,12 +200,8 @@ def analyze_stock_data(symbol, df):
         "risk_reward": 2.0
     }
 
-# --- COOLDOWN LOGIC WITH DYNAMIC OVERRIDE ---
+# --- COOLDOWN LOGIC ---
 def should_send_alert(symbol, breakout_type, volume_ratio):
-    """
-    Checks cooldown status. Overrides cooldown if a major 50-day breakout 
-    occurs with strong volume (>2.5x avg).
-    """
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
     param = "%s" if db_type == "postgres" else "?"
@@ -222,18 +215,15 @@ def should_send_alert(symbol, breakout_type, volume_ratio):
         if isinstance(last_time, str):
             last_time = datetime.datetime.fromisoformat(last_time)
             
-        time_diff = (now - last_time).total_seconds() / 3600.0  # Hours
+        time_diff = (now - last_time).total_seconds() / 3600.0
 
-        # Standard Cooldown: 4 hours
         if time_diff < 4.0:
-            # Dynamic Cooldown Override: Upgrade from 20-day to 50-day breakout with high volume
             if prev_breakout == "20_DAY" and breakout_type == "50_DAY" and volume_ratio >= 2.5:
                 logging.info(f"Dynamic Cooldown Override triggered for {symbol}!")
             else:
                 conn.close()
                 return False
 
-    # Update Alert History
     if db_type == "postgres":
         cursor.execute("""
             INSERT INTO alert_history (symbol, last_alert_time, breakout_type)
@@ -251,9 +241,8 @@ def should_send_alert(symbol, breakout_type, volume_ratio):
     conn.close()
     return True
 
-# --- SCANNING ENGINE (BATCH DOWNLOAD) ---
+# --- SCANNING ENGINE ---
 def run_market_scan():
-    """Main scanner job triggered every 15 minutes."""
     if not is_market_open():
         logging.info("Markets are currently closed. Skipping scan.")
         return
@@ -261,7 +250,6 @@ def run_market_scan():
     logging.info("Starting batch market scan...")
     tickers = get_all_tickers()
     
-    # Download data in batches to avoid rate-limits
     try:
         data = yf.download(tickers, period="60d", interval="1d", group_by='ticker', threads=True, progress=False)
     except Exception as e:
@@ -278,14 +266,13 @@ def run_market_scan():
             
             if signal and should_send_alert(symbol, signal["breakout_type"], signal["volume_ratio"]):
                 alerts_to_send.append(signal)
-        except Exception as e:
+        except Exception:
             continue
 
     if alerts_to_send:
         broadcast_alerts(alerts_to_send, translator)
 
 def broadcast_alerts(signals, translator):
-    """Formats and sends breakout alerts to registered users and watchlist watchers."""
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
 
@@ -294,9 +281,6 @@ def broadcast_alerts(signals, translator):
 
     for sig in signals:
         breakout_str = "פריצת שיא 50 ימים 🚀" if sig["breakout_type"] == "50_DAY" else "פריצת שיא 20 ימים 📈"
-        
-        # Translate symbol notes if applicable
-        clean_symbol = sig['symbol'].replace('.TA', '')
         
         msg = (
             f"🚨 **אות פריצה זוהה!**\n\n"
@@ -345,7 +329,6 @@ def handle_start(message):
 
 @bot.message_handler(commands=['watch'])
 def handle_watch(message):
-    """Adds a ticker to the user's personal watchlist."""
     chat_id = message.chat.id
     args = message.text.split()
     if len(args) < 2:
@@ -360,7 +343,7 @@ def handle_watch(message):
     try:
         cursor.execute(f"INSERT INTO watchlists (chat_id, symbol) VALUES ({param}, {param})", (chat_id, symbol))
         conn.commit()
-        bot.reply_to(message, f"המניה **{symbol}** נופה בהצלחה לרשימת המעקב האישית שלך! 👁", parse_mode="Markdown")
+        bot.reply_to(message, f"המניה **{symbol}** נוספה בהצלחה לרשימת המעקב האישית שלך! 👁", parse_mode="Markdown")
     except Exception:
         bot.reply_to(message, f"המניה {symbol} כבר נמצאת ברשימת המעקב שלך.")
     finally:
@@ -368,7 +351,6 @@ def handle_watch(message):
 
 @bot.message_handler(commands=['unwatch'])
 def handle_unwatch(message):
-    """Removes a ticker from the user's personal watchlist."""
     chat_id = message.chat.id
     args = message.text.split()
     if len(args) < 2:
@@ -387,7 +369,6 @@ def handle_unwatch(message):
 
 @bot.message_handler(commands=['mywatchlist'])
 def handle_my_watchlist(message):
-    """Lists the user's watchlist tickers."""
     chat_id = message.chat.id
     conn, db_type = get_db_connection()
     cursor = conn.cursor()
@@ -404,7 +385,6 @@ def handle_my_watchlist(message):
         bot.reply_to(message, f"📋 **רשימת המעקב האישית שלך:**\n\n{symbols_str}", parse_mode="Markdown")
 
 def setup_bot_commands():
-    """Sets the Telegram bot interactive menu options."""
     commands = [
         BotCommand("start", "הרשמה לקבלת התראות פריצה"),
         BotCommand("watch", "הוספת מניה לרשימת המעקב האישית"),
@@ -416,44 +396,21 @@ def setup_bot_commands():
     except Exception as e:
         logging.error(f"Failed to set bot commands: {e}")
 
-# --- DAILY DIGEST SCHEDULER ---
-def send_daily_digest():
-    """Sends a end-of-day summary message to all users."""
-    conn, db_type = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT chat_id FROM users")
-    users = [row[0] for row in cursor.fetchall()]
-
-    digest_msg = (
-        "📊 **סיכום יום המסחר - הבוט החכם**\n\n"
-        "סריקות היום הושלמו בהצלחה. "
-        "המערכת מנטרת באופן רציף את מדד S&P 500 ומניות בורסת תל אביב (.TA).\n\n"
-        "נתראה בסריקת פתיחת המסחר הבאה! 🚀"
-    )
-
-    for chat_id in users:
-        try:
-            bot.send_message(chat_id, digest_msg, parse_mode="Markdown")
-        except Exception:
-            pass
-
-    conn.close()
-
-# --- MAIN ENTRY POINT ---
-if __name__ == "__main__":
-    init_db()
-    setup_bot_commands()
-
-    # Setup Scheduler
-    scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
-    # Scan every 15 minutes
-    scheduler.add_job(run_market_scan, 'interval', minutes=15)
-    # Send daily summary at 23:15
-    scheduler.add_job(send_daily_digest, 'cron', hour=23, minute=15)
-    scheduler.start()
-
-    logging.info("Bot started successfully and listening for messages...")
-    
-    # Start Telegram Polling
+def run_bot():
     bot.infinity_polling()
+
+# --- INITIALIZATION ---
+init_db()
+setup_bot_commands()
+
+scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
+scheduler.add_job(run_market_scan, 'interval', minutes=15)
+scheduler.start()
+
+# Start bot polling in a separate background thread
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
+
+if __name__ == "__main__":
+    # Local execution fallback
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
