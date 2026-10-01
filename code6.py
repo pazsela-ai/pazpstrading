@@ -347,7 +347,15 @@ def handle_portfolio(message):
 def home():
     return "PazPSTrading Bot - Broad Multi-Index Scanner Active!"
 
+# דגל גלובלי למניעת הרצה כפולה
+is_tasks_started = False
+
 def start_background_tasks():
+    global is_tasks_started
+    if is_tasks_started:
+        return
+    is_tasks_started = True
+
     scheduler = BackgroundScheduler()
     scheduler.add_job(scan_technical_market, 'interval', minutes=30)
     scheduler.add_job(scan_news_feed, 'interval', minutes=15)
@@ -355,17 +363,22 @@ def start_background_tasks():
 
     def run_bot():
         try:
+            # איפוס Webhook כדי למנוע קונפליקטים מגרסאות קודמות
             bot.remove_webhook()
+            time.sleep(1)
             logging.info("Starting Telegram Bot Polling...")
-            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+            bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
         except Exception as e:
             logging.error(f"Error running bot polling: {e}")
 
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
-start_background_tasks()
-
+# הפעלה בטוחה רק כשהקובץ מורץ ישירות או בתוך ה-Worker הראשי
 if __name__ == '__main__':
+    start_background_tasks()
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
+else:
+    # במידה ו-Gunicorn מריץ את האפליקציה, מפעילים את המשימות פעם אחת בלבד
+    start_background_tasks()
