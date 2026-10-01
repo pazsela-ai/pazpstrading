@@ -1,10 +1,10 @@
+Flask
+gunicorn
 pyTelegramBotAPI
 yfinance
 pandas
 pandas_ta
-deep-translator
-requests
-Flask
 APScheduler
-pytz
-gunicorn
+requests
+feedparser
+google-genai
