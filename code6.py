@@ -306,11 +306,17 @@ def start_scheduler():
     scheduler.start()
 
 def run_bot():
-    bot.infinity_polling()
+    try:
+        # מחיקת webhook ישן כדי למנוע חסימה מטלגרם
+        bot.remove_webhook()
+        logging.info("Starting Telegram Bot Polling...")
+        bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    except Exception as e:
+        logging.error(f"Error running bot polling: {e}")
 
 if __name__ == '__main__':
     start_scheduler()
-    bot_thread = threading.Thread(target=run_bot)
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
