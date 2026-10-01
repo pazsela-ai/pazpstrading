@@ -18,7 +18,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # הגדרת לוגים
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# הגדרת משתני סביבה מנוקים מרווחים
+# ניקוי משתני סביבה מרווחים נסתרים
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
@@ -27,10 +27,10 @@ RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 if not TELEGRAM_TOKEN:
     logging.error("CRITICAL: TELEGRAM_BOT_TOKEN is missing!")
 
-bot = TeleBot(TELEGRAM_TOKEN)
+bot = TeleBot(TELEGRAM_TOKEN, threaded=False)
 app = Flask(__name__)
 
-# אתחול מנוע ה-AI
+# אתחול AI
 ai_client = None
 if GEMINI_API_KEY:
     try:
@@ -43,7 +43,7 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. WEBHOOK & HEALTH CHECK
+# 1. WEBHOOK & HEALTH CHECK ENDPOINTS
 # ---------------------------------------------------------
 
 @app.route('/')
@@ -51,29 +51,39 @@ HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 def home():
     return "OK - Market Scanner Bot Active!", 200
 
+@app.route('/init_webhook', methods=['GET', 'POST'])
+def init_webhook():
+    """נתיב ייעודי לאתחול ה-Webhook בטלגרם"""
+    if not TELEGRAM_TOKEN or not RENDER_EXTERNAL_URL:
+        return "Missing TELEGRAM_BOT_TOKEN or RENDER_EXTERNAL_URL environment variables.", 400
+    
+    url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        res = bot.set_webhook(url=url)
+        if res:
+            logging.info(f"Successfully set webhook to: {url}")
+            return f"Success! Webhook set to {url}", 200
+        else:
+            return "Telegram rejected webhook setting.", 500
+    except Exception as e:
+        logging.error(f"Error setting webhook: {e}")
+        return f"Error setting webhook: {e}", 500
+
 @app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
 def telegram_webhook():
-    """קבלת עדכונים בלייב מטלגרם דרך Webhook"""
-    try:
-        if request.headers.get('content-type') == 'application/json':
+    """קבלת עדכונים בזמן אמת מטלגרם"""
+    if request.headers.get('content-type') == 'application/json':
+        try:
             json_string = request.get_data().decode('utf-8')
             update = types.Update.de_json(json_string)
             bot.process_new_updates([update])
             return 'OK', 200
-    except Exception as e:
-        logging.error(f"Error processing update: {e}")
-    return 'OK', 200
-
-def setup_webhook():
-    if RENDER_EXTERNAL_URL and TELEGRAM_TOKEN:
-        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
-        try:
-            bot.remove_webhook()
-            time.sleep(1)
-            bot.set_webhook(url=webhook_url)
-            logging.info(f"Webhook set successfully to: {webhook_url}")
         except Exception as e:
-            logging.error(f"Failed to set Webhook: {e}")
+            logging.error(f"Error processing webhook payload: {e}")
+            return 'OK', 200
+    return 'Forbidden', 403
 
 # ---------------------------------------------------------
 # 2. TICKER FETCHERS
@@ -172,7 +182,6 @@ def _async_technical_scan():
     logging.info("Background technical scan completed.")
 
 def scan_technical_market():
-    # הרצת הסריקה ב-Thread נפרד כדי שלא לחסום את השרת
     threading.Thread(target=_async_technical_scan, daemon=True).start()
 
 def analyze_ticker_specific_news(ticker):
@@ -239,7 +248,7 @@ def send_welcome(message):
         "🟢 **הבוט PazPSTrading מחובר ופעיל!**\n\n"
         "פקודות זמינות:\n"
         "• `/status` - בדיקת סטטוס מערכת\n"
-        "• `/tech <TICKER>` - ניתוח טכני למניה (למשל: `/tech NVDA` או `/tech ELAL.TA`)\n"
+        "• `/tech <TICKER>` - ניתוח טכני למניה (למשל: `/tech NVDA`)\n"
         "• `/news_scan <TICKER>` - ניתוח חדשות AI למניה"
     )
     bot.reply_to(message, welcome_text, parse_mode="Markdown")
@@ -292,8 +301,6 @@ def handle_simulation_callback(call):
 scheduler = BackgroundScheduler()
 scheduler.add_job(scan_technical_market, 'interval', minutes=60)
 scheduler.start()
-
-setup_webhook()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
