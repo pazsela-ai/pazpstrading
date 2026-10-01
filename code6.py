@@ -37,8 +37,24 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. WEBHOOK & HEALTH CHECK
+# 1. WEBHOOK & COMMANDS SETUP
 # ---------------------------------------------------------
+
+def setup_bot_commands():
+    """עדכון התפריט הרשמי של הבוט בטלגרם"""
+    try:
+        commands = [
+            types.BotCommand("start", "הפעלת הבוט ותפריט ראשי"),
+            types.BotCommand("status", "בדיקת סטטוס מערכת וחיבורים"),
+            types.BotCommand("test_tech", "הרצת סריקה טכנית מיידית"),
+            types.BotCommand("test_news", "הרצת סריקת חדשות AI מיידית"),
+            types.BotCommand("tech", "ניתוח טכני למניה (למשל /tech NVDA)"),
+            types.BotCommand("news_scan", "ניתוח חדשות למניה (למשל /news_scan NVDA)")
+        ]
+        bot.set_my_commands(commands)
+        logging.info("Bot menu commands updated successfully.")
+    except Exception as e:
+        logging.error(f"Failed to update bot commands: {e}")
 
 @app.route('/')
 @app.route('/health')
@@ -54,6 +70,7 @@ def init_webhook():
         bot.remove_webhook()
         time.sleep(1)
         res = bot.set_webhook(url=url)
+        setup_bot_commands()
         return f"Success! Webhook set to {url}" if res else "Telegram rejected webhook", 200
     except Exception as e:
         return f"Error: {e}", 500
@@ -72,7 +89,7 @@ def telegram_webhook():
     return 'Forbidden', 403
 
 # ---------------------------------------------------------
-# 2. TICKER LISTS (EXPANDED STATIC LIST)
+# 2. TICKER LISTS
 # ---------------------------------------------------------
 
 STATIC_TICKERS = [
@@ -102,7 +119,7 @@ def get_all_market_tickers():
     return list(tickers)
 
 # ---------------------------------------------------------
-# 3. TECHNICAL ANALYSIS ENGINE
+# 3. ANALYSIS ENGINES
 # ---------------------------------------------------------
 
 def analyze_technical(ticker):
@@ -121,8 +138,6 @@ def analyze_technical(ticker):
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
 
         latest = df.iloc[-1]
-        prev = df.iloc[-2]
-
         current_price = float(latest['Close'])
         atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else current_price * 0.03
         rsi_val = float(latest['RSI'])
@@ -152,10 +167,6 @@ def analyze_technical(ticker):
         logging.error(f"Error analyzing {ticker}: {e}")
         return None
 
-# ---------------------------------------------------------
-# 4. NEWS ANALYSIS ENGINE (FALLBACK MODEL SYSTEM)
-# ---------------------------------------------------------
-
 def analyze_ticker_specific_news(ticker):
     if not ai_client:
         return "❌ מנוע ה-AI אינו מחובר (חסר GEMINI_API_KEY)."
@@ -173,8 +184,8 @@ def analyze_ticker_specific_news(ticker):
 
         prompt = f"נתח בקצרה בעברית את הידיעות הבאות עבור מניית {ticker}:\n" + "\n".join(items)
         
-        # רשימת מודלים חלופיים למניעת שגיאת NOT FOUND
-        candidate_models = ['gemini-1.5-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-pro']
+        # רשימת מודלים חלופיים תואמים
+        candidate_models = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
         
         for model_name in candidate_models:
             try:
@@ -187,12 +198,12 @@ def analyze_ticker_specific_news(ticker):
             except Exception:
                 continue
 
-        return "❌ לא ניתן התקבל ניתוח מהמערכת (בדוק הרשאות API Key)."
+        return "❌ שגיאה: לא התקבל מענה מכל מודלי ה-AI שנבדקו."
     except Exception as e:
         return f"❌ שגיאה בניתוח חדשות: {e}"
 
 # ---------------------------------------------------------
-# 5. SCANNER TASKS
+# 4. BACKGROUND & MANUAL SCANS
 # ---------------------------------------------------------
 
 def scan_single_ticker_task(ticker):
@@ -204,7 +215,7 @@ def _async_technical_scan(chat_id=None):
     last_scans["tech"] = time.strftime("%Y-%m-%d %H:%M:%S")
     tickers = get_all_market_tickers()
     if chat_id:
-        bot.send_message(chat_id, f"🔎 מתחיל סריקה טכנית על `{len(tickers)}` מניות...", parse_mode="Markdown")
+        bot.send_message(chat_id, f"🔎 מתחיל סריקה טכנית בלייב על `{len(tickers)}` מניות...", parse_mode="Markdown")
     
     with ThreadPoolExecutor(max_workers=8) as executor:
         executor.map(scan_single_ticker_task, tickers)
@@ -212,11 +223,8 @@ def _async_technical_scan(chat_id=None):
     if chat_id:
         bot.send_message(chat_id, "✅ הסריקה הטכנית הושלמה!")
 
-def run_manual_scan(chat_id):
-    threading.Thread(target=_async_technical_scan, args=(chat_id,), daemon=True).start()
-
 # ---------------------------------------------------------
-# 6. TELEGRAM BOT HANDLERS
+# 5. TELEGRAM BOT HANDLERS (ALL MENU COMMANDS INCLUDED)
 # ---------------------------------------------------------
 
 def get_tradingview_link(ticker):
@@ -265,11 +273,12 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
 def send_welcome(message):
     welcome_text = (
         "🟢 **הבוט PazPSTrading מחובר ופעיל!**\n\n"
-        "פקודות זמינות:\n"
+        "פקודות זמינות בתפריט:\n"
         "• `/status` - בדיקת סטטוס מערכת\n"
-        "• `/tech <TICKER>` - ניתוח טכני למניה ספציפית\n"
-        "• `/news_scan <TICKER>` - ניתוח חדשות AI למניה\n"
-        "• `/scan_tech` - הרצת סריקה טכנית יזוקה על כל השוק"
+        "• `/test_tech` - הרצת סריקה טכנית בלייב\n"
+        "• `/test_news` - הרצת סריקת חדשות AI\n"
+        "• `/tech <TICKER>` - ניתוח מניה ספציפית\n"
+        "• `/news_scan <TICKER>` - ניתוח חדשות למניה"
     )
     bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
@@ -284,6 +293,19 @@ def handle_status(message):
         f"• עסקאות בסימולטור: `{len(simulated_trades)}`"
     )
     bot.reply_to(message, status_msg, parse_mode="Markdown")
+
+@bot.message_handler(commands=['test_tech', 'scan_tech'])
+def handle_test_tech(message):
+    """טיפול בפקודת סריקה טכנית מיידית מהתפריט"""
+    threading.Thread(target=_async_technical_scan, args=(message.chat.id,), daemon=True).start()
+
+@bot.message_handler(commands=['test_news'])
+def handle_test_news(message):
+    """טיפול בפקודת סריקת חדשות מיידית מהתפריט"""
+    bot.reply_to(message, "📰 מריץ סריקת חדשות AI עבור מניות מובילות (NVDA, AAPL, TSLA)...")
+    for t in ["NVDA", "AAPL", "TSLA"]:
+        res = analyze_ticker_specific_news(t)
+        bot.send_message(message.chat.id, f"**חדשות עבור {t}:**\n{res}", parse_mode="Markdown")
 
 @bot.message_handler(commands=['tech'])
 def handle_tech_manual(message):
@@ -304,10 +326,6 @@ def handle_news_scan_manual(message):
     ticker = parts[1].upper()
     res = analyze_ticker_specific_news(ticker)
     bot.reply_to(message, res, parse_mode="Markdown")
-
-@bot.message_handler(commands=['scan_tech'])
-def handle_manual_tech_scan(message):
-    run_manual_scan(message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('sim_'))
 def handle_simulation_callback(call):
