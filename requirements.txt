@@ -1,11 +1,9 @@
+pyTelegramBotAPI>=4.12.0
 Flask
-gunicorn
-pyTelegramBotAPI
-yfinance
+requests
 pandas
 pandas_ta
-APScheduler
-requests
+yfinance
 feedparser
+APScheduler
 google-genai
-deep-translator
