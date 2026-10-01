@@ -24,7 +24,6 @@ RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 bot = TeleBot(TELEGRAM_TOKEN, threaded=False)
 app = Flask(__name__)
 
-# שימוש במודל הנתמך
 GEMINI_MODEL = "gemini-1.5-flash"
 
 ai_client = None
@@ -40,7 +39,7 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. WEBHOOK & COMMANDS
+# 1. WEBHOOK & BOT COMMANDS SETUP
 # ---------------------------------------------------------
 
 def setup_bot_commands():
@@ -60,7 +59,7 @@ def setup_bot_commands():
 @app.route('/')
 @app.route('/health')
 def home():
-    return "OK - Advanced Event & Technical Scanner Active!", 200
+    return "OK - Event & Risk Calculator Bot Active!", 200
 
 @app.route('/init_webhook', methods=['GET', 'POST'])
 def init_webhook():
@@ -90,38 +89,26 @@ def telegram_webhook():
     return 'Forbidden', 403
 
 # ---------------------------------------------------------
-# 2. ADVANCED TECHNICAL ENGINE (MULTI-INDICATOR SCORE)
+# 2. ADVANCED TECHNICAL ENGINE
 # ---------------------------------------------------------
 
 def analyze_technical_deep(ticker):
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="100d", interval="1d")
-        if df.empty or len(df) < 50:
+        if df.empty or len(df) < 30:
             return None
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # חישוב אינדיקטורים מרובים
         df['EMA20'] = ta.ema(df['Close'], length=20)
         df['EMA50'] = ta.ema(df['Close'], length=50)
-        df['EMA200'] = ta.ema(df['Close'], length=200) if len(df) >= 200 else df['EMA50']
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        
-        # MACD & Volatility
-        macd = ta.macd(df['Close'])
-        if macd is not None:
-            df['MACD'] = macd['MACD_12_26_9']
-            df['MACD_SIGNAL'] = macd['MACDs_12_26_9']
-        
-        # Volume
         df['VOL_SMA20'] = ta.sma(df['Volume'], length=20)
 
         latest = df.iloc[-1]
-        prev = df.iloc[-2]
-
         current_price = float(latest['Close'])
         atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else current_price * 0.03
         rsi_val = float(latest['RSI'])
@@ -133,39 +120,33 @@ def analyze_technical_deep(ticker):
         score = 0
         reasons = []
 
-        # 1. מגמה ראשית
         if current_price > ema20 > ema50:
-            score += 25
-            reasons.append(f"מגמה עולה חזקה (מחיר > EMA20 > EMA50)")
-
-        # 2. RSI ומומנטום
-        if 52 <= rsi_val <= 68:
-            score += 25
+            score += 30
+            reasons.append("מגמה עולה: מחיר מעל EMA20 ומעל EMA50")
+        if 50 <= rsi_val <= 68:
+            score += 35
             reasons.append(f"מומנטום בריא: RSI ברמה של {rsi_val:.1f}")
-        elif rsi_val > 70:
-            reasons.append(f"⚠️ RSI גבוה ({rsi_val:.1f}) - קרוב לאזור קניית יתר")
+        if vol_now > (vol_avg * 1.2):
+            score += 35
+            reasons.append(f"נפח מסחר מוגבר ({int(vol_now/vol_avg*100)}% מהממוצע)")
 
-        # 3. אישור נפח מסחר (Volume Confirmation)
-        if vol_now > (vol_avg * 1.3):
-            score += 25
-            reasons.append(f"זינוק בנפח המסחר ({int(vol_now/vol_avg*100)}% ממוצע)")
+        # הגדרת מחיר כניסה מותנה (Trigger Price) בפריצה קלה מעל מחיר סגירה
+        entry_price = round(current_price * 1.005, 2)
+        tp_price = round(entry_price + (atr_val * 2.2), 2)
+        sl_price = round(entry_price - (atr_val * 1.2), 2)
 
-        # 4. MACD Cross
-        if 'MACD' in df and latest['MACD'] > latest['MACD_SIGNAL']:
-            score += 25
-            reasons.append("אישור MACD עולה (MACD מעל Signal)")
-
-        is_quality_breakout = score >= 75
-        recommendation = "🟢 **מומלץ לכניסה (איתות איכותי)**" if is_quality_breakout else "🔴 **המתנה (איכות איתות נמוכה)**"
+        is_quality_breakout = score >= 65
+        recommendation = "🟢 **מומלץ לכניסה (איתות פריצה)**" if is_quality_breakout else "🔴 **המתנה (אין איתות ברור)**"
 
         return {
             "ticker": ticker,
             "score": score,
             "is_breakout": is_quality_breakout,
             "recommendation": recommendation,
-            "price": round(current_price, 2),
-            "tp": round(current_price + (atr_val * 2.2), 2),
-            "sl": round(current_price - (atr_val * 1.2), 2),
+            "current_price": round(current_price, 2),
+            "entry_price": entry_price,
+            "tp": tp_price,
+            "sl": sl_price,
             "rsi": round(rsi_val, 1),
             "reasons": reasons
         }
@@ -174,7 +155,7 @@ def analyze_technical_deep(ticker):
         return None
 
 # ---------------------------------------------------------
-# 3. EVENT-DRIVEN NEWS SCANNER (DYNAMIC & FIXED)
+# 3. EVENT-DRIVEN NEWS ENGINE
 # ---------------------------------------------------------
 
 GLOBAL_NEWS_FEEDS = [
@@ -215,21 +196,17 @@ def scan_breaking_news_events():
     )
 
     try:
-        response = ai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
+        response = ai_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         if response and response.text and "אין אירוע קריטי" not in response.text:
-            msg = f"🚨 **איתות אירוע מתפרץ (Event-Driven)!**\n\n{response.text.strip()}"
+            msg = f"🚨 **איתות אירוע מתפרץ בזמן אמת!**\n\n{response.text.strip()}"
             bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
             
-            # חילוץ טיקרים אוטומטי מהטקסט של AI והרצת בדיקה טכנית
+            # חילוץ טיקרים והפקת התרעת ניתוח
             found_tickers = re.findall(r'\b[A-Z]{2,5}(?:\.TA)?\b', response.text)
             for tick in set(found_tickers):
                 tech_data = analyze_technical_deep(tick)
                 if tech_data:
                     send_alert(tick, tech_data)
-
     except Exception as e:
         logging.error(f"AI Event Scan error: {e}")
 
@@ -252,13 +229,13 @@ def analyze_single_ticker_news(ticker):
         response = ai_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         
         if response and response.text:
-            return f"📰 **ניתוח חדשות AI עבור {ticker}:**\n\n{response.text.strip()}"
+            return f"📰 **סיכום חדשות AI עבור {ticker}:**\n\n{response.text.strip()}"
         return "❌ לא התקבל מענה מ-Gemini AI."
     except Exception as e:
         return f"❌ שגיאה: {e}"
 
 # ---------------------------------------------------------
-# 4. TELEGRAM HANDLERS
+# 4. MESSAGING & INTERACTIVE RISK CALCULATOR
 # ---------------------------------------------------------
 
 def send_alert(ticker, tech_data=None, target_chat_id=None):
@@ -273,7 +250,7 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
         bot.send_message(dest_id, f"❌ לא ניתן לשלוף נתונים עבור `{ticker}`.")
         return
 
-    price = tech_data["price"]
+    entry = tech_data["entry_price"]
     tp = tech_data["tp"]
     sl = tech_data["sl"]
     rec = tech_data["recommendation"]
@@ -283,26 +260,87 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
     reasons_text = "\n".join([f"  • {r}" for r in tech_data["reasons"]]) if tech_data["reasons"] else "  • ללא אינדיקטור מיוחד"
 
     msg = (
-        f"📊 **ניתוח טכני מעמיק - {ticker}** (ציון: {score}/100)\n\n"
+        f"📊 **ניתוח איתות - {ticker}** (ציון איכות: {score}/100)\n\n"
         f"📣 **המלצה:** {rec}\n\n"
         f"💡 **פרמטרים שנבדקו:**\n"
         f"{reasons_text}\n\n"
         f"🎯 **תכנית עבודה מוצעת:**\n"
-        f"• מחיר: {currency}{price}\n"
+        f"• מחיר נוכחי: {currency}{tech_data['current_price']}\n"
+        f"• מחיר כניסה מומלץ (Limit): {currency}{entry}\n"
         f"• יעד רווח (TP): {currency}{tp}\n"
         f"• סטופ לוס (SL): {currency}{sl}\n"
     )
 
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(
-        types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.replace('.TA','')}")
-    )
+    # כפתור בצע עסקה למחשבון סיכון
+    keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker}_{entry}_{sl}_{tp}"))
+    keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.replace('.TA','')}") )
 
     bot.send_message(dest_id, msg, parse_mode="Markdown", reply_markup=keyboard)
 
+# ---------------------------------------------------------
+# 5. TELEGRAM CALLBACK HANDLERS (RISK SELECTION)
+# ---------------------------------------------------------
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('trade_'))
+def handle_trade_click(call):
+    _, ticker, entry, sl, tp = call.data.split('_')
+    
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    buttons = [
+        types.InlineKeyboardButton("$50", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_USD_50"),
+        types.InlineKeyboardButton("$100", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_USD_100"),
+        types.InlineKeyboardButton("$250", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_USD_250"),
+        types.InlineKeyboardButton("$500", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_USD_500"),
+        types.InlineKeyboardButton("₪500", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_ILS_500"),
+        types.InlineKeyboardButton("₪1,000", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_ILS_1000")
+    ]
+    keyboard.add(*buttons)
+    
+    bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=keyboard)
+    bot.answer_callback_query(call.id, text="בחר סכום סיכון לחישוב פוזיציה")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('calc_'))
+def handle_calc_risk(call):
+    _, ticker, entry_str, sl_str, tp_str, curr_type, amount_str = call.data.split('_')
+    
+    entry = float(entry_str)
+    sl = float(sl_str)
+    tp = float(tp_str)
+    risk_amount = float(amount_str)
+    
+    risk_per_share = entry - sl
+    if risk_per_share <= 0:
+        bot.answer_callback_query(call.id, text="שגיאה בחישוב הסיכון (SL גבוה ממתחיר הכניסה)")
+        return
+
+    # חישוב כמות מניות לפי סיכון
+    shares_count = int(risk_amount / risk_per_share)
+    total_cost = round(shares_count * entry, 2)
+    potential_profit = round(shares_count * (tp - entry), 2)
+    
+    curr_symbol = "$" if curr_type == "USD" else "₪"
+
+    calc_msg = (
+        f"📐 **חישוב פוזיציה וניהול סיכונים עבור {ticker}:**\n\n"
+        f"• **סכום סיכון מוגדר:** {curr_symbol}{risk_amount}\n"
+        f"• **מחיר כניסה מומלץ:** {curr_symbol}{entry}\n"
+        f"• **סטופ לוס (SL):** {curr_symbol}{sl} (סיכון של {curr_symbol}{risk_per_share:.2f} למניה)\n\n"
+        f"👉 **כדי לסכן בדיוק {curr_symbol}{risk_amount} - עליך לקנות:** `{shares_count}` מניות\n"
+        f"• **שווי פוזיציה כולל:** {curr_symbol}{total_cost}\n"
+        f"• **רווח פוטנציאלי ביעד (TP):** {curr_symbol}{potential_profit}\n"
+    )
+
+    bot.send_message(call.message.chat.id, calc_msg, parse_mode="Markdown")
+    bot.answer_callback_query(call.id, text="חישוב בוצע בהצלחה!")
+
+# ---------------------------------------------------------
+# 6. TELEGRAM COMMAND HANDLERS
+# ---------------------------------------------------------
+
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🟢 **הבוט PazPSTrading מחובר ופעיל במתכונת מעמיקה!**", parse_mode="Markdown")
+    bot.reply_to(message, "🟢 **הבוט PazPSTrading מחובר ופעיל!**\nהבוט מזהה אירועים בזמן אמת ומחשב גודל פוזיציות בלחיצת כפתור.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['status'])
 def handle_status(message):
@@ -336,7 +374,7 @@ def handle_news_scan_manual(message):
     bot.reply_to(message, res, parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# 5. BACKGROUND SCHEDULER
+# 7. BACKGROUND SCHEDULER
 # ---------------------------------------------------------
 
 scheduler = BackgroundScheduler(daemon=True)
