@@ -72,33 +72,37 @@ def telegram_webhook():
     return 'Forbidden', 403
 
 # ---------------------------------------------------------
-# 2. EXPANDED TICKER LISTS
+# 2. TICKER LISTS (EXPANDED STATIC LIST)
 # ---------------------------------------------------------
 
 STATIC_TICKERS = [
-    # US Tech & Major S&P 500
+    # US Tech & Mega Cap
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "INTC", "NFLX",
     "MS", "JPM", "BAC", "V", "MA", "UNH", "PG", "HD", "DIS", "PYPL", "COST", "CSCO",
     "ORCL", "CRM", "PEP", "KO", "XOM", "CVX", "NKE", "LLY", "AVGO", "QCOM", "TXN",
+    "AMAT", "MU", "LRCX", "PANW", "SNOW", "PLTR", "UBER", "ABNB", "COIN", "MARA",
+    "SQ", "SHOP", "ROKU", "SNAP", "PINS", "SE", "MELI", "BKNG", "SBUX", "MCD",
     # TASE / Israel
     "ELAL.TA", "TEVA.TA", "ICL.TA", "NICE.TA", "LUMI.TA", "POLI.TA", "ESLT.TA",
-    "DSCT.TA", "FIBI.TA", "AZRG.TA", "MVRN.TA", "DELTG.TA", "ENLT.TA", "ORA.TA"
+    "DSCT.TA", "FIBI.TA", "AZRG.TA", "MVRN.TA", "DELTG.TA", "ENLT.TA", "ORA.TA",
+    "HARL.TA", "CLIS.TA", "PHOE.TA", "SAEN.TA", "SPEN.TA", "ARGO.TA", "BEZQ.TA"
 ]
 
 def get_all_market_tickers():
     tickers = set(STATIC_TICKERS)
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        resp = requests.get(url, headers=HEADERS, timeout=5)
-        tables = pd.read_html(resp.text)
-        wiki_sp = [str(t).replace('.', '-') for t in tables[0]['Symbol'].tolist()]
-        tickers.update(wiki_sp)
+        resp = requests.get(url, headers=HEADERS, timeout=4)
+        if resp.status_code == 200:
+            tables = pd.read_html(resp.text)
+            wiki_sp = [str(t).replace('.', '-') for t in tables[0]['Symbol'].tolist()]
+            tickers.update(wiki_sp)
     except Exception as e:
         logging.warning(f"Wikipedia fetch skipped: {e}")
     return list(tickers)
 
 # ---------------------------------------------------------
-# 3. TECHNICAL ANALYSIS ENGINE (ENHANCED REASONING)
+# 3. TECHNICAL ANALYSIS ENGINE
 # ---------------------------------------------------------
 
 def analyze_technical(ticker):
@@ -115,7 +119,6 @@ def analyze_technical(ticker):
         df['EMA50'] = ta.ema(df['Close'], length=50)
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        df['Vol_SMA'] = ta.sma(df['Volume'], length=20)
 
         latest = df.iloc[-1]
         prev = df.iloc[-2]
@@ -126,7 +129,6 @@ def analyze_technical(ticker):
         ema20 = float(latest['EMA20'])
         ema50 = float(latest['EMA50'])
 
-        # נימוקים טכניים
         reasons = []
         if current_price > ema20:
             reasons.append(f"מחיר (${current_price:.2f}) מעל ממוצע נע EMA20 (${ema20:.2f})")
@@ -134,10 +136,6 @@ def analyze_technical(ticker):
             reasons.append("מגמה עולה: EMA20 נמצא מעל EMA50")
         if 50 <= rsi_val <= 70:
             reasons.append(f"מומנטום חיובי בריא: RSI ברמה של {rsi_val:.1f}")
-        elif rsi_val > 70:
-            reasons.append(f"מומנטום עוצמתי (קניית יתר): RSI ברמה של {rsi_val:.1f}")
-        if latest['Volume'] > prev['Vol_SMA']:
-            reasons.append("נפח מסחר גבוה מהממוצע ב-20 הימים האחרונים")
 
         is_breakout = (current_price > ema20) and (rsi_val >= 50)
 
@@ -155,7 +153,7 @@ def analyze_technical(ticker):
         return None
 
 # ---------------------------------------------------------
-# 4. NEWS ANALYSIS (UPDATED TO GEMINI-2.5-FLASH)
+# 4. NEWS ANALYSIS ENGINE (FALLBACK MODEL SYSTEM)
 # ---------------------------------------------------------
 
 def analyze_ticker_specific_news(ticker):
@@ -175,17 +173,50 @@ def analyze_ticker_specific_news(ticker):
 
         prompt = f"נתח בקצרה בעברית את הידיעות הבאות עבור מניית {ticker}:\n" + "\n".join(items)
         
-        # עדכון שם המודל לגרסה הנתמכת
-        response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt
-        )
-        return response.text.strip() if response and response.text else "❌ לא התקבלה תשובה מ-AI."
+        # רשימת מודלים חלופיים למניעת שגיאת NOT FOUND
+        candidate_models = ['gemini-1.5-flash', 'gemini-2.0-flash-exp', 'gemini-1.5-pro']
+        
+        for model_name in candidate_models:
+            try:
+                response = ai_client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                if response and response.text:
+                    return response.text.strip()
+            except Exception:
+                continue
+
+        return "❌ לא ניתן התקבל ניתוח מהמערכת (בדוק הרשאות API Key)."
     except Exception as e:
         return f"❌ שגיאה בניתוח חדשות: {e}"
 
 # ---------------------------------------------------------
-# 5. TELEGRAM BOT HANDLERS
+# 5. SCANNER TASKS
+# ---------------------------------------------------------
+
+def scan_single_ticker_task(ticker):
+    tech_res = analyze_technical(ticker)
+    if tech_res and tech_res["is_breakout"]:
+        send_alert(ticker=ticker, tech_data=tech_res)
+
+def _async_technical_scan(chat_id=None):
+    last_scans["tech"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    tickers = get_all_market_tickers()
+    if chat_id:
+        bot.send_message(chat_id, f"🔎 מתחיל סריקה טכנית על `{len(tickers)}` מניות...", parse_mode="Markdown")
+    
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        executor.map(scan_single_ticker_task, tickers)
+        
+    if chat_id:
+        bot.send_message(chat_id, "✅ הסריקה הטכנית הושלמה!")
+
+def run_manual_scan(chat_id):
+    threading.Thread(target=_async_technical_scan, args=(chat_id,), daemon=True).start()
+
+# ---------------------------------------------------------
+# 6. TELEGRAM BOT HANDLERS
 # ---------------------------------------------------------
 
 def get_tradingview_link(ticker):
@@ -214,7 +245,7 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
 
     msg = (
         f"📊 **ניתוח טכני מפורט - {ticker}**\n\n"
-        f"💡 **נימוקי הניתוח והפריצה:**\n"
+        f"💡 **נימוקי הניתוח:**\n"
         f"{reasons_text}\n\n"
         f"🎯 **תכנית עבודה מומלצת:**\n"
         f"• מחיר נוכחי: {currency}{price}\n"
@@ -236,8 +267,9 @@ def send_welcome(message):
         "🟢 **הבוט PazPSTrading מחובר ופעיל!**\n\n"
         "פקודות זמינות:\n"
         "• `/status` - בדיקת סטטוס מערכת\n"
-        "• `/tech <TICKER>` - ניתוח טכני מנומק למניה\n"
-        "• `/news_scan <TICKER>` - ניתוח חדשות AI למניה"
+        "• `/tech <TICKER>` - ניתוח טכני למניה ספציפית\n"
+        "• `/news_scan <TICKER>` - ניתוח חדשות AI למניה\n"
+        "• `/scan_tech` - הרצת סריקה טכנית יזוקה על כל השוק"
     )
     bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
@@ -248,6 +280,7 @@ def handle_status(message):
         "⚙ **סטטוס מערכת:**\n\n"
         f"• AI Engine: {'✅ פעיל' if ai_client else '❌ חסר מפתח'}\n"
         f"• מניות במעקב דינמי: `{total_tickers}`\n"
+        f"• סריקה טכנית אחרונה: `{last_scans['tech']}`\n"
         f"• עסקאות בסימולטור: `{len(simulated_trades)}`"
     )
     bot.reply_to(message, status_msg, parse_mode="Markdown")
@@ -271,6 +304,10 @@ def handle_news_scan_manual(message):
     ticker = parts[1].upper()
     res = analyze_ticker_specific_news(ticker)
     bot.reply_to(message, res, parse_mode="Markdown")
+
+@bot.message_handler(commands=['scan_tech'])
+def handle_manual_tech_scan(message):
+    run_manual_scan(message.chat.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('sim_'))
 def handle_simulation_callback(call):
