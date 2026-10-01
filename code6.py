@@ -186,4 +186,8 @@ def analyze_broad_news_with_ai(headline, summary):
                 contents=prompt
             )
             if response and response.text:
-                clean_json = re.sub(r'```json\s*|\s*
+                clean_json = response.text.replace('```json', '').replace('```', '').strip()
+                return json.loads(clean_json)
+        except Exception as e:
+            logging.error(f"Error in AI news reasoning with {model_name}: {e}")
+    return None
