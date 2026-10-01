@@ -1,3 +1,4 @@
+gunicorn
 pyTelegramBotAPI>=4.12.0
 Flask
 requests
