@@ -68,4 +68,4 @@ def analyze_news_with_ai(headline, summary):
             model='gemini-2.5-flash',
             contents=prompt,
         )
-        res_text = response.text.strip().replace("```json", "").replace("
+res_text = response.text.strip().replace("```json", "").replace("```", "")
