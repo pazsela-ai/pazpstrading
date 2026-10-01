@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import time
+import socket
 import feedparser
 import json
 import re
@@ -157,7 +158,7 @@ def scan_technical_market():
     logging.info("Automated technical scan completed.")
 
 # ---------------------------------------------------------
-# 3. מנוע ניתוח חדשותי (אוטומטי + ממוקד - מתוקן)
+# 3. מנוע ניתוח חדשותי (אוטומטי + ממוקד)
 # ---------------------------------------------------------
 
 def analyze_broad_news_with_ai(headline, summary):
@@ -459,8 +460,23 @@ def start_background_tasks():
     scheduler.add_job(scan_news_feed, 'interval', minutes=15)
     scheduler.start()
 
+def is_already_running():
+    """בודק אם כבר רץ תהליך של הבוט על המכונה כדי למנוע כפילות 409"""
+    try:
+        lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lock_socket.bind(('127.0.0.1', 47829))
+        # נשמור את הסוקט פתוח כל עוד התהליך חי
+        globals()['_process_lock_socket'] = lock_socket
+        return False
+    except socket.error:
+        return True
+
 def start_bot_polling():
     """הרצת ה-Polling של הבוט בתוך תהליך ברקע"""
+    if is_already_running():
+        logging.warning("Another bot process is already running. Skipping polling on this thread.")
+        return
+
     start_background_tasks()
 
     while True:
@@ -471,13 +487,13 @@ def start_bot_polling():
             except TypeError:
                 bot.remove_webhook()
             
-            time.sleep(1)
+            time.sleep(2)
             logging.info("Starting Telegram Bot Polling...")
             
             bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
         except Exception as e:
             logging.error(f"Error in bot polling loop: {e}")
-            time.sleep(5)
+            time.sleep(10)
 
 bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
 bot_thread.start()
