@@ -437,22 +437,13 @@ def start_background_tasks():
     scheduler.add_job(scan_news_feed, 'interval', minutes=15)
     scheduler.start()
 
-    def run_bot():
+def run_bot():
         try:
-            # מחיקת Webhook מוחלטת ואיפוס עדכונים ישנים שהצטברו
-            bot.remove_webhook(drop_pending_updates=True)
+            # מחיקת Webhook בצורה תואמת לכל גרסאות pyTelegramBotAPI
+            bot.remove_webhook()
             time.sleep(2)
             logging.info("Starting Telegram Bot Polling...")
+            # הפרמטר skip_pending=True בתוך infinity_polling דואג להכנסת העדכונים הישנים לפח
             bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
         except Exception as e:
             logging.error(f"Error running bot polling: {e}")
-
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
-if __name__ == '__main__':
-    start_background_tasks()
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
-else:
-    start_background_tasks()
