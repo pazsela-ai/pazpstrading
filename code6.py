@@ -172,7 +172,6 @@ def analyze_broad_news_with_ai(headline, summary):
     אחרת קבע is_relevant=false.
     """
 
-    # הגדרת סכמת פלט מובנית לקבלת JSON נקי ומבוטח
     news_schema = genai_types.Schema(
         type=genai_types.Type.OBJECT,
         properties={
@@ -416,7 +415,7 @@ def handle_portfolio(message):
     bot.reply_to(message, text, parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# 5. Flask & Background Scheduler
+# 5. Flask & Background Scheduler & Bot Thread
 # ---------------------------------------------------------
 
 @app.route('/')
@@ -437,13 +436,31 @@ def start_background_tasks():
     scheduler.add_job(scan_news_feed, 'interval', minutes=15)
     scheduler.start()
 
-def run_bot():
+def start_bot_polling():
+    """הרצת ה-Polling של הבוט בתוך תהליך ברקע"""
+    # הפעלת משימות התיזמון האוטומטיות (Background Scheduler)
+    start_background_tasks()
+
+    while True:
         try:
-            # מחיקת Webhook בצורה תואמת לכל גרסאות pyTelegramBotAPI
-            bot.remove_webhook()
-            time.sleep(2)
+            logging.info("Clearing webhooks...")
+            try:
+                bot.remove_webhook(drop_pending_updates=True)
+            except TypeError:
+                bot.remove_webhook()
+            
+            time.sleep(1)
             logging.info("Starting Telegram Bot Polling...")
-            # הפרמטר skip_pending=True בתוך infinity_polling דואג להכנסת העדכונים הישנים לפח
+            
+            # הרצת ה-Polling
             bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
         except Exception as e:
-            logging.error(f"Error running bot polling: {e}")
+            logging.error(f"Error in bot polling loop: {e}")
+            time.sleep(5)
+
+# הפעלת ה-Polling ב-Thread נפרד ברגע ש-Flask/Gunicorn עולים
+bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
+bot_thread.start()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)
