@@ -9,7 +9,7 @@ import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import feedparser
-import google.generativeai as genai
+from google import genai
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask
 from telebot import TeleBot, types
@@ -26,9 +26,13 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 bot = TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# אתחול מנוע ה-AI (Gemini)
+# אתחול מנוע ה-AI החדש (google-genai SDK)
+ai_client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    try:
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        logging.error(f"Failed to initialize Gemini Client: {e}")
 
 # מסד נתונים בזיכרון
 simulated_trades = []
@@ -158,11 +162,11 @@ def scan_technical_market():
     logging.info("Automated technical scan completed.")
 
 # ---------------------------------------------------------
-# 4. מנוע ניתוח חדשותי (תוקן לחלוטין)
+# 4. מנוע ניתוח חדשותי (התאמה מלאה ל-google-genai)
 # ---------------------------------------------------------
 
 def analyze_broad_news_with_ai(headline, summary):
-    if not GEMINI_API_KEY:
+    if not ai_client:
         return None
 
     prompt = f"""
@@ -179,11 +183,13 @@ def analyze_broad_news_with_ai(headline, summary):
     אם הידיעה אינה משפיעה ישירות על מניה ספציפית במדדים, החזר is_relevant=false.
     """
 
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
+    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash']
     for model_name in models_to_try:
         try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
             if response and response.text:
                 clean_json = response.text.replace('```json', '').replace('```', '').strip()
                 return json.loads(clean_json)
@@ -242,7 +248,7 @@ def fetch_ticker_news_rss(ticker):
     return "\n".join(news_items)
 
 def analyze_ticker_specific_news(ticker):
-    if not GEMINI_API_KEY:
+    if not ai_client:
         return "❌ מנוע ה-AI אינו מחובר (חסר GEMINI_API_KEY)."
 
     news_text = fetch_ticker_news_rss(ticker)
@@ -259,11 +265,13 @@ def analyze_ticker_specific_news(ticker):
     2. תן שורת סיכום ברורה בסוף.
     """
     
-    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
+    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash']
     for model_name in models_to_try:
         try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
             if response and response.text:
                 return response.text.strip()
         except Exception as e:
@@ -338,7 +346,7 @@ def handle_status(message):
     total_tickers = len(get_all_market_tickers())
     status_msg = (
         "⚙ **סטטוס מערכת:**\n\n"
-        f"• חיבור ל-AI: {'✅ תקין' if GEMINI_API_KEY else '❌ לא מחובר'}\n"
+        f"• חיבור ל-AI: {'✅ תקין' if ai_client else '❌ לא מחובר'}\n"
         f"• סריקת חדשות אחרונה: `{last_scans['news']}`\n"
         f"• סריקה טכנית אחרונה: `{last_scans['tech']}`\n"
         f"• מניות במעקב דינמי: `{total_tickers}`\n"
@@ -351,7 +359,7 @@ def handle_test_news(message):
     bot.reply_to(message, "🔎 מריץ סורק חדשות מבוסס AI בלייב...")
     found = scan_news_feed()
     if not found:
-        bot.send_message(message.chat.id, "ℹ️️ לא נמצאו כרגע אירועים חדשותיים בעלי השפעה חיובית מובהקת.")
+        bot.send_message(message.chat.id, "ℹ לא נמצאו כרגע אירועים חדשותיים בעלי השפעה חיובית מובהקת.")
 
 @bot.message_handler(commands=['test_tech'])
 def handle_test_tech(message):
@@ -453,7 +461,7 @@ def start_bot_polling():
     start_background_tasks()
     
     try:
-        bot.remove_webhook(drop_pending_updates=True)
+        bot.remove_webhook()
     except Exception as e:
         logging.warning(f"Failed to remove webhook: {e}")
 
