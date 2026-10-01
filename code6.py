@@ -22,13 +22,14 @@ RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 bot = TeleBot(TELEGRAM_TOKEN, threaded=False)
 app = Flask(__name__)
 
-GEMINI_MODEL = "gemini-1.5-flash"
+# שמירת מצבי משתמש להזנת סכום מותאם אישית
+user_states = {}
 
 ai_client = None
 if GEMINI_API_KEY:
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
-        logging.info("Gemini Client initialized.")
+        logging.info("Gemini Client initialized successfully.")
     except Exception as e:
         logging.error(f"Failed to initialize Gemini Client: {e}")
 
@@ -37,7 +38,31 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. WEBHOOK & BOT COMMANDS SETUP
+# 1. HELPER: GEMINI AI GENERATOR WITH FALLBACKS
+# ---------------------------------------------------------
+
+def generate_ai_response(prompt):
+    if not ai_client:
+        return "❌ מנוע AI אינו מחובר. נא לוודא הגדרת GEMINI_API_KEY."
+
+    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    
+    for model_name in models_to_try:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            if response and response.text:
+                return response.text.strip()
+        except Exception as e:
+            logging.warning(f"Model {model_name} failed: {e}. Trying fallback...")
+            continue
+
+    return "❌ לא ניתן היה לקבל מענה מכל מודלי Gemini הנתמכים."
+
+# ---------------------------------------------------------
+# 2. WEBHOOK & COMMANDS SETUP
 # ---------------------------------------------------------
 
 def setup_bot_commands():
@@ -58,7 +83,7 @@ def setup_bot_commands():
 @app.route('/')
 @app.route('/health')
 def home():
-    return "OK - Event & Risk Calculator Bot Active!", 200
+    return "OK - Event & Dynamic Risk Calculator Active!", 200
 
 @app.route('/init_webhook', methods=['GET', 'POST'])
 def init_webhook():
@@ -88,7 +113,7 @@ def telegram_webhook():
     return 'Forbidden', 403
 
 # ---------------------------------------------------------
-# 2. ADVANCED TECHNICAL ENGINE
+# 3. TECHNICAL ENGINE
 # ---------------------------------------------------------
 
 def analyze_technical_deep(ticker):
@@ -153,7 +178,7 @@ def analyze_technical_deep(ticker):
         return None
 
 # ---------------------------------------------------------
-# 3. EVENT-DRIVEN NEWS ENGINE
+# 4. EVENT-DRIVEN NEWS ENGINE
 # ---------------------------------------------------------
 
 GLOBAL_NEWS_FEEDS = [
@@ -191,24 +216,18 @@ def scan_breaking_news_events():
         "אם אין אירוע חריג, ענה 'אין אירוע קריטי'."
     )
 
-    try:
-        response = ai_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        if response and response.text and "אין אירוע קריטי" not in response.text:
-            msg = f"🚨 **איתות אירוע מתפרץ בזמן אמת!**\n\n{response.text.strip()}"
-            bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
-            
-            found_tickers = re.findall(r'\b[A-Z]{2,5}(?:\.TA)?\b', response.text)
-            for tick in set(found_tickers):
-                tech_data = analyze_technical_deep(tick)
-                if tech_data:
-                    send_alert(tick, tech_data)
-    except Exception as e:
-        logging.error(f"AI Event Scan error: {e}")
+    ai_text = generate_ai_response(prompt)
+    if "אין אירוע קריטי" not in ai_text and "❌" not in ai_text:
+        msg = f"🚨 **איתות אירוע מתפרץ בזמן אמת!**\n\n{ai_text}"
+        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+        
+        found_tickers = re.findall(r'\b[A-Z]{2,5}(?:\.TA)?\b', ai_text)
+        for tick in set(found_tickers):
+            tech_data = analyze_technical_deep(tick)
+            if tech_data:
+                send_alert(tick, tech_data)
 
 def analyze_single_ticker_news(ticker):
-    if not ai_client:
-        return "❌ מנוע AI אינו מחובר. נסה לוודא שמוגדר GEMINI_API_KEY."
-
     query = f"{ticker.replace('.TA', '')}+stock"
     rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
@@ -221,16 +240,16 @@ def analyze_single_ticker_news(ticker):
             return f"ℹ️ לא נמצאו כתבות חדשותיות אחרונות עבור `{ticker}`."
 
         prompt = f"נתח בקצרה בעברית את הידיעות עבור {ticker} ותן המלצה (חיובי/שלילי/ניטרלי):\n" + "\n".join(items)
-        response = ai_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        ai_text = generate_ai_response(prompt)
         
-        if response and response.text:
-            return f"📰 **סיכום חדשות AI עבור {ticker}:**\n\n{response.text.strip()}"
-        return "❌ לא התקבל מענה מ-Gemini AI."
+        if "❌" not in ai_text:
+            return f"📰 **סיכום חדשות AI עבור {ticker}:**\n\n{ai_text}"
+        return ai_text
     except Exception as e:
         return f"❌ שגיאה בניתוח חדשות: {e}"
 
 # ---------------------------------------------------------
-# 4. MESSAGING & INTERACTIVE RISK CALCULATOR
+# 5. ALERT MESSAGING & CALLBACKS
 # ---------------------------------------------------------
 
 def send_alert(ticker, tech_data=None, target_chat_id=None):
@@ -252,7 +271,7 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
     score = tech_data["score"]
     currency = "₪" if ".TA" in ticker else "$"
 
-    reasons_text = "\n".join([f"  • {r}" for r in tech_data["reasons"]]) if tech_data["reasons"] else "  • ללא אינדיקטור מיועד"
+    reasons_text = "\n".join([f"  • {r}" for r in tech_data["reasons"]]) if tech_data["reasons"] else "  • ללא אינדיקטור מיוחד"
 
     msg = (
         f"📊 **ניתוח איתות - {ticker}** (ציון איכות: {score}/100)\n\n"
@@ -272,107 +291,125 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
 
     bot.send_message(dest_id, msg, parse_mode="Markdown", reply_markup=keyboard)
 
-# ---------------------------------------------------------
-# 5. TELEGRAM CALLBACK & COMMAND HANDLERS
-# ---------------------------------------------------------
-
+# בחירת מטבע (שקלים / דולרים)
 @bot.callback_query_handler(func=lambda call: call.data.startswith('trade_'))
 def handle_trade_click(call):
     _, ticker, entry, sl, tp = call.data.split('_')
-    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
-        types.InlineKeyboardButton("$50", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_USD_50"),
-        types.InlineKeyboardButton("$100", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_USD_100"),
-        types.InlineKeyboardButton("$250", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_USD_250"),
-        types.InlineKeyboardButton("$500", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_USD_500"),
-        types.InlineKeyboardButton("₪500", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_ILS_500"),
-        types.InlineKeyboardButton("₪1,000", callback_data=f"calc_{ticker}_{entry}_{sl}_{tp}_ILS_1000")
+        types.InlineKeyboardButton("💵 חישוב בדולרים ($)", callback_data=f"currency_{ticker}_{entry}_{sl}_{tp}_USD"),
+        types.InlineKeyboardButton("₪ חישוב בשקלים (₪)", callback_data=f"currency_{ticker}_{entry}_{sl}_{tp}_ILS")
     ]
     keyboard.add(*buttons)
     bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id, text="בחר סכום סיכון לחישוב פוזיציה")
+    bot.answer_callback_query(call.id, text="בחר מטבע לחישוב הסיכון")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('calc_'))
-def handle_calc_risk(call):
-    _, ticker, entry_str, sl_str, tp_str, curr_type, amount_str = call.data.split('_')
-    entry, sl, tp, risk_amount = float(entry_str), float(sl_str), float(tp_str), float(amount_str)
+# בקשת הזנת סכום מותאם אישית
+@bot.callback_query_handler(func=lambda call: call.data.startswith('currency_'))
+def handle_currency_select(call):
+    _, ticker, entry, sl, tp, curr = call.data.split('_')
     
-    risk_per_share = entry - sl
-    if risk_per_share <= 0:
-        bot.answer_callback_query(call.id, text="שגיאה בחישוב הסיכון")
-        return
+    # שמירת נתוני המשימה בלשונית המשתמש
+    user_states[call.from_user.id] = {
+        "action": "awaiting_risk_amount",
+        "ticker": ticker,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp": float(tp),
+        "curr": curr
+    }
 
-    shares_count = int(risk_amount / risk_per_share)
-    total_cost = round(shares_count * entry, 2)
-    potential_profit = round(shares_count * (tp - entry), 2)
-    curr_symbol = "$" if curr_type == "USD" else "₪"
-
-    calc_msg = (
-        f"📐 **חישוב פוזיציה וניהול סיכונים עבור {ticker}:**\n\n"
-        f"• **סכום סיכון מוגדר:** {curr_symbol}{risk_amount}\n"
-        f"• **מחיר כניסה מומלץ:** {curr_symbol}{entry}\n"
-        f"• **סטופ לוס (SL):** {curr_symbol}{sl}\n\n"
-        f"👉 **כדי לסכן בדיוק {curr_symbol}{risk_amount} - עליך לקנות:** `{shares_count}` מניות\n"
-        f"• **שווי פוזיציה כולל:** {curr_symbol}{total_cost}\n"
-        f"• **רווח פוטנציאלי ביעד (TP):** {curr_symbol}{potential_profit}\n"
-    )
-
-    bot.send_message(call.message.chat.id, calc_msg, parse_mode="Markdown")
-    bot.answer_callback_query(call.id, text="חישוב בוצע בהצלחה!")
-
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.reply_to(message, "🟢 **הבוט PazPSTrading פעיל!**\nהקש `/tech NVDA` או `/news_scan NVDA` לבדיקה.", parse_mode="Markdown")
-
-@bot.message_handler(commands=['status'])
-def handle_status(message):
-    status_msg = (
-        "⚙ **סטטוס מערכת:**\n\n"
-        f"• AI Engine: {'✅ פעיל (' + GEMINI_MODEL + ')' if GEMINI_API_KEY else '❌ לא מחובר'}\n"
-        f"• סריקת אירועים אוטומטית: 🟢 מופעלת (כל 15 דק')\n"
-        f"• סריקת חדשות אחרונה: `{last_scans['news']}`"
-    )
-    bot.reply_to(message, status_msg, parse_mode="Markdown")
-
-@bot.message_handler(commands=['tech'])
-def handle_tech_manual(message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/tech NVDA`", parse_mode="Markdown")
-        return
-    ticker = parts[1].upper()
-    bot.reply_to(message, f"🔍 מריץ ניתוח טכני עבור `{ticker}`...", parse_mode="Markdown")
-    tech_data = analyze_technical_deep(ticker)
-    send_alert(ticker=ticker, tech_data=tech_data, target_chat_id=message.chat.id)
-
-@bot.message_handler(commands=['news_scan'])
-def handle_news_scan_manual(message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
-        return
-    ticker = parts[1].upper()
-    bot.reply_to(message, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker}`...", parse_mode="Markdown")
-    res = analyze_single_ticker_news(ticker)
-    bot.reply_to(message, res, parse_mode="Markdown")
-
-@bot.message_handler(commands=['test_news'])
-def handle_test_news(message):
-    bot.reply_to(message, "📰 מריץ סריקת אירועים חדשותיים בלייב...")
-    scan_breaking_news_events()
-
-@bot.message_handler(commands=['test_tech'])
-def handle_test_tech(message):
-    bot.reply_to(message, "📈 מריץ בדיקה טכנית לדוגמה (NVDA)...")
-    tech_data = analyze_technical_deep("NVDA")
-    send_alert("NVDA", tech_data, message.chat.id)
-
-@bot.message_handler(commands=['portfolio'])
-def handle_portfolio(message):
-    bot.reply_to(message, "💼 **תיק מעקב מניות:** כרגע אין מניות רשומות במעקב הפעיל.", parse_mode="Markdown")
+    symbol = "$" if curr == "USD" else "₪"
+    bot.send_message(call.message.chat.id, f"✍️ **אנא הקלד/י כעת בטרמינל את סכום הסיכון המבוקש ב-{symbol}:**\n(לדוגמה: 150 או 500)", parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
 
 # ---------------------------------------------------------
-# 6. BACKGROUND SCHEDULER & RUNNER
+# 6. TELEGRAM MESSAGES & USER INPUT HANDLER
+# ---------------------------------------------------------
+
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    # טיפול בהזנת סכום סיכון מותאם אישית
+    if user_id in user_states and user_states[user_id].get("action") == "awaiting_risk_amount":
+        try:
+            risk_amount = float(text)
+            state = user_states.pop(user_id) # ניקוי מצב
+
+            entry = state["entry"]
+            sl = state["sl"]
+            tp = state["tp"]
+            ticker = state["ticker"]
+            curr = state["curr"]
+
+            risk_per_share = entry - sl
+            if risk_per_share <= 0:
+                bot.reply_to(message, "❌ שגיאה: סטופ לוס גבוה/שווה למחיר הכניסה.")
+                return
+
+            shares_count = int(risk_amount / risk_per_share)
+            total_cost = round(shares_count * entry, 2)
+            potential_profit = round(shares_count * (tp - entry), 2)
+            curr_symbol = "$" if curr == "USD" else "₪"
+
+            calc_msg = (
+                f"📐 **חישוב פוזיציה מותאם אישית עבור {ticker}:**\n\n"
+                f"• **סכום סיכון מוגדר:** {curr_symbol}{risk_amount}\n"
+                f"• **מחיר כניסה מומלץ:** {curr_symbol}{entry}\n"
+                f"• **סטופ לוס (SL):** {curr_symbol}{sl} (סיכון של {curr_symbol}{risk_per_share:.2f} למניה)\n\n"
+                f"👉 **כדי לסכן בדיוק {curr_symbol}{risk_amount} - עליך לקנות:** `{shares_count}` מניות\n"
+                f"• **שווי פוזיציה כולל:** {curr_symbol}{total_cost}\n"
+                f"• **רווח פוטנציאלי ביעד (TP):** {curr_symbol}{potential_profit}\n"
+            )
+            bot.reply_to(message, calc_msg, parse_mode="Markdown")
+            return
+        except ValueError:
+            bot.reply_to(message, "⚠️ אנא הזן מספר תקין בלבד (למשל: 200). נסה שוב:")
+            return
+
+    # פקודות רגילות
+    if text.startswith('/start') or text.startswith('/help'):
+        bot.reply_to(message, "🟢 **הבוט PazPSTrading מחובר ופעיל!**\nהקש `/tech NVDA` או `/news_scan NVDA` לבדיקה.", parse_mode="Markdown")
+    elif text.startswith('/status'):
+        status_msg = (
+            "⚙ **סטטוס מערכת:**\n\n"
+            f"• AI Engine: {'✅ פעיל' if GEMINI_API_KEY else '❌ לא מחובר'}\n"
+            f"• סריקת אירועים אוטומטית: 🟢 מופעלת (כל 15 דק')\n"
+            f"• סריקת חדשות אחרונה: `{last_scans['news']}`"
+        )
+        bot.reply_to(message, status_msg, parse_mode="Markdown")
+    elif text.startswith('/tech'):
+        parts = text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/tech NVDA`", parse_mode="Markdown")
+            return
+        ticker = parts[1].upper()
+        bot.reply_to(message, f"🔍 מריץ ניתוח טכני עבור `{ticker}`...", parse_mode="Markdown")
+        tech_data = analyze_technical_deep(ticker)
+        send_alert(ticker=ticker, tech_data=tech_data, target_chat_id=message.chat.id)
+    elif text.startswith('/news_scan'):
+        parts = text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
+            return
+        ticker = parts[1].upper()
+        bot.reply_to(message, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker}`...", parse_mode="Markdown")
+        res = analyze_single_ticker_news(ticker)
+        bot.reply_to(message, res, parse_mode="Markdown")
+    elif text.startswith('/test_news'):
+        bot.reply_to(message, "📰 מריץ סריקת אירועים חדשותיים בלייב...")
+        scan_breaking_news_events()
+    elif text.startswith('/test_tech'):
+        bot.reply_to(message, "📈 מריץ בדיקה טכנית לדוגמה (NVDA)...")
+        tech_data = analyze_technical_deep("NVDA")
+        send_alert("NVDA", tech_data, message.chat.id)
+    elif text.startswith('/portfolio'):
+        bot.reply_to(message, "💼 **תיק מעקב מניות:** כרגע אין מניות רשומות במעקב הפעיל.", parse_mode="Markdown")
+
+# ---------------------------------------------------------
+# 7. BACKGROUND SCHEDULER & RUNNER
 # ---------------------------------------------------------
 
 scheduler = BackgroundScheduler(daemon=True)
