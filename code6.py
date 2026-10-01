@@ -460,6 +460,8 @@ def start_background_tasks():
 def start_bot_polling():
     start_background_tasks()
     
+    # השהיה קלה להבטחת התנתקות מחיבורים קודמים
+    time.sleep(3)
     try:
         bot.remove_webhook()
     except Exception as e:
