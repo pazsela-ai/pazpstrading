@@ -9,3 +9,4 @@ feedparser
 APScheduler
 google-genai
 google-generativeai>=0.8.0
+textblob
