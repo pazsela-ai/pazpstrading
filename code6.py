@@ -4,6 +4,7 @@ import threading
 import time
 import feedparser
 import json
+import re
 import requests
 import pandas as pd
 import pandas_ta as ta
@@ -156,7 +157,7 @@ def scan_technical_market():
     logging.info("Automated technical scan completed.")
 
 # ---------------------------------------------------------
-# 3. מנוע ניתוח חדשותי (אוטומטי + ממוקד)
+# 3. מנוע ניתוח חדשותי (אוטומטי + ממוקד - מתוקן)
 # ---------------------------------------------------------
 
 def analyze_broad_news_with_ai(headline, summary):
@@ -183,19 +184,22 @@ def analyze_broad_news_with_ai(headline, summary):
         required=["is_relevant"]
     )
 
-    try:
-        response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=news_schema
+    models_to_try = ['gemini-1.5-flash', 'gemini-2.0-flash']
+    for model_name in models_to_try:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=news_schema
+                )
             )
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        logging.error(f"Error in AI news reasoning: {e}")
-        return None
+            if response and response.text:
+                return json.loads(response.text)
+        except Exception as e:
+            logging.error(f"Error in AI news reasoning with {model_name}: {e}")
+    return None
 
 def scan_news_feed():
     logging.info("Starting automated news scan...")
@@ -210,7 +214,8 @@ def scan_news_feed():
     for url in rss_urls:
         feed = feedparser.parse(url)
         for entry in feed.entries[:8]:
-            ai_res = analyze_broad_news_with_ai(entry.title, entry.get("summary", ""))
+            clean_summary = re.sub('<[^<]+?>', '', entry.get("summary", ""))
+            ai_res = analyze_broad_news_with_ai(entry.title, clean_summary)
             if ai_res and ai_res.get("is_relevant"):
                 ticker = ai_res.get("ticker")
                 reason = ai_res.get("reason", "")
@@ -220,12 +225,22 @@ def scan_news_feed():
     return found_any
 
 def fetch_ticker_news_rss(ticker):
+    is_israeli = ".TA" in ticker
     clean_ticker = ticker.replace(".TA", "")
-    rss_url = f"https://news.google.com/rss/search?q={clean_ticker}+stock+news&hl=en-US&gl=US&ceid=US:en"
+    
+    if is_israeli:
+        rss_url = f"https://news.google.com/rss/search?q={clean_ticker}+אל+על+בורסה&hl=he&gl=IL&ceid=IL:he"
+    else:
+        rss_url = f"https://news.google.com/rss/search?q={clean_ticker}+stock+news&hl=en-US&gl=US&ceid=US:en"
+        
     feed = feedparser.parse(rss_url)
     news_items = []
+    
     for entry in feed.entries[:5]:
-        news_items.append(f"- כותרת: {entry.title}\n  תקציר: {entry.get('summary', '')}")
+        raw_summary = entry.get('summary', '')
+        clean_summary = re.sub('<[^<]+?>', '', raw_summary)
+        news_items.append(f"- כותרת: {entry.title}\n  תקציר: {clean_summary}")
+    
     return "\n".join(news_items)
 
 def analyze_ticker_specific_news(ticker):
@@ -233,25 +248,33 @@ def analyze_ticker_specific_news(ticker):
         return "❌ מנוע ה-AI אינו מחובר (חסר GEMINI_API_KEY)."
 
     news_text = fetch_ticker_news_rss(ticker)
-    if not news_text:
-        return f"ℹ️ לא נמצאו חדשות עדכניות עבור `{ticker}`."
+    
+    if not news_text or not news_text.strip():
+        return f"ℹ️ לא נמצאו כתבות חדשות עדכניות ברשת עבור `{ticker}`."
 
     prompt = f"""
-    אתה אנליסט בכיר. להלן חדשות עבור המניה {ticker}:
+    אתה אנליסט פיננסי בכיר. להלן כתבות חדשות שהתקבלו עבור המניה {ticker}:
     {news_text}
 
-    1. נתח את הסנטימנט (חיובי/שלילי/ניטרלי) וההשפעה על המניה ב-2-3 משפטים בעברית.
-    2. תן שורת סיכום ברורה: [חיובי / ניטרלי / שלילי].
+    נתח את הידיעות הללו:
+    1. קבע סנטימנט (חיובי / ניטרלי / שלילי) והסבר בקצרה ב-2 משפטים בעברית.
+    2. תן שורת סיכום ברורה בסוף.
     """
-    try:
-        response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        return response.text.strip()
-    except Exception as e:
-        logging.error(f"Error analyzing news for {ticker}: {e}")
-        return f"❌ אירעה שגיאה בניתוח ה-AI עבור `{ticker}`."
+    
+    models_to_try = ['gemini-1.5-flash', 'gemini-2.0-flash']
+    
+    for model_name in models_to_try:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            if response and response.text:
+                return response.text.strip()
+        except Exception as e:
+            logging.error(f"Failed analysis with model {model_name} for {ticker}: {e}")
+
+    return f"❌ אירעה שגיאה בחיבור ל-AI בזמן ניתוח `{ticker}`."
 
 # ---------------------------------------------------------
 # 4. התראות ופקודות טלגרם
@@ -438,7 +461,6 @@ def start_background_tasks():
 
 def start_bot_polling():
     """הרצת ה-Polling של הבוט בתוך תהליך ברקע"""
-    # הפעלת משימות התיזמון האוטומטיות (Background Scheduler)
     start_background_tasks()
 
     while True:
@@ -452,13 +474,11 @@ def start_bot_polling():
             time.sleep(1)
             logging.info("Starting Telegram Bot Polling...")
             
-            # הרצת ה-Polling
             bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
         except Exception as e:
             logging.error(f"Error in bot polling loop: {e}")
             time.sleep(5)
 
-# הפעלת ה-Polling ב-Thread נפרד ברגע ש-Flask/Gunicorn עולים
 bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
 bot_thread.start()
 
