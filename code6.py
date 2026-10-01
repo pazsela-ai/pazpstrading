@@ -2,7 +2,6 @@ import os
 import logging
 import threading
 import time
-import re
 import feedparser
 import json
 import requests
@@ -14,6 +13,7 @@ from flask import Flask
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 from google import genai
+from google.genai import types as genai_types
 
 # הגדרת לוגים
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -164,24 +164,36 @@ def analyze_broad_news_with_ai(headline, summary):
         return None
 
     prompt = f"""
-    אתה אנליסט בכיר. נתח את הידיעה:
+    אתה אנליסט בכיר. נתח את הידיעה הבאה:
     כותרת: {headline}
     תקציר: {summary}
 
-    אם יש השפעה חיובית מובהקת על מניה במדדים המובילים (ת"א 125, S&P 500, Nasdaq 100), החזר JSON בלבד:
-    {{"is_relevant": true, "ticker": "ELAL.TA", "reason": "נימוק...", "conviction": "HIGH"}}
-    אחרת החזר: {{"is_relevant": false}}
+    אם יש השפעה חיובית מובהקת על מניה במדדים המובילים (ת"א 125, S&P 500, Nasdaq 100), קבע is_relevant=true, ציין את הסימול, הסיבה ורמת הביטחון.
+    אחרת קבע is_relevant=false.
     """
+
+    # הגדרת סכמת פלט מובנית לקבלת JSON נקי ומבוטח
+    news_schema = genai_types.Schema(
+        type=genai_types.Type.OBJECT,
+        properties={
+            "is_relevant": genai_types.Schema(type=genai_types.Type.BOOLEAN),
+            "ticker": genai_types.Schema(type=genai_types.Type.STRING),
+            "reason": genai_types.Schema(type=genai_types.Type.STRING),
+            "conviction": genai_types.Schema(type=genai_types.Type.STRING, enum=["LOW", "MEDIUM", "HIGH"]),
+        },
+        required=["is_relevant"]
+    )
+
     try:
         response = ai_client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=news_schema
+            )
         )
-        res_text = response.text.strip()
-        res_text = re.sub(r'^```json\s*', '', res_text)
-        res_text = re.sub(r'^```\s*', '', res_text)
-        res_text = re.sub(r'\s*```$', '', res_text)
-        return json.loads(res_text)
+        return json.loads(response.text)
     except Exception as e:
         logging.error(f"Error in AI news reasoning: {e}")
         return None
@@ -191,8 +203,8 @@ def scan_news_feed():
     last_scans["news"] = time.strftime("%Y-%m-%d %H:%M:%S")
     
     rss_urls = [
-        "[https://news.google.com/rss/search?q=ישראל+תעופה+ביטחון+כלכלה+בורסה&hl=he&gl=IL&ceid=IL:he](https://news.google.com/rss/search?q=ישראל+תעופה+ביטחון+כלכלה+בורסה&hl=he&gl=IL&ceid=IL:he)",
-        "[https://news.google.com/rss/search?q=stock+market+earnings+acquisition+defense+contracts&hl=en-US&gl=US&ceid=US:en](https://news.google.com/rss/search?q=stock+market+earnings+acquisition+defense+contracts&hl=en-US&gl=US&ceid=US:en)"
+        "https://news.google.com/rss/search?q=ישראל+תעופה+ביטחון+כלכלה+בורסה&hl=he&gl=IL&ceid=IL:he",
+        "https://news.google.com/rss/search?q=stock+market+earnings+acquisition+defense+contracts&hl=en-US&gl=US&ceid=US:en"
     ]
 
     found_any = False
@@ -201,15 +213,16 @@ def scan_news_feed():
         for entry in feed.entries[:8]:
             ai_res = analyze_broad_news_with_ai(entry.title, entry.get("summary", ""))
             if ai_res and ai_res.get("is_relevant"):
-                ticker = ai_res["ticker"]
-                reason = ai_res["reason"]
-                send_alert(ticker=ticker, trigger_type="NEWS", news_reason=reason)
-                found_any = True
+                ticker = ai_res.get("ticker")
+                reason = ai_res.get("reason", "")
+                if ticker:
+                    send_alert(ticker=ticker, trigger_type="NEWS", news_reason=reason)
+                    found_any = True
     return found_any
 
 def fetch_ticker_news_rss(ticker):
     clean_ticker = ticker.replace(".TA", "")
-    rss_url = f"[https://news.google.com/rss/search?q=](https://news.google.com/rss/search?q=){clean_ticker}+stock+news&hl=en-US&gl=US&ceid=US:en"
+    rss_url = f"https://news.google.com/rss/search?q={clean_ticker}+stock+news&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(rss_url)
     news_items = []
     for entry in feed.entries[:5]:
@@ -248,7 +261,7 @@ def analyze_ticker_specific_news(ticker):
 def get_tradingview_link(ticker):
     clean_ticker = ticker.replace(".TA", "")
     exchange = "TASE" if ".TA" in ticker else "NASDAQ"
-    return f"[https://www.tradingview.com/chart/?symbol=](https://www.tradingview.com/chart/?symbol=){exchange}:{clean_ticker}"
+    return f"https://www.tradingview.com/chart/?symbol={exchange}:{clean_ticker}"
 
 def send_alert(ticker, trigger_type="TECHNICAL", news_reason="", tech_data=None, target_chat_id=None):
     dest_id = target_chat_id or CHAT_ID
