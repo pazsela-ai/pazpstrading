@@ -8,3 +8,4 @@ APScheduler
 requests
 feedparser
 google-genai
+deep-translator
