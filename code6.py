@@ -1,6 +1,5 @@
 import os
 import logging
-import threading
 import time
 import json
 import re
@@ -11,7 +10,7 @@ import yfinance as yf
 import feedparser
 from google import genai
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask
+from flask import Flask, request
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -22,11 +21,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")  # מוגדר אוטומטית על ידי Render
 
 bot = TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# אתחול מנוע ה-AI החדש (google-genai SDK)
+# אתחול מנוע ה-AI
 ai_client = None
 if GEMINI_API_KEY:
     try:
@@ -40,13 +40,37 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. נתיבי Health Check עבור Render
+# 1. נתיבי Health Check ו-Webhook עבור Render & Telegram
 # ---------------------------------------------------------
 
 @app.route('/')
 @app.route('/health')
 def home():
     return "OK - PazPSTrading Bot is Running!", 200
+
+@app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
+def telegram_webhook():
+    """קבלת עדכונים בלייב מטלגרם דרך Webhook"""
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    return 'Forbidden', 403
+
+def setup_webhook():
+    """הגדרת כתובת ה-Webhook בשרתי טלגרם"""
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
+        try:
+            bot.remove_webhook()
+            time.sleep(1)
+            bot.set_webhook(url=webhook_url)
+            logging.info(f"Webhook set successfully to: {webhook_url}")
+        except Exception as e:
+            logging.error(f"Failed to set Webhook: {e}")
+    else:
+        logging.warning("RENDER_EXTERNAL_URL environment variable is missing. Webhook not set.")
 
 # ---------------------------------------------------------
 # 2. טעינה דינמית מלאה: S&P 500 + NASDAQ 100 + ת"א 125
@@ -162,7 +186,7 @@ def scan_technical_market():
     logging.info("Automated technical scan completed.")
 
 # ---------------------------------------------------------
-# 4. מנוע ניתוח חדשותי (התאמה מלאה ל-google-genai)
+# 4. מנוע ניתוח חדשותי
 # ---------------------------------------------------------
 
 def analyze_broad_news_with_ai(headline, summary):
@@ -441,7 +465,7 @@ def handle_portfolio(message):
     bot.reply_to(message, text, parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# 6. אתחול Scheduler ו-Polling
+# 6. אתחול Scheduler
 # ---------------------------------------------------------
 
 is_tasks_started = False
@@ -457,26 +481,8 @@ def start_background_tasks():
     scheduler.add_job(scan_news_feed, 'interval', minutes=15)
     scheduler.start()
 
-def start_bot_polling():
-    start_background_tasks()
-    
-    # השהיה קלה להבטחת התנתקות מחיבורים קודמים
-    time.sleep(3)
-    try:
-        bot.remove_webhook()
-    except Exception as e:
-        logging.warning(f"Failed to remove webhook: {e}")
-
-    logging.info("Starting Telegram Bot Polling thread...")
-    while True:
-        try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=15, skip_pending=True)
-        except Exception as e:
-            logging.error(f"Error in bot polling loop: {e}")
-            time.sleep(5)
-
-bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
-bot_thread.start()
+start_background_tasks()
+setup_webhook()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
