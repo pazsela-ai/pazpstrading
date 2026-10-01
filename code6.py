@@ -2,19 +2,18 @@ import os
 import logging
 import threading
 import time
-import socket
-import feedparser
 import json
 import re
 import requests
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
+import feedparser
+import google.generativeai as genai
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
-from google import genai
 
 # הגדרת לוגים
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,13 +26,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 bot = TeleBot(TELEGRAM_TOKEN)
 app = Flask(__name__)
 
-# אתחול לקוח AI (Gemini)
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# אתחול מנוע ה-AI (Gemini)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # מסד נתונים בזיכרון
 simulated_trades = []
 last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
 # 1. נתיבי Health Check עבור Render
@@ -45,55 +45,47 @@ def home():
     return "OK - PazPSTrading Bot is Running!", 200
 
 # ---------------------------------------------------------
-# 2. טעינה דינמית: S&P 500 + NASDAQ 100 + ת"א 125
+# 2. טעינה דינמית מלאה: S&P 500 + NASDAQ 100 + ת"א 125
 # ---------------------------------------------------------
 
 def get_sp500_tickers():
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        req = requests.get(url, headers=HEADERS, timeout=10)
-        tables = pd.read_html(req.text)
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        tables = pd.read_html(resp.text)
         df = tables[0]
         tickers = df['Symbol'].tolist()
         return [str(t).replace('.', '-') for t in tickers]
     except Exception as e:
         logging.error(f"Error fetching S&P 500 tickers: {e}")
-        return ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA"]
+        return ["NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "NFLX", "INTC"]
 
 def get_nasdaq100_tickers():
     try:
         url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        req = requests.get(url, headers=HEADERS, timeout=10)
-        tables = pd.read_html(req.text)
-        df = None
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        tables = pd.read_html(resp.text)
         for t in tables:
-            if 'Ticker' in t.columns or 'Symbol' in t.columns:
-                df = t
-                break
-        if df is not None:
-            col = 'Ticker' if 'Ticker' in df.columns else 'Symbol'
-            tickers = df[col].dropna().tolist()
-            return [str(t).replace('.', '-').strip() for t in tickers]
-        raise ValueError("Nasdaq 100 table not found")
+            for col in ['Ticker', 'Symbol', 'Company']:
+                if col in t.columns:
+                    tickers = t[col].dropna().tolist()
+                    return [str(x).replace('.', '-').strip() for x in tickers if len(str(x)) <= 5]
+        raise ValueError("Nasdaq table not parsed")
     except Exception as e:
         logging.error(f"Error fetching Nasdaq 100 tickers: {e}")
-        return ["QQQ", "AMD", "AVGO", "COST", "NFLX", "INTC", "QCOM", "TXN", "ADBE", "PANW"]
+        return ["QQQ", "AVGO", "COST", "QCOM", "TXN", "ADBE", "PANW"]
 
 def get_ta125_tickers():
     try:
         url = "https://he.wikipedia.org/wiki/%D0%A0%D7%A9%D7%99%D7%9E%D7%AA_%D7%97%D7%91%D7%A8%D7%95%D7%AA_%D7%91%D7%9E%D7%93%D7%93_%D7%AA%22%D7%90-125"
-        req = requests.get(url, headers=HEADERS, timeout=10)
-        tables = pd.read_html(req.text)
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        tables = pd.read_html(resp.text)
         df = tables[0]
-        ticker_col = None
         for col in df.columns:
-            if 'סימול' in str(col) or 'Ticker' in str(col) or 'סמל' in str(col):
-                ticker_col = col
-                break
-        if ticker_col:
-            raw_tickers = df[ticker_col].dropna().tolist()
-            return [f"{str(t).strip().upper()}.TA" for t in raw_tickers if str(t).strip()]
-        raise ValueError("TA125 table parsing failed")
+            if any(k in str(col) for k in ['סימול', 'Ticker', 'סמל']):
+                raw_tickers = df[col].dropna().tolist()
+                return [f"{str(t).strip().upper()}.TA" for t in raw_tickers if str(t).strip()]
+        raise ValueError("TA125 table not parsed")
     except Exception as e:
         logging.error(f"Error fetching TA-125 tickers: {e}")
         return ["ELAL.TA", "TEVA.TA", "ICL.TA", "NICE.TA", "LUMI.TA", "POLI.TA", "ESLT.TA"]
@@ -166,11 +158,11 @@ def scan_technical_market():
     logging.info("Automated technical scan completed.")
 
 # ---------------------------------------------------------
-# 4. מנוע ניתוח חדשותי מעודכן
+# 4. מנוע ניתוח חדשותי (תוקן לחלוטין)
 # ---------------------------------------------------------
 
 def analyze_broad_news_with_ai(headline, summary):
-    if not ai_client:
+    if not GEMINI_API_KEY:
         return None
 
     prompt = f"""
@@ -187,13 +179,11 @@ def analyze_broad_news_with_ai(headline, summary):
     אם הידיעה אינה משפיעה ישירות על מניה ספציפית במדדים, החזר is_relevant=false.
     """
 
-    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash']
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
     for model_name in models_to_try:
         try:
-            response = ai_client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
             if response and response.text:
                 clean_json = response.text.replace('```json', '').replace('```', '').strip()
                 return json.loads(clean_json)
@@ -252,7 +242,7 @@ def fetch_ticker_news_rss(ticker):
     return "\n".join(news_items)
 
 def analyze_ticker_specific_news(ticker):
-    if not ai_client:
+    if not GEMINI_API_KEY:
         return "❌ מנוע ה-AI אינו מחובר (חסר GEMINI_API_KEY)."
 
     news_text = fetch_ticker_news_rss(ticker)
@@ -269,14 +259,11 @@ def analyze_ticker_specific_news(ticker):
     2. תן שורת סיכום ברורה בסוף.
     """
     
-    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash']
-    
+    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
     for model_name in models_to_try:
         try:
-            response = ai_client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
             if response and response.text:
                 return response.text.strip()
         except Exception as e:
@@ -351,7 +338,7 @@ def handle_status(message):
     total_tickers = len(get_all_market_tickers())
     status_msg = (
         "⚙ **סטטוס מערכת:**\n\n"
-        f"• חיבור ל-AI: {'✅ תקין' if ai_client else '❌ לא מחובר'}\n"
+        f"• חיבור ל-AI: {'✅ תקין' if GEMINI_API_KEY else '❌ לא מחובר'}\n"
         f"• סריקת חדשות אחרונה: `{last_scans['news']}`\n"
         f"• סריקה טכנית אחרונה: `{last_scans['tech']}`\n"
         f"• מניות במעקב דינמי: `{total_tickers}`\n"
@@ -364,7 +351,7 @@ def handle_test_news(message):
     bot.reply_to(message, "🔎 מריץ סורק חדשות מבוסס AI בלייב...")
     found = scan_news_feed()
     if not found:
-        bot.send_message(message.chat.id, "ℹ️ לא נמצאו כרגע אירועים חדשותיים בעלי השפעה חיובית מובהקת.")
+        bot.send_message(message.chat.id, "ℹ️️ לא נמצאו כרגע אירועים חדשותיים בעלי השפעה חיובית מובהקת.")
 
 @bot.message_handler(commands=['test_tech'])
 def handle_test_tech(message):
@@ -446,7 +433,7 @@ def handle_portfolio(message):
     bot.reply_to(message, text, parse_mode="Markdown")
 
 # ---------------------------------------------------------
-# 6. אתחול Scheduler ו-Polling של הבוט
+# 6. אתחול Scheduler ו-Polling
 # ---------------------------------------------------------
 
 is_tasks_started = False
@@ -465,7 +452,6 @@ def start_background_tasks():
 def start_bot_polling():
     start_background_tasks()
     
-    # ניקוי Webhook קיים לפני תחילת Polling
     try:
         bot.remove_webhook(drop_pending_updates=True)
     except Exception as e:
@@ -479,7 +465,6 @@ def start_bot_polling():
             logging.error(f"Error in bot polling loop: {e}")
             time.sleep(5)
 
-# הפעלת הבוט ב-Thread נפרד בעת טעינת המודול ב-Gunicorn
 bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
 bot_thread.start()
 
