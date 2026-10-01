@@ -183,7 +183,7 @@ def analyze_broad_news_with_ai(headline, summary):
     אם הידיעה אינה משפיעה ישירות על מניה ספציפית במדדים, החזר is_relevant=false.
     """
 
-    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash']
+    models_to_try = ['gemini-2.0-flash']
     for model_name in models_to_try:
         try:
             response = ai_client.models.generate_content(
@@ -265,7 +265,7 @@ def analyze_ticker_specific_news(ticker):
     2. תן שורת סיכום ברורה בסוף.
     """
     
-    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash']
+    models_to_try = ['gemini-2.0-flash']
     for model_name in models_to_try:
         try:
             response = ai_client.models.generate_content(
