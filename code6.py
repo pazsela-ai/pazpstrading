@@ -15,7 +15,6 @@ from flask import Flask
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 from google import genai
-from google.genai import types as genai_types
 
 # הגדרת לוגים
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,7 +33,7 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 # מסד נתונים בזיכרון
 simulated_trades = []
 last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
 # 1. טעינה דינמית מוגנת: S&P 500 + NASDAQ 100 + ת"א 125
@@ -43,7 +42,7 @@ HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 def get_sp500_tickers():
     try:
         url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        req = requests.get(url, headers=HEADERS)
+        req = requests.get(url, headers=HEADERS, timeout=10)
         tables = pd.read_html(req.text)
         df = tables[0]
         tickers = df['Symbol'].tolist()
@@ -55,7 +54,7 @@ def get_sp500_tickers():
 def get_nasdaq100_tickers():
     try:
         url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        req = requests.get(url, headers=HEADERS)
+        req = requests.get(url, headers=HEADERS, timeout=10)
         tables = pd.read_html(req.text)
         df = None
         for t in tables:
@@ -74,7 +73,7 @@ def get_nasdaq100_tickers():
 def get_ta125_tickers():
     try:
         url = "https://he.wikipedia.org/wiki/%D0%A0%D7%A9%D7%99%D7%9E%D7%AA_%D7%97%D7%91%D7%A8%D7%95%D7%AA_%D7%91%D7%9E%D7%93%D7%93_%D7%AA%22%D7%90-125"
-        req = requests.get(url, headers=HEADERS)
+        req = requests.get(url, headers=HEADERS, timeout=10)
         tables = pd.read_html(req.text)
         df = tables[0]
         ticker_col = None
@@ -99,7 +98,7 @@ def get_all_market_tickers():
     return all_tickers
 
 # ---------------------------------------------------------
-# 2. מנוע ניתוח טכני מעודכן ומוגן
+# 2. מנוע ניתוח טכני
 # ---------------------------------------------------------
 
 def analyze_technical(ticker):
@@ -158,7 +157,7 @@ def scan_technical_market():
     logging.info("Automated technical scan completed.")
 
 # ---------------------------------------------------------
-# 3. מנוע ניתוח חדשותי (אוטומטי + ממוקד)
+# 3. מנוע ניתוח חדשותי מעודכן ומתוקן
 # ---------------------------------------------------------
 
 def analyze_broad_news_with_ai(headline, summary):
@@ -166,337 +165,25 @@ def analyze_broad_news_with_ai(headline, summary):
         return None
 
     prompt = f"""
-    אתה אנליסט בכיר. נתח את הידיעה הבאה:
+    אתה אנליסט פיננסי בכיר. נתח את הידיעה החדשותית הבאה:
     כותרת: {headline}
     תקציר: {summary}
 
-    אם יש השפעה חיובית מובהקת על מניה במדדים המובילים (ת"א 125, S&P 500, Nasdaq 100), קבע is_relevant=true, ציין את הסימול, הסיבה ורמת הביטחון.
-    אחרת קבע is_relevant=false.
+    ענה בפורמט JSON בלבד ללא שום טקסט נוסף, במבנה הבא:
+    {{
+      "is_relevant": true/false,
+      "ticker": "סימול המניה באותיות אנגליות בלבד",
+      "reason": "הסבר קצר בעברית של משפט אחד"
+    }}
+    אם הידיעה אינה משפיעה ישירות על מניה ספציפית במדדים, החזר is_relevant=false.
     """
 
-    news_schema = genai_types.Schema(
-        type=genai_types.Type.OBJECT,
-        properties={
-            "is_relevant": genai_types.Schema(type=genai_types.Type.BOOLEAN),
-            "ticker": genai_types.Schema(type=genai_types.Type.STRING),
-            "reason": genai_types.Schema(type=genai_types.Type.STRING),
-            "conviction": genai_types.Schema(type=genai_types.Type.STRING, enum=["LOW", "MEDIUM", "HIGH"]),
-        },
-        required=["is_relevant"]
-    )
-
-    models_to_try = ['gemini-1.5-flash', 'gemini-2.0-flash']
+    models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash']
     for model_name in models_to_try:
         try:
             response = ai_client.models.generate_content(
                 model=model_name,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=news_schema
-                )
+                contents=prompt
             )
             if response and response.text:
-                return json.loads(response.text)
-        except Exception as e:
-            logging.error(f"Error in AI news reasoning with {model_name}: {e}")
-    return None
-
-def scan_news_feed():
-    logging.info("Starting automated news scan...")
-    last_scans["news"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    
-    rss_urls = [
-        "https://news.google.com/rss/search?q=ישראל+תעופה+ביטחון+כלכלה+בורסה&hl=he&gl=IL&ceid=IL:he",
-        "https://news.google.com/rss/search?q=stock+market+earnings+acquisition+defense+contracts&hl=en-US&gl=US&ceid=US:en"
-    ]
-
-    found_any = False
-    for url in rss_urls:
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:8]:
-            clean_summary = re.sub('<[^<]+?>', '', entry.get("summary", ""))
-            ai_res = analyze_broad_news_with_ai(entry.title, clean_summary)
-            if ai_res and ai_res.get("is_relevant"):
-                ticker = ai_res.get("ticker")
-                reason = ai_res.get("reason", "")
-                if ticker:
-                    send_alert(ticker=ticker, trigger_type="NEWS", news_reason=reason)
-                    found_any = True
-    return found_any
-
-def fetch_ticker_news_rss(ticker):
-    is_israeli = ".TA" in ticker
-    clean_ticker = ticker.replace(".TA", "")
-    
-    if is_israeli:
-        rss_url = f"https://news.google.com/rss/search?q={clean_ticker}+אל+על+בורסה&hl=he&gl=IL&ceid=IL:he"
-    else:
-        rss_url = f"https://news.google.com/rss/search?q={clean_ticker}+stock+news&hl=en-US&gl=US&ceid=US:en"
-        
-    feed = feedparser.parse(rss_url)
-    news_items = []
-    
-    for entry in feed.entries[:5]:
-        raw_summary = entry.get('summary', '')
-        clean_summary = re.sub('<[^<]+?>', '', raw_summary)
-        news_items.append(f"- כותרת: {entry.title}\n  תקציר: {clean_summary}")
-    
-    return "\n".join(news_items)
-
-def analyze_ticker_specific_news(ticker):
-    if not ai_client:
-        return "❌ מנוע ה-AI אינו מחובר (חסר GEMINI_API_KEY)."
-
-    news_text = fetch_ticker_news_rss(ticker)
-    
-    if not news_text or not news_text.strip():
-        return f"ℹ️ לא נמצאו כתבות חדשות עדכניות ברשת עבור `{ticker}`."
-
-    prompt = f"""
-    אתה אנליסט פיננסי בכיר. להלן כתבות חדשות שהתקבלו עבור המניה {ticker}:
-    {news_text}
-
-    נתח את הידיעות הללו:
-    1. קבע סנטימנט (חיובי / ניטרלי / שלילי) והסבר בקצרה ב-2 משפטים בעברית.
-    2. תן שורת סיכום ברורה בסוף.
-    """
-    
-    models_to_try = ['gemini-1.5-flash', 'gemini-2.0-flash']
-    
-    for model_name in models_to_try:
-        try:
-            response = ai_client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
-            if response and response.text:
-                return response.text.strip()
-        except Exception as e:
-            logging.error(f"Failed analysis with model {model_name} for {ticker}: {e}")
-
-    return f"❌ אירעה שגיאה בחיבור ל-AI בזמן ניתוח `{ticker}`."
-
-# ---------------------------------------------------------
-# 4. התראות ופקודות טלגרם
-# ---------------------------------------------------------
-
-def get_tradingview_link(ticker):
-    clean_ticker = ticker.replace(".TA", "")
-    exchange = "TASE" if ".TA" in ticker else "NASDAQ"
-    return f"https://www.tradingview.com/chart/?symbol={exchange}:{clean_ticker}"
-
-def send_alert(ticker, trigger_type="TECHNICAL", news_reason="", tech_data=None, target_chat_id=None):
-    dest_id = target_chat_id or CHAT_ID
-    if not dest_id:
-        return
-
-    if not tech_data:
-        tech_data = analyze_technical(ticker)
-
-    price = tech_data["price"] if tech_data else "N/A"
-    tp = tech_data["tp"] if tech_data else "N/A"
-    sl = tech_data["sl"] if tech_data else "N/A"
-    rsi = tech_data.get("rsi", "N/A") if tech_data else "N/A"
-    tv_link = get_tradingview_link(ticker)
-
-    if trigger_type == "NEWS":
-        header = f"🚨 **התראת קטליזטור חדשותי - {ticker}**"
-        body = f"💡 **נימוק והסקה אנליטית:**\n{news_reason}\n"
-    elif trigger_type == "TECHNICAL":
-        header = f"📊 **התראת פריצה טכנית - {ticker}**"
-        body = f"📈 **ניתוח טכני:** פריצת מומנטום בגרף יומי (RSI: {rsi}).\n"
-    else:
-        header = f"🔥 **התראה משולבת: חדשות + טכני - {ticker}**"
-        body = f"💡 **נימוק אנליטי:** {news_reason}\n📈 **ניתוח טכני:** פריצת מומנטום מעל ממוצעים נעים.\n"
-
-    currency = "₪" if ".TA" in ticker else "$"
-    msg = f"{header}\n\n{body}\n" \
-          f"🎯 **מחירי עבודה מומלצים:**\n" \
-          f"• מחיר כניסה: {currency}{price}\n" \
-          f"• יעד רווח (TP): {currency}{tp}\n" \
-          f"• סטופ לוס (SL): {currency}{sl}\n"
-
-    keyboard = types.InlineKeyboardMarkup()
-    sim_btn = types.InlineKeyboardButton("📈 בצע סימולציית קנייה", callback_data=f"sim_{ticker}_{price}_{tp}_{sl}")
-    tv_btn = types.InlineKeyboardButton("📊 פתח גרף ב-TradingView", url=tv_link)
-    keyboard.add(sim_btn, tv_btn)
-
-    bot.send_message(dest_id, msg, parse_mode="Markdown", reply_markup=keyboard)
-
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome_text = (
-        "🟢 **אפליקציית PazPSTrading פעילה ועובדת!**\n\n"
-        "הבוט מנטר ברקע ובאופן אוטומטי לחלוטין את כל המניות במדדי S&P 500, Nasdaq 100 ות\"א 125.\n\n"
-        "🛠️ **פקודות לבקרה ידנית:**\n"
-        "• `/status` - סטטוס וכמות המניות שבמעקב\n"
-        "• `/test_news` - הרצת סורק חדשות AI\n"
-        "• `/test_tech` - הרצת סריקה טכנית מלאה\n"
-        "• `/tech <TICKER>` - ניתוח טכני ממוקד למניה\n"
-        "• `/news_scan <TICKER>` - ניתוח חדשות ממוקד למניה\n"
-        "• `/portfolio` - צפייה בתיק סימולציות"
-    )
-    bot.reply_to(message, welcome_text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['status'])
-def handle_status(message):
-    total_tickers = len(get_all_market_tickers())
-    status_msg = (
-        "⚙ **סטטוס מערכת:**\n\n"
-        f"• חיבור ל-AI: {'✅ תקין' if ai_client else '❌ לא מחובר'}\n"
-        f"• סריקת חדשות אחרונה: `{last_scans['news']}`\n"
-        f"• סריקה טכנית אחרונה: `{last_scans['tech']}`\n"
-        f"• מניות במעקב דינמי: `{total_tickers}`\n"
-        f"• עסקאות בסימולטור: `{len(simulated_trades)}`"
-    )
-    bot.reply_to(message, status_msg, parse_mode="Markdown")
-
-@bot.message_handler(commands=['test_news'])
-def handle_test_news(message):
-    bot.reply_to(message, "🔎 מריץ סורק חדשות מבוסס AI בלייב...")
-    found = scan_news_feed()
-    if not found:
-        bot.send_message(message.chat.id, "ℹ️ לא נמצאו כרגע אירועים חדשותיים בעלי השפעה חיובית מובהקת.")
-
-@bot.message_handler(commands=['test_tech'])
-def handle_test_tech(message):
-    bot.reply_to(message, "🔎 מריץ סריקה טכנית במקביל על **כל המניות** במדדים...")
-    scan_technical_market()
-    bot.send_message(message.chat.id, "✅ הסריקה הטכנית הושלמה.")
-
-@bot.message_handler(commands=['tech'])
-def handle_tech_manual(message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "יש לציין סימול מניה. לדוגמה: `/tech NVDA`", parse_mode="Markdown")
-        return
-    ticker = parts[1].upper()
-    bot.reply_to(message, f"📊 מנתח אינדיקטורים טכניים עבור `{ticker}`...", parse_mode="Markdown")
-    
-    tech_data = analyze_technical(ticker)
-    if tech_data:
-        send_alert(ticker=ticker, trigger_type="TECHNICAL", tech_data=tech_data, target_chat_id=message.chat.id)
-    else:
-        bot.send_message(message.chat.id, f"❌ לא ניתן היה לשלוף נתונים טכניים עבור `{ticker}`. ודא שהסימול תקין (למשל NVDA או TEVA.TA).")
-
-@bot.message_handler(commands=['news_scan'])
-def handle_news_scan_manual(message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
-        return
-    
-    ticker = parts[1].upper()
-    bot.reply_to(message, f"🔎 סורק חדשות ומריץ ניתוח AI עבור `{ticker}`...", parse_mode="Markdown")
-    
-    analysis_result = analyze_ticker_specific_news(ticker)
-    tech_data = analyze_technical(ticker)
-    
-    price = tech_data["price"] if tech_data else "N/A"
-    tp = tech_data["tp"] if tech_data else "N/A"
-    sl = tech_data["sl"] if tech_data else "N/A"
-    currency = "₪" if ".TA" in ticker else "$"
-
-    response_msg = (
-        f"📰 **ניתוח חדשות וסנטימנט AI עבור {ticker}:**\n\n"
-        f"{analysis_result}\n\n"
-        f"🎯 **מחירי עבודה נוכחיים:**\n"
-        f"• מחיר כניסה: {currency}{price}\n"
-        f"• יעד (TP): {currency}{tp}\n"
-        f"• סטופ (SL): {currency}{sl}"
-    )
-    
-    tv_link = get_tradingview_link(ticker)
-    keyboard = types.InlineKeyboardMarkup()
-    sim_btn = types.InlineKeyboardButton("📈 בצע סימולציית קנייה", callback_data=f"sim_{ticker}_{price}_{tp}_{sl}")
-    tv_btn = types.InlineKeyboardButton("📊 פתח גרף ב-TradingView", url=tv_link)
-    keyboard.add(sim_btn, tv_btn)
-
-    bot.send_message(message.chat.id, response_msg, parse_mode="Markdown", reply_markup=keyboard)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('sim_'))
-def handle_simulation_callback(call):
-    _, ticker, price, tp, sl = call.data.split('_')
-    simulated_trades.append({
-        "ticker": ticker,
-        "entry_price": price,
-        "tp": tp,
-        "sl": sl,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-    })
-    bot.answer_callback_query(call.id, text=f"✅ עסקה וירטואלית על {ticker} נרשמה!")
-    bot.send_message(call.message.chat.id, f"📝 **עסקה נרשמה בסימולטור!**\nמניה: `{ticker}`\nכניסה: `{price}` | TP: `{tp}` | SL: `{sl}`", parse_mode="Markdown")
-
-@bot.message_handler(commands=['portfolio'])
-def handle_portfolio(message):
-    if not simulated_trades:
-        bot.reply_to(message, "אין עסקאות פעילות כרגע בסימולטור.")
-        return
-    text = "💼 **תיק סימולציות פעיל:**\n\n"
-    for idx, trade in enumerate(simulated_trades, 1):
-        text += f"{idx}. **{trade['ticker']}** | כניסה: {trade['entry_price']} | TP: {trade['tp']} | SL: {trade['sl']}\n"
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-# ---------------------------------------------------------
-# 5. Flask & Background Scheduler & Bot Thread
-# ---------------------------------------------------------
-
-@app.route('/')
-def home():
-    return "PazPSTrading Bot - Broad Multi-Index Scanner Active!"
-
-is_tasks_started = False
-
-def start_background_tasks():
-    global is_tasks_started
-    if is_tasks_started:
-        return
-    is_tasks_started = True
-
-    scheduler = BackgroundScheduler()
-    # סריקות אוטומטיות ברקע
-    scheduler.add_job(scan_technical_market, 'interval', minutes=30)
-    scheduler.add_job(scan_news_feed, 'interval', minutes=15)
-    scheduler.start()
-
-def is_already_running():
-    """בודק אם כבר רץ תהליך של הבוט על המכונה כדי למנוע כפילות 409"""
-    try:
-        lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        lock_socket.bind(('127.0.0.1', 47829))
-        # נשמור את הסוקט פתוח כל עוד התהליך חי
-        globals()['_process_lock_socket'] = lock_socket
-        return False
-    except socket.error:
-        return True
-
-def start_bot_polling():
-    """הרצת ה-Polling של הבוט בתוך תהליך ברקע"""
-    if is_already_running():
-        logging.warning("Another bot process is already running. Skipping polling on this thread.")
-        return
-
-    start_background_tasks()
-
-    while True:
-        try:
-            logging.info("Clearing webhooks...")
-            try:
-                bot.remove_webhook(drop_pending_updates=True)
-            except TypeError:
-                bot.remove_webhook()
-            
-            time.sleep(2)
-            logging.info("Starting Telegram Bot Polling...")
-            
-            bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
-        except Exception as e:
-            logging.error(f"Error in bot polling loop: {e}")
-            time.sleep(10)
-
-bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
-bot_thread.start()
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+                clean_json = re.sub(r'```json\s*|\s*
