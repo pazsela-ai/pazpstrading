@@ -15,22 +15,16 @@ from flask import Flask, request
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# הגדרת לוגים
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ניקוי משתני סביבה מרווחים נסתרים
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 
-if not TELEGRAM_TOKEN:
-    logging.error("CRITICAL: TELEGRAM_BOT_TOKEN is missing!")
-
 bot = TeleBot(TELEGRAM_TOKEN, threaded=False)
 app = Flask(__name__)
 
-# אתחול AI
 ai_client = None
 if GEMINI_API_KEY:
     try:
@@ -43,7 +37,7 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. WEBHOOK & HEALTH CHECK ENDPOINTS
+# 1. WEBHOOK & HEALTH CHECK
 # ---------------------------------------------------------
 
 @app.route('/')
@@ -53,27 +47,19 @@ def home():
 
 @app.route('/init_webhook', methods=['GET', 'POST'])
 def init_webhook():
-    """נתיב ייעודי לאתחול ה-Webhook בטלגרם"""
     if not TELEGRAM_TOKEN or not RENDER_EXTERNAL_URL:
-        return "Missing TELEGRAM_BOT_TOKEN or RENDER_EXTERNAL_URL environment variables.", 400
-    
+        return "Missing variables", 400
     url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
     try:
         bot.remove_webhook()
         time.sleep(1)
         res = bot.set_webhook(url=url)
-        if res:
-            logging.info(f"Successfully set webhook to: {url}")
-            return f"Success! Webhook set to {url}", 200
-        else:
-            return "Telegram rejected webhook setting.", 500
+        return f"Success! Webhook set to {url}" if res else "Telegram rejected webhook", 200
     except Exception as e:
-        logging.error(f"Error setting webhook: {e}")
-        return f"Error setting webhook: {e}", 500
+        return f"Error: {e}", 500
 
 @app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
 def telegram_webhook():
-    """קבלת עדכונים בזמן אמת מטלגרם"""
     if request.headers.get('content-type') == 'application/json':
         try:
             json_string = request.get_data().decode('utf-8')
@@ -81,64 +67,44 @@ def telegram_webhook():
             bot.process_new_updates([update])
             return 'OK', 200
         except Exception as e:
-            logging.error(f"Error processing webhook payload: {e}")
+            logging.error(f"Webhook error: {e}")
             return 'OK', 200
     return 'Forbidden', 403
 
 # ---------------------------------------------------------
-# 2. TICKER FETCHERS
+# 2. EXPANDED TICKER LISTS
 # ---------------------------------------------------------
 
-def get_sp500_tickers():
-    try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        tables = pd.read_html(resp.text)
-        return [str(t).replace('.', '-') for t in tables[0]['Symbol'].tolist()]
-    except Exception as e:
-        logging.error(f"Error SP500 fetch: {e}")
-        return ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD"]
-
-def get_nasdaq100_tickers():
-    try:
-        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        tables = pd.read_html(resp.text)
-        for t in tables:
-            for col in ['Ticker', 'Symbol']:
-                if col in t.columns:
-                    return [str(x).replace('.', '-').strip() for x in t[col].dropna().tolist() if len(str(x)) <= 5]
-        raise ValueError("Nasdaq format error")
-    except Exception as e:
-        logging.error(f"Error Nasdaq fetch: {e}")
-        return ["QQQ", "AVGO", "COST", "QCOM", "ADBE", "PANW", "NFLX"]
-
-def get_ta125_tickers():
-    try:
-        url = "https://he.wikipedia.org/wiki/%D0%A0%D7%A9%D7%99%D7%9E%D7%AA_%D7%97%D7%91%D7%A8%D7%95%D7%AA_%D7%91%D7%9E%D7%93%D7%93_%D7%AA%22%D7%90-125"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        tables = pd.read_html(resp.text)
-        df = tables[0]
-        for col in df.columns:
-            if any(k in str(col) for k in ['סימול', 'Ticker', 'סמל']):
-                return [f"{str(t).strip().upper()}.TA" for t in df[col].dropna().tolist() if str(t).strip()]
-        raise ValueError("TA125 format error")
-    except Exception as e:
-        logging.error(f"Error TA125 fetch: {e}")
-        return ["ELAL.TA", "TEVA.TA", "ICL.TA", "NICE.TA", "LUMI.TA", "POLI.TA"]
+STATIC_TICKERS = [
+    # US Tech & Major S&P 500
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "INTC", "NFLX",
+    "MS", "JPM", "BAC", "V", "MA", "UNH", "PG", "HD", "DIS", "PYPL", "COST", "CSCO",
+    "ORCL", "CRM", "PEP", "KO", "XOM", "CVX", "NKE", "LLY", "AVGO", "QCOM", "TXN",
+    # TASE / Israel
+    "ELAL.TA", "TEVA.TA", "ICL.TA", "NICE.TA", "LUMI.TA", "POLI.TA", "ESLT.TA",
+    "DSCT.TA", "FIBI.TA", "AZRG.TA", "MVRN.TA", "DELTG.TA", "ENLT.TA", "ORA.TA"
+]
 
 def get_all_market_tickers():
-    return list(set(get_sp500_tickers() + get_nasdaq100_tickers() + get_ta125_tickers()))
+    tickers = set(STATIC_TICKERS)
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        resp = requests.get(url, headers=HEADERS, timeout=5)
+        tables = pd.read_html(resp.text)
+        wiki_sp = [str(t).replace('.', '-') for t in tables[0]['Symbol'].tolist()]
+        tickers.update(wiki_sp)
+    except Exception as e:
+        logging.warning(f"Wikipedia fetch skipped: {e}")
+    return list(tickers)
 
 # ---------------------------------------------------------
-# 3. TECHNICAL ANALYSIS & NEWS ENGINE
+# 3. TECHNICAL ANALYSIS ENGINE (ENHANCED REASONING)
 # ---------------------------------------------------------
 
 def analyze_technical(ticker):
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="60d", interval="1d")
-        
         if df.empty or len(df) < 20:
             return None
 
@@ -146,16 +112,34 @@ def analyze_technical(ticker):
             df.columns = df.columns.get_level_values(0)
 
         df['EMA20'] = ta.ema(df['Close'], length=20)
+        df['EMA50'] = ta.ema(df['Close'], length=50)
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        df['Vol_SMA'] = ta.sma(df['Volume'], length=20)
 
         latest = df.iloc[-1]
         prev = df.iloc[-2]
 
         current_price = float(latest['Close'])
         atr_val = float(latest['ATR']) if not pd.isna(latest['ATR']) else current_price * 0.03
+        rsi_val = float(latest['RSI'])
+        ema20 = float(latest['EMA20'])
+        ema50 = float(latest['EMA50'])
 
-        is_breakout = (current_price > latest['EMA20']) and (50 <= latest['RSI'] <= 70) and (latest['RSI'] > prev['RSI'])
+        # נימוקים טכניים
+        reasons = []
+        if current_price > ema20:
+            reasons.append(f"מחיר (${current_price:.2f}) מעל ממוצע נע EMA20 (${ema20:.2f})")
+        if ema20 > ema50:
+            reasons.append("מגמה עולה: EMA20 נמצא מעל EMA50")
+        if 50 <= rsi_val <= 70:
+            reasons.append(f"מומנטום חיובי בריא: RSI ברמה של {rsi_val:.1f}")
+        elif rsi_val > 70:
+            reasons.append(f"מומנטום עוצמתי (קניית יתר): RSI ברמה של {rsi_val:.1f}")
+        if latest['Volume'] > prev['Vol_SMA']:
+            reasons.append("נפח מסחר גבוה מהממוצע ב-20 הימים האחרונים")
+
+        is_breakout = (current_price > ema20) and (rsi_val >= 50)
 
         return {
             "ticker": ticker,
@@ -163,26 +147,16 @@ def analyze_technical(ticker):
             "price": round(current_price, 2),
             "tp": round(current_price + (atr_val * 2.0), 2),
             "sl": round(current_price - (atr_val * 1.2), 2),
-            "rsi": round(latest['RSI'], 1)
+            "rsi": round(rsi_val, 1),
+            "reasons": reasons
         }
-    except Exception:
+    except Exception as e:
+        logging.error(f"Error analyzing {ticker}: {e}")
         return None
 
-def scan_single_ticker_task(ticker):
-    tech_res = analyze_technical(ticker)
-    if tech_res and tech_res["is_breakout"]:
-        send_alert(ticker=ticker, trigger_type="TECHNICAL", tech_data=tech_res)
-
-def _async_technical_scan():
-    logging.info("Starting background technical scan...")
-    last_scans["tech"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    tickers = get_all_market_tickers()
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        executor.map(scan_single_ticker_task, tickers)
-    logging.info("Background technical scan completed.")
-
-def scan_technical_market():
-    threading.Thread(target=_async_technical_scan, daemon=True).start()
+# ---------------------------------------------------------
+# 4. NEWS ANALYSIS (UPDATED TO GEMINI-2.5-FLASH)
+# ---------------------------------------------------------
 
 def analyze_ticker_specific_news(ticker):
     if not ai_client:
@@ -200,13 +174,18 @@ def analyze_ticker_specific_news(ticker):
             return f"ℹ️ לא נמצאו כתבות חדשות עדכניות עבור `{ticker}`."
 
         prompt = f"נתח בקצרה בעברית את הידיעות הבאות עבור מניית {ticker}:\n" + "\n".join(items)
-        response = ai_client.models.generate_content(model='gemini-2.0-flash', contents=prompt)
+        
+        # עדכון שם המודל לגרסה הנתמכת
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
         return response.text.strip() if response and response.text else "❌ לא התקבלה תשובה מ-AI."
     except Exception as e:
         return f"❌ שגיאה בניתוח חדשות: {e}"
 
 # ---------------------------------------------------------
-# 4. TELEGRAM BOT HANDLERS
+# 5. TELEGRAM BOT HANDLERS
 # ---------------------------------------------------------
 
 def get_tradingview_link(ticker):
@@ -214,7 +193,7 @@ def get_tradingview_link(ticker):
     exchange = "TASE" if ".TA" in ticker else "NASDAQ"
     return f"https://www.tradingview.com/chart/?symbol={exchange}:{clean_ticker}"
 
-def send_alert(ticker, trigger_type="TECHNICAL", news_reason="", tech_data=None, target_chat_id=None):
+def send_alert(ticker, tech_data=None, target_chat_id=None):
     dest_id = target_chat_id or CHAT_ID
     if not dest_id:
         return
@@ -222,16 +201,25 @@ def send_alert(ticker, trigger_type="TECHNICAL", news_reason="", tech_data=None,
     if not tech_data:
         tech_data = analyze_technical(ticker)
 
-    price = tech_data["price"] if tech_data else "N/A"
-    tp = tech_data["tp"] if tech_data else "N/A"
-    sl = tech_data["sl"] if tech_data else "N/A"
+    if not tech_data:
+        bot.send_message(dest_id, f"❌ לא ניתן לשלוף נתונים עבור `{ticker}`.")
+        return
+
+    price = tech_data["price"]
+    tp = tech_data["tp"]
+    sl = tech_data["sl"]
     currency = "₪" if ".TA" in ticker else "$"
 
+    reasons_text = "\n".join([f"  • {r}" for r in tech_data["reasons"]]) if tech_data["reasons"] else "  • פריצת מומנטום כללית"
+
     msg = (
-        f"📊 **התראת פריצה - {ticker}**\n\n"
-        f"• מחיר כניסה: {currency}{price}\n"
-        f"• יעד (TP): {currency}{tp}\n"
-        f"• סטופ (SL): {currency}{sl}\n"
+        f"📊 **ניתוח טכני מפורט - {ticker}**\n\n"
+        f"💡 **נימוקי הניתוח והפריצה:**\n"
+        f"{reasons_text}\n\n"
+        f"🎯 **תכנית עבודה מומלצת:**\n"
+        f"• מחיר נוכחי: {currency}{price}\n"
+        f"• יעד רווח (TP): {currency}{tp}\n"
+        f"• סטופ לוס (SL): {currency}{sl}\n"
     )
 
     keyboard = types.InlineKeyboardMarkup()
@@ -248,7 +236,7 @@ def send_welcome(message):
         "🟢 **הבוט PazPSTrading מחובר ופעיל!**\n\n"
         "פקודות זמינות:\n"
         "• `/status` - בדיקת סטטוס מערכת\n"
-        "• `/tech <TICKER>` - ניתוח טכני למניה (למשל: `/tech NVDA`)\n"
+        "• `/tech <TICKER>` - ניתוח טכני מנומק למניה\n"
         "• `/news_scan <TICKER>` - ניתוח חדשות AI למניה"
     )
     bot.reply_to(message, welcome_text, parse_mode="Markdown")
@@ -259,7 +247,6 @@ def handle_status(message):
     status_msg = (
         "⚙ **סטטוס מערכת:**\n\n"
         f"• AI Engine: {'✅ פעיל' if ai_client else '❌ חסר מפתח'}\n"
-        f"• סריקה טכנית אחרונה: `{last_scans['tech']}`\n"
         f"• מניות במעקב דינמי: `{total_tickers}`\n"
         f"• עסקאות בסימולטור: `{len(simulated_trades)}`"
     )
@@ -273,10 +260,7 @@ def handle_tech_manual(message):
         return
     ticker = parts[1].upper()
     tech_data = analyze_technical(ticker)
-    if tech_data:
-        send_alert(ticker=ticker, trigger_type="TECHNICAL", tech_data=tech_data, target_chat_id=message.chat.id)
-    else:
-        bot.reply_to(message, f"❌ לא נמצאו נתונים עבור `{ticker}`.")
+    send_alert(ticker=ticker, tech_data=tech_data, target_chat_id=message.chat.id)
 
 @bot.message_handler(commands=['news_scan'])
 def handle_news_scan_manual(message):
@@ -293,14 +277,6 @@ def handle_simulation_callback(call):
     _, ticker, price, tp, sl = call.data.split('_')
     simulated_trades.append({"ticker": ticker, "price": price, "tp": tp, "sl": sl})
     bot.answer_callback_query(call.id, text=f"✅ עסקה על {ticker} נרשמה!")
-
-# ---------------------------------------------------------
-# 5. SCHEDULER & STARTUP
-# ---------------------------------------------------------
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(scan_technical_market, 'interval', minutes=60)
-scheduler.start()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
