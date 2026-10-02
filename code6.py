@@ -28,7 +28,6 @@ user_states = {}
 last_processed_news_titles = set()
 last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 
-# User-Agent תואם דרישות SEC ו-Google News
 HEADERS = {'User-Agent': 'PazPSTradingBot/1.0 (contact@pazpstrading.com)'}
 
 WATCHLIST = [
@@ -45,16 +44,15 @@ def ask_gemini_direct(prompt):
         logging.error("GEMINI_API_KEY is missing!")
         return None
 
-    # שימוש בנקודות קצה מעודכנות ומבנה payload תואם
+    # נקודות קצה מעודכנות ומודלים נתמכים ב-v1beta
     endpoints = [
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
     ]
     
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{
-            "role": "user",
             "parts": [{"text": prompt}]
         }]
     }
@@ -85,7 +83,7 @@ def ask_groq_direct(prompt):
         "Content-Type": "application/json"
     }
     
-    # מודלים פעילים בלבד (הוסר mixtral-8x7b הישן)
+    # מודלים פעילים ב-Groq
     groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     
     for model in groq_models:
@@ -297,7 +295,7 @@ BROAD_NEWS_FEEDS = [
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&datea=&dateb=&owner=include&start=0&count=40&output=atom",
     "https://news.google.com/rss/search?q=pharma+FDA+clinical+trial+cancer+acquisition+merger&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=aviation+airline+defense+conflict+war+sanctions&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%91%D7%97%D7%95%D7%9F+%D7%A4%D7%90%D7%A8%D7%9E%D7%94+%D7%91%D7%95%D7%A8%D7%A1%D7%94+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he"
+    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%91%D7%97%D7%95%D7%9F+%D7%A4%D7%90%D7%A8%D7%9E%D7%94+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he"
 ]
 
 def scan_breaking_news_events():
@@ -458,7 +456,7 @@ def handle_currency_select(call):
     }
 
     symbol = "$" if curr == "USD" else "₪"
-    safe_send_message(call.message.chat.id, f"✍️ **אנא הקלד/י כעת בטרמינל את סכום הסיכון המבוקש ב-{symbol}:**\n(לדוגמה: 150 או 500)")
+    safe_send_message(call.message.chat.id, f"✍️️ **אנא הקלד/י כעת בטרמינל את סכום הסיכון המבוקש ב-{symbol}:**\n(לדוגמה: 150 או 500)")
     bot.answer_callback_query(call.id)
 
 # ---------------------------------------------------------
@@ -503,7 +501,7 @@ def handle_all_messages(message):
             safe_send_message(message.chat.id, calc_msg)
             return
         except ValueError:
-            bot.reply_to(message, "⚠️️ אנא הזן מספר תקין בלבד (למשל: 200). נסה שוב:")
+            bot.reply_to(message, "⚠ אנא הזן מספר תקין בלבד (למשל: 200). נסה שוב:")
             return
 
     if text.startswith('/start') or text.startswith('/help'):
