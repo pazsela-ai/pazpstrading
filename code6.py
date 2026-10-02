@@ -16,6 +16,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 
 bot = TeleBot(TELEGRAM_TOKEN, threaded=False)
@@ -27,45 +29,116 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. DIRECT REST API CALL TO GEMINI AI (STABLE V1 & V1BETA)
+# 1. TRIPLE FAILOVER AI ENGINE (GEMINI -> GROQ -> OPENAI)
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
+    """ניסיון ראשי: Gemini API דרך נקודות הקצה העדכניות ביותר"""
     if not GEMINI_API_KEY:
-        return "❌ GEMINI_API_KEY אינו מוגדר בהגדרות הסביבה."
+        return None
 
-    # רשימת נתיבים ומודלים נתמכים לבדיקה
     endpoints = [
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
     ]
     
     headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }]
-    }
-
-    last_error_msg = ""
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     for url in endpoints:
         try:
-            res = requests.post(url, json=payload, headers=headers, timeout=12)
+            res = requests.post(url, json=payload, headers=headers, timeout=8)
             if res.status_code == 200:
                 data = res.json()
                 if 'candidates' in data and len(data['candidates']) > 0:
                     text = data['candidates'][0]['content']['parts'][0]['text']
                     return text.strip()
             else:
-                last_error_msg = f"Status {res.status_code}: {res.text}"
-                logging.warning(f"Gemini API attempt failed: {last_error_msg}")
+                logging.warning(f"Gemini endpoint failed [{res.status_code}]: {res.text[:100]}")
         except Exception as e:
-            last_error_msg = str(e)
             logging.error(f"Error calling Gemini REST API: {e}")
 
-    return f"❌ שגיאה מול Gemini API: {last_error_msg[:120]}"
+    return None
+
+def ask_groq_direct(prompt):
+    """גיבוי ראשון: Groq API (Llama-3.3-70b)"""
+    if not GROQ_API_KEY:
+        return None
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3
+    }
+
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            return data['choices'][0]['message']['content'].strip()
+        else:
+            logging.warning(f"Groq API failed [{res.status_code}]: {res.text[:100]}")
+    except Exception as e:
+        logging.error(f"Error calling Groq API: {e}")
+
+    return None
+
+def ask_openai_direct(prompt):
+    """גיבוי שני: OpenAI API (GPT-4o-mini)"""
+    if not OPENAI_API_KEY:
+        return None
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3
+    }
+
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=8)
+        if res.status_code == 200:
+            data = res.json()
+            return data['choices'][0]['message']['content'].strip()
+        else:
+            logging.warning(f"OpenAI API failed [{res.status_code}]: {res.text[:100]}")
+    except Exception as e:
+        logging.error(f"Error calling OpenAI API: {e}")
+
+    return None
+
+def ask_ai_with_failover(prompt):
+    """מנגנון קריאה מרכזי המעביר בקשות בין ספקים באופן שקוף"""
+    # 1. ניסיון ראשי מול Gemini
+    res = ask_gemini_direct(prompt)
+    if res:
+        return res
+
+    logging.info("Gemini failed or unconfigured. Falling back to Groq...")
+    
+    # 2. גיבוי ראשון מול Groq
+    res = ask_groq_direct(prompt)
+    if res:
+        return res
+
+    logging.info("Groq failed or unconfigured. Falling back to OpenAI...")
+
+    # 3. גיבוי שני מול OpenAI
+    res = ask_openai_direct(prompt)
+    if res:
+        return res
+
+    return "❌ שגיאה: כל ספקי ה-AI (Gemini, Groq, OpenAI) אינם זמינים כעת. אנא בדוק/י מפתחות API ומכסות."
 
 # ---------------------------------------------------------
 # 2. WEBHOOK & COMMANDS SETUP
@@ -194,7 +267,7 @@ GLOBAL_NEWS_FEEDS = [
 
 def scan_breaking_news_events():
     last_scans["news"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    if not CHAT_ID or not GEMINI_API_KEY:
+    if not CHAT_ID:
         return
 
     collected_articles = []
@@ -222,7 +295,7 @@ def scan_breaking_news_events():
         "אם אין אירוע חריג, ענה 'אין אירוע קריטי'."
     )
 
-    ai_text = ask_gemini_direct(prompt)
+    ai_text = ask_ai_with_failover(prompt)
     if "אין אירוע קריטי" not in ai_text and "❌" not in ai_text:
         msg = f"🚨 **איתות אירוע מתפרץ בזמן אמת!**\n\n{ai_text}"
         bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
@@ -246,7 +319,7 @@ def analyze_single_ticker_news(ticker):
             return f"ℹ️ לא נמצאו כתבות חדשותיות אחרונות עבור `{ticker}`."
 
         prompt = f"אתה אנליסט פיננסי. נתח בקצרה בעברית את הידיעות החדשותיות הבאות עבור מניית {ticker} ותן המלצה (חיובי/שלילי/ניטרלי):\n" + "\n".join(items)
-        ai_text = ask_gemini_direct(prompt)
+        ai_text = ask_ai_with_failover(prompt)
         
         if "❌" not in ai_text:
             return f"📰 **סיכום חדשות AI עבור {ticker}:**\n\n{ai_text}"
@@ -374,9 +447,14 @@ def handle_all_messages(message):
     if text.startswith('/start') or text.startswith('/help'):
         bot.reply_to(message, "🟢 **הבוט PazPSTrading מחובר ופעיל!**\nהקש `/tech NVDA` או `/news_scan NVDA` לבדיקה.", parse_mode="Markdown")
     elif text.startswith('/status'):
+        active_providers = []
+        if GEMINI_API_KEY: active_providers.append("Gemini")
+        if GROQ_API_KEY: active_providers.append("Groq")
+        if OPENAI_API_KEY: active_providers.append("OpenAI")
+
         status_msg = (
             "⚙ **סטטוס מערכת:**\n\n"
-            f"• AI Engine: {'✅ פעיל (REST API)' if GEMINI_API_KEY else '❌ לא מחובר'}\n"
+            f"• AI Engine: {'✅ מחובר (' + ', '.join(active_providers) + ')' if active_providers else '❌ ללא מפתח פעיל'}\n"
             f"• סריקת אירועים אוטומטית: 🟢 מופעלת (כל 15 דק')\n"
             f"• סריקת חדשות אחרונה: `{last_scans['news']}`"
         )
