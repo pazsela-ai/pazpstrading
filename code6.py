@@ -34,15 +34,16 @@ HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
-    """קריאה ישירה ל-Gemini API דרך נקודות קצה יציבות בלבד"""
+    """קריאה ישירה ל-Gemini API דרך נקודות קצה מעודכנות בלבד"""
     if not GEMINI_API_KEY:
         logging.error("GEMINI_API_KEY is missing!")
         return None
 
-    # מודלים רשמיים ויציבים הנתמכים ב-REST v1beta
+    # מודלים מעודכנים ונתמכים ב-REST v1beta לחשבונות בתשלום
     endpoints = [
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
     ]
     
     headers = {"Content-Type": "application/json"}
@@ -77,21 +78,26 @@ def ask_groq_direct(prompt):
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": "llama-3.3-70b-versatile",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3
-    }
+    
+    # ניסיון עבודה מול מודלים קיימים ב-Groq
+    groq_models = ["llama-3.3-70b-specdec", "llama3-70b-8192", "mixtral-8x7b-32768"]
+    
+    for model in groq_models:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3
+        }
 
-    try:
-        res = requests.post(url, json=payload, headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            return data['choices'][0]['message']['content'].strip()
-        else:
-            logging.warning(f"Groq API Error [{res.status_code}]: {res.text[:150]}")
-    except Exception as e:
-        logging.error(f"Error calling Groq API: {e}")
+        try:
+            res = requests.post(url, json=payload, headers=headers, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                return data['choices'][0]['message']['content'].strip()
+            else:
+                logging.warning(f"Groq API Error [{res.status_code}] ({model}): {res.text[:150]}")
+        except Exception as e:
+            logging.error(f"Error calling Groq API ({model}): {e}")
 
     return None
 
@@ -494,7 +500,7 @@ def handle_all_messages(message):
     elif text.startswith('/news_scan'):
         parts = text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "⚠️️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
+            bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
             return
         ticker = parts[1]
         bot.reply_to(message, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker.upper()}`...", parse_mode="Markdown")
