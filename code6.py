@@ -26,20 +26,20 @@ app = Flask(__name__)
 user_states = {}
 last_processed_news_titles = set()
 last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
 # 1. TRIPLE FAILOVER AI ENGINE (GEMINI -> GROQ -> OPENAI)
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
-    """ניסיון ראשי: Gemini API דרך נקודות הקצה העדכניות ביותר"""
+    """ניסיון ראשי: Gemini API דרך REST v1beta תקין"""
     if not GEMINI_API_KEY:
         return None
 
+    # שימוש במודלים הנתמכים והרשמיים ב-REST
     endpoints = [
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}",
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
     ]
     
@@ -48,14 +48,14 @@ def ask_gemini_direct(prompt):
 
     for url in endpoints:
         try:
-            res = requests.post(url, json=payload, headers=headers, timeout=8)
+            res = requests.post(url, json=payload, headers=headers, timeout=10)
             if res.status_code == 200:
                 data = res.json()
                 if 'candidates' in data and len(data['candidates']) > 0:
                     text = data['candidates'][0]['content']['parts'][0]['text']
                     return text.strip()
             else:
-                logging.warning(f"Gemini endpoint failed [{res.status_code}]: {res.text[:100]}")
+                logging.warning(f"Gemini API Error [{res.status_code}]: {res.text[:150]}")
         except Exception as e:
             logging.error(f"Error calling Gemini REST API: {e}")
 
@@ -78,12 +78,12 @@ def ask_groq_direct(prompt):
     }
 
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=8)
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
         if res.status_code == 200:
             data = res.json()
             return data['choices'][0]['message']['content'].strip()
         else:
-            logging.warning(f"Groq API failed [{res.status_code}]: {res.text[:100]}")
+            logging.warning(f"Groq API Error [{res.status_code}]: {res.text[:150]}")
     except Exception as e:
         logging.error(f"Error calling Groq API: {e}")
 
@@ -106,12 +106,12 @@ def ask_openai_direct(prompt):
     }
 
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=8)
+        res = requests.post(url, json=payload, headers=headers, timeout=10)
         if res.status_code == 200:
             data = res.json()
             return data['choices'][0]['message']['content'].strip()
         else:
-            logging.warning(f"OpenAI API failed [{res.status_code}]: {res.text[:100]}")
+            logging.warning(f"OpenAI API Error [{res.status_code}]: {res.text[:150]}")
     except Exception as e:
         logging.error(f"Error calling OpenAI API: {e}")
 
@@ -124,14 +124,14 @@ def ask_ai_with_failover(prompt):
     if res:
         return res
 
-    logging.info("Gemini failed or unconfigured. Falling back to Groq...")
+    logging.info("Gemini failed. Falling back to Groq...")
     
     # 2. גיבוי ראשון מול Groq
     res = ask_groq_direct(prompt)
     if res:
         return res
 
-    logging.info("Groq failed or unconfigured. Falling back to OpenAI...")
+    logging.info("Groq failed. Falling back to OpenAI...")
 
     # 3. גיבוי שני מול OpenAI
     res = ask_openai_direct(prompt)
@@ -273,7 +273,7 @@ def scan_breaking_news_events():
     collected_articles = []
     for feed_url in GLOBAL_NEWS_FEEDS:
         try:
-            resp = requests.get(feed_url, headers=HEADERS, timeout=6)
+            resp = requests.get(feed_url, headers=HEADERS, timeout=8)
             feed = feedparser.parse(resp.content)
             for entry in feed.entries[:8]:
                 if entry.title not in last_processed_news_titles:
@@ -308,23 +308,35 @@ def scan_breaking_news_events():
 
 def analyze_single_ticker_news(ticker):
     clean_ticker = ticker.replace('.TA', '')
-    rss_url = f"https://news.google.com/rss/search?q={clean_ticker}+stock&hl=en-US&gl=US&ceid=US:en"
+    query = f"{clean_ticker}+stock" if not ticker.endswith('.TA') else f"{clean_ticker}+אל+על"
+    rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
     try:
-        resp = requests.get(rss_url, headers=HEADERS, timeout=6)
+        resp = requests.get(rss_url, headers=HEADERS, timeout=10)
+        
+        if resp.status_code != 200:
+            logging.error(f"Google News RSS status code: {resp.status_code}")
+            return f"⚠️ לא ניתן לשלוף חדשות מ-Google News כרגע (קוד שגיאה: {resp.status_code})."
+
         feed = feedparser.parse(resp.content)
-        items = [f"• {e.title}" for e in feed.entries[:5]]
+        items = [f"• {e.title}" for e in feed.entries[:5] if hasattr(e, 'title')]
 
         if not items:
             return f"ℹ️ לא נמצאו כתבות חדשותיות אחרונות עבור `{ticker}`."
 
-        prompt = f"אתה אנליסט פיננסי. נתח בקצרה בעברית את הידיעות החדשותיות הבאות עבור מניית {ticker} ותן המלצה (חיובי/שלילי/ניטרלי):\n" + "\n".join(items)
+        prompt = (
+            f"אתה אנליסט פיננסי. נתח בקצרה בעברית את הידיעות החדשותיות הבאות עבור מניית {ticker} "
+            f"ותן סיכום קצר והמלצה (חיובי/שלילי/ניטרלי):\n" + "\n".join(items)
+        )
+        
         ai_text = ask_ai_with_failover(prompt)
         
-        if "❌" not in ai_text:
+        if ai_text and "❌" not in ai_text:
             return f"📰 **סיכום חדשות AI עבור {ticker}:**\n\n{ai_text}"
         return ai_text
+
     except Exception as e:
+        logging.error(f"Error in analyze_single_ticker_news: {e}")
         return f"❌ שגיאה בניתוח חדשות: {e}"
 
 # ---------------------------------------------------------
