@@ -29,21 +29,26 @@ last_processed_news_titles = set()
 last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
 
+# רשימת מעקב טכנית דינמית (Watchlist) למניות תנודתיות ובעלות נזילות
+WATCHLIST = [
+    "ELAL.TA", "ISRA.TA", "CAMT.TA", "NICE.TA", "TLRD.TA", "ENLT.TA", "NWM.TA", "ESLT.TA",
+    "NVDA", "TSLA", "AMD", "MRNA", "PFE", "DAL", "LMT", "AAPL", "MSFT", "AMZN", "META"
+]
+
 # ---------------------------------------------------------
-# 1. TRIPLE FAILOVER AI ENGINE (GEMINI STABLE -> GROQ -> OPENAI)
+# 1. FIXED TRIPLE FAILOVER AI ENGINE
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
-    """קריאה ישירה ל-Gemini API דרך נקודות קצה מעודכנות בלבד"""
+    """קריאה יציבה ל-Gemini API דרך נקודות קצה נתמכות בלבד"""
     if not GEMINI_API_KEY:
         logging.error("GEMINI_API_KEY is missing!")
         return None
 
-    # מודלים מעודכנים ונתמכים ב-REST v1beta לחשבונות בתשלום
     endpoints = [
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
     ]
     
     headers = {"Content-Type": "application/json"}
@@ -62,7 +67,7 @@ def ask_gemini_direct(prompt):
                     text = data['candidates'][0]['content']['parts'][0]['text']
                     return text.strip()
             else:
-                logging.warning(f"Gemini API Error [{res.status_code}]: {res.text[:200]}")
+                logging.warning(f"Gemini API Error [{res.status_code}]: {res.text[:150]}")
         except Exception as e:
             logging.error(f"Error calling Gemini REST API: {e}")
 
@@ -79,14 +84,13 @@ def ask_groq_direct(prompt):
         "Content-Type": "application/json"
     }
     
-    # ניסיון עבודה מול מודלים קיימים ב-Groq
-    groq_models = ["llama-3.3-70b-specdec", "llama3-70b-8192", "mixtral-8x7b-32768"]
+    groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
     
     for model in groq_models:
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3
+            "temperature": 0.2
         }
 
         try:
@@ -114,7 +118,7 @@ def ask_openai_direct(prompt):
     payload = {
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3
+        "temperature": 0.2
     }
 
     try:
@@ -199,7 +203,7 @@ def telegram_webhook():
     return 'Forbidden', 403
 
 # ---------------------------------------------------------
-# 3. TECHNICAL ENGINE
+# 3. TECHNICAL ENGINE & WATCHLIST SCANNER
 # ---------------------------------------------------------
 
 def analyze_technical_deep(ticker):
@@ -264,13 +268,29 @@ def analyze_technical_deep(ticker):
         logging.error(f"Error deep analyzing {ticker}: {e}")
         return None
 
+def scan_watchlist_technical():
+    """סריקה טכנית אוטומטית ברקע לרשימת ה-Watchlist"""
+    last_scans["tech"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    logging.info("Starting background technical scan for Watchlist...")
+    for ticker in WATCHLIST:
+        try:
+            tech_data = analyze_technical_deep(ticker)
+            if tech_data and tech_data["is_breakout"]:
+                send_alert(ticker, tech_data)
+        except Exception as e:
+            logging.error(f"Error in watchlist scan for {ticker}: {e}")
+
 # ---------------------------------------------------------
-# 4. EVENT-DRIVEN NEWS ENGINE
+# 4. EXPANDED BROAD EVENT-DRIVEN NEWS ENGINE
 # ---------------------------------------------------------
 
-GLOBAL_NEWS_FEEDS = [
-    "https://news.google.com/rss/search?q=stock+market+pharma+aviation+oil+gas&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=%D7%91%D7%95%D7%A8%D7%A1%D7%94+%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%A4%D7%90%D7%A8%D7%9E%D7%94+%D7%A0%D7%A4%D7%90&hl=he&gl=IL&ceid=IL:he"
+BROAD_NEWS_FEEDS = [
+    "https://www.businesswire.com/rss/home/?rss=G1NSRmRZXVR3e1xRWA==",
+    "https://www.globenewswire.com/rss/feed/subject/pharmaceuticals",
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&datea=&dateb=&owner=include&start=0&count=40&output=atom",
+    "https://news.google.com/rss/search?q=pharma+FDA+clinical+trial+cancer+acquisition+merger&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=aviation+airline+defense+conflict+war+sanctions&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%98%D7%97%D7%95%D7%9F+%D7%A4%D7%90%D7%A8%D7%9E%D7%94+%D7%91%D7%95%D7%A8%D7%A1%D7%94+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he"
 ]
 
 def scan_breaking_news_events():
@@ -279,35 +299,41 @@ def scan_breaking_news_events():
         return
 
     collected_articles = []
-    for feed_url in GLOBAL_NEWS_FEEDS:
+    for feed_url in BROAD_NEWS_FEEDS:
         try:
             resp = requests.get(feed_url, headers=HEADERS, timeout=8)
             feed = feedparser.parse(resp.content)
-            for entry in feed.entries[:8]:
-                if entry.title not in last_processed_news_titles:
-                    collected_articles.append(entry.title)
-                    last_processed_news_titles.add(entry.title)
+            for entry in feed.entries[:6]:
+                title = getattr(entry, 'title', '')
+                if title and title not in last_processed_news_titles:
+                    collected_articles.append(title)
+                    last_processed_news_titles.add(title)
         except Exception as e:
-            logging.error(f"Error fetching feed: {e}")
+            logging.error(f"Error fetching feed {feed_url}: {e}")
 
     if not collected_articles:
         return
 
     prompt = (
-        "אתה אנליסט מסחר מבוסס אירועים. נתח את הידיעות החדשותיות הבאות:\n"
+        "אתה אנליסט פיננסי בכיר ומסוחר אירועים (Event-Driven Trader).\n"
+        "קרא את כותרות החדשות והדיווחים הבאים שנאספו כעת בזמן אמת:\n"
         + "\n".join([f"- {t}" for t in collected_articles]) +
-        "\n\nאם יש אירוע קריטי המשפיע על מניות/סקטורים:\n"
-        "1. תמצת את האירוע בקצרה.\n"
-        "2. ציין סימולי מניות רלוונטיים באנגלית.\n"
-        "3. רשום המלצת פעולה.\n"
-        "אם אין אירוע חריג, ענה 'אין אירוע קריטי'."
+        "\n\nתפקידך לסווג את הידיעות ולחלץ המלצות מסחר מעשיות:\n"
+        "1. **סיווג אירועים קריטיים:** זהה אם יש אירוע מהותי (ניסוי קליני/FDA, עסקאות M&A, אירועים ביטחוניים/תעופתיים, רגולציה/דוחות 8-K, סייבר, שרשרת אספקה).\n"
+        "2. **זיהוי מניות מושפעות:** רשום מפורשות סימולי מניות באנגלית (לדוגמה: MRNA, ELAL.TA, ESLT.TA, DAL, NVDA, PFE).\n"
+        "3. **המלצת השקעה ומסחר:** לכל מניה שזוהתה, ספק המלצה ברורה:\n"
+        "   - **כיוון פוזיציה:** (קנייה / שורט / מעקב בלבד)\n"
+        "   - **אופק זמן:** (מסחר יומי, סווינג לטווח קצר, השקעה לטווח בינוני)\n"
+        "   - **רציונל וטריגר לכניסה:** הסבר קצר מדוע האירוע יוצר הזדמנות מסחר ומהו התנאי לכניסה.\n\n"
+        "אם אין אף אירוע דרמטי בעל השפעה מסחרית ישירה, ענה בדיוק: 'אין אירוע קריטי'."
     )
 
     ai_text = ask_ai_with_failover(prompt)
     if "אין אירוע קריטי" not in ai_text and "❌" not in ai_text:
-        msg = f"🚨 **איתות אירוע מתפרץ בזמן אמת!**\n\n{ai_text}"
+        msg = f"🚨 **איתות אירוע מתפרץ + המלצת השקעה!**\n\n{ai_text}"
         bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
         
+        # חילוץ מניות מהטקסט והרצת ניתוח טכני משלים
         found_tickers = re.findall(r'\b[A-Z]{2,5}(?:\.TA)?\b', ai_text)
         for tick in set(found_tickers):
             tech_data = analyze_technical_deep(tick)
@@ -342,14 +368,15 @@ def analyze_single_ticker_news(ticker):
             return f"ℹ️ לא נמצאו כתבות חדשותיות אחרונות עבור `{ticker}`."
 
         prompt = (
-            f"אתה אנליסט פיננסי. נתח בקצרה בעברית את הידיעות החדשותיות הבאות עבור מניית {ticker} "
-            f"ותן סיכום קצר והמלצה (חיובי/שלילי/ניטרלי):\n" + "\n".join(items)
+            f"אתה אנליסט פיננסי. נתח בקצרה בעברית את הידיעות החדשותיות הבאות עבור מניית {ticker}:\n"
+            + "\n".join(items) +
+            "\n\nספק סיכום קצר, הערכת השפעה על המחיר, והמלצת מסחר/השקעה מפורשת (קנייה / שורט / המתנה)."
         )
         
         ai_text = ask_ai_with_failover(prompt)
         
         if ai_text and "❌" not in ai_text:
-            return f"📰 **סיכום חדשות AI עבור {ticker}:**\n\n{ai_text}"
+            return f"📰 **סיכום חדשות והמלצת השקעה עבור {ticker}:**\n\n{ai_text}"
         return ai_text
 
     except Exception as e:
@@ -485,13 +512,14 @@ def handle_all_messages(message):
             "⚙ **סטטוס מערכת:**\n\n"
             f"• AI Engine: {'✅ מחובר (' + ', '.join(active_providers) + ')' if active_providers else '❌ ללא מפתח פעיל'}\n"
             f"• סריקת אירועים אוטומטית: 🟢 מופעלת (כל 15 דק')\n"
-            f"• סריקת חדשות אחרונה: `{last_scans['news']}`"
+            f"• סריקת חדשות אחרונה: `{last_scans['news']}`\n"
+            f"• סריקה טכנית אחרונה: `{last_scans['tech']}`"
         )
         bot.reply_to(message, status_msg, parse_mode="Markdown")
     elif text.startswith('/tech'):
         parts = text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/tech NVDA`", parse_mode="Markdown")
+            bot.reply_to(message, "⚠ יש לציין סימול מניה. לדוגמה: `/tech NVDA`", parse_mode="Markdown")
             return
         ticker = parts[1]
         bot.reply_to(message, f"🔍 מריץ ניתוח טכני עבור `{ticker.upper()}`...", parse_mode="Markdown")
@@ -522,6 +550,7 @@ def handle_all_messages(message):
 
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
+scheduler.add_job(scan_watchlist_technical, 'interval', hours=1)
 scheduler.start()
 
 if __name__ == '__main__':
