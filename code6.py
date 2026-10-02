@@ -27,9 +27,10 @@ app = Flask(__name__)
 user_states = {}
 last_processed_news_titles = set()
 last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
 
-# רשימת מעקב טכנית דינמית (Watchlist) למניות תנודתיות ובעלות נזילות
+# User-Agent תואם דרישות SEC ו-Google News
+HEADERS = {'User-Agent': 'PazPSTradingBot/1.0 (contact@pazpstrading.com)'}
+
 WATCHLIST = [
     "ELAL.TA", "ISRA.TA", "CAMT.TA", "NICE.TA", "TLRD.TA", "ENLT.TA", "NWM.TA", "ESLT.TA",
     "NVDA", "TSLA", "AMD", "MRNA", "PFE", "DAL", "LMT", "AAPL", "MSFT", "AMZN", "META"
@@ -40,42 +41,41 @@ WATCHLIST = [
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
-    """קריאה יציבה ל-Gemini API דרך מודלים נתמכים ועדכניים"""
     if not GEMINI_API_KEY:
         logging.error("GEMINI_API_KEY is missing!")
         return None
 
-    # מודלים נתמכים בלבד
-    gemini_models = [
-        "gemini-1.5-flash",
-        "gemini-1.5-pro"
+    # שימוש בנקודות קצה מעודכנות ומבנה payload תואם
+    endpoints = [
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
     ]
     
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{
+            "role": "user",
             "parts": [{"text": prompt}]
         }]
     }
 
-    for model in gemini_models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    for url in endpoints:
         try:
             res = requests.post(url, json=payload, headers=headers, timeout=12)
             if res.status_code == 200:
                 data = res.json()
                 if 'candidates' in data and len(data['candidates']) > 0:
-                    text = data['candidates'][0]['content']['parts'][0]['text']
-                    return text.strip()
+                    parts = data['candidates'][0].get('content', {}).get('parts', [])
+                    if parts and 'text' in parts[0]:
+                        return parts[0]['text'].strip()
             else:
-                logging.warning(f"Gemini API Error [{res.status_code}] ({model}): {res.text[:150]}")
+                logging.warning(f"Gemini API Error [{res.status_code}]: {res.text[:150]}")
         except Exception as e:
-            logging.error(f"Error calling Gemini REST API ({model}): {e}")
+            logging.error(f"Error calling Gemini REST API: {e}")
 
     return None
 
 def ask_groq_direct(prompt):
-    """גיבוי ראשון: Groq API עם מודלים פעילים מעודכנים"""
     if not GROQ_API_KEY:
         return None
 
@@ -85,12 +85,8 @@ def ask_groq_direct(prompt):
         "Content-Type": "application/json"
     }
     
-    # מודלים עדכניים שפעילים כעת ב-Groq
-    groq_models = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "llama3-8b-8192"
-    ]
+    # מודלים פעילים בלבד (הוסר mixtral-8x7b הישן)
+    groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     
     for model in groq_models:
         payload = {
@@ -112,7 +108,6 @@ def ask_groq_direct(prompt):
     return None
 
 def ask_openai_direct(prompt):
-    """גיבוי שני: OpenAI API"""
     if not OPENAI_API_KEY:
         return None
 
@@ -140,7 +135,6 @@ def ask_openai_direct(prompt):
     return None
 
 def ask_ai_with_failover(prompt):
-    """מנגנון קריאה מרכזי המעביר בקשות בין ספקים באופן שקוף"""
     res = ask_gemini_direct(prompt)
     if res:
         return res
@@ -156,6 +150,14 @@ def ask_ai_with_failover(prompt):
         return res
 
     return "❌ שגיאה: כל ספקי ה-AI (Gemini, Groq, OpenAI) אינם זמינים כעת. אנא בדוק/י מפתחות API ומכסות."
+
+def safe_send_message(chat_id, text, reply_markup=None):
+    """שליחה בטוחה המונעת קריסה עקב תווי Markdown לא תקינים מה-AI"""
+    try:
+        bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception as e:
+        logging.warning(f"Failed to send Markdown message, falling back to plain text: {e}")
+        bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 # ---------------------------------------------------------
 # 2. WEBHOOK & COMMANDS SETUP
@@ -275,7 +277,6 @@ def analyze_technical_deep(ticker):
         return None
 
 def scan_watchlist_technical():
-    """סריקה טכנית אוטומטית ברקע לרשימת ה-Watchlist"""
     last_scans["tech"] = time.strftime("%Y-%m-%d %H:%M:%S")
     logging.info("Starting background technical scan for Watchlist...")
     for ticker in WATCHLIST:
@@ -337,9 +338,8 @@ def scan_breaking_news_events():
     ai_text = ask_ai_with_failover(prompt)
     if "אין אירוע קריטי" not in ai_text and "❌" not in ai_text:
         msg = f"🚨 **איתות אירוע מתפרץ + המלצת השקעה!**\n\n{ai_text}"
-        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+        safe_send_message(CHAT_ID, msg)
         
-        # חילוץ מניות מהטקסט והרצת ניתוח טכני משלים
         found_tickers = re.findall(r'\b[A-Z]{2,5}(?:\.TA)?\b', ai_text)
         for tick in set(found_tickers):
             tech_data = analyze_technical_deep(tick)
@@ -402,7 +402,7 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
         tech_data = analyze_technical_deep(ticker)
 
     if not tech_data:
-        bot.send_message(dest_id, f"❌ לא ניתן לשלוף נתונים עבור `{ticker}`.")
+        safe_send_message(dest_id, f"❌ לא ניתן לשלוף נתונים עבור `{ticker}`.")
         return
 
     entry = tech_data["entry_price"]
@@ -430,7 +430,7 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
     keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker.upper()}_{entry}_{sl}_{tp}"))
     keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.upper().replace('.TA','')}") )
 
-    bot.send_message(dest_id, msg, parse_mode="Markdown", reply_markup=keyboard)
+    safe_send_message(dest_id, msg, reply_markup=keyboard)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('trade_'))
 def handle_trade_click(call):
@@ -458,7 +458,7 @@ def handle_currency_select(call):
     }
 
     symbol = "$" if curr == "USD" else "₪"
-    bot.send_message(call.message.chat.id, f"✍️ **אנא הקלד/י כעת בטרמינל את סכום הסיכון המבוקש ב-{symbol}:**\n(לדוגמה: 150 או 500)", parse_mode="Markdown")
+    safe_send_message(call.message.chat.id, f"✍️ **אנא הקלד/י כעת בטרמינל את סכום הסיכון המבוקש ב-{symbol}:**\n(לדוגמה: 150 או 500)")
     bot.answer_callback_query(call.id)
 
 # ---------------------------------------------------------
@@ -500,14 +500,14 @@ def handle_all_messages(message):
                 f"• **שווי פוזיציה כולל:** {curr_symbol}{total_cost}\n"
                 f"• **רווח פוטנציאלי ביעד (TP):** {curr_symbol}{potential_profit}\n"
             )
-            bot.reply_to(message, calc_msg, parse_mode="Markdown")
+            safe_send_message(message.chat.id, calc_msg)
             return
         except ValueError:
-            bot.reply_to(message, "⚠️ אנא הזן מספר תקין בלבד (למשל: 200). נסה שוב:")
+            bot.reply_to(message, "⚠️️ אנא הזן מספר תקין בלבד (למשל: 200). נסה שוב:")
             return
 
     if text.startswith('/start') or text.startswith('/help'):
-        bot.reply_to(message, "🟢 **הבוט PazPSTrading מחובר ופעיל!**\nהקש `/tech NVDA` או `/news_scan NVDA` לבדיקה.", parse_mode="Markdown")
+        safe_send_message(message.chat.id, "🟢 **הבוט PazPSTrading מחובר ופעיל!**\nהקש `/tech NVDA` או `/news_scan NVDA` לבדיקה.")
     elif text.startswith('/status'):
         active_providers = []
         if GEMINI_API_KEY: active_providers.append("Gemini")
@@ -521,34 +521,34 @@ def handle_all_messages(message):
             f"• סריקת חדשות אחרונה: `{last_scans['news']}`\n"
             f"• סריקה טכנית אחרונה: `{last_scans['tech']}`"
         )
-        bot.reply_to(message, status_msg, parse_mode="Markdown")
+        safe_send_message(message.chat.id, status_msg)
     elif text.startswith('/tech'):
         parts = text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "⚠ יש לציין סימול מניה. לדוגמה: `/tech NVDA`", parse_mode="Markdown")
+            safe_send_message(message.chat.id, "⚠ יש לציין סימול מניה. לדוגמה: `/tech NVDA`")
             return
         ticker = parts[1]
-        bot.reply_to(message, f"🔍 מריץ ניתוח טכני עבור `{ticker.upper()}`...", parse_mode="Markdown")
+        safe_send_message(message.chat.id, f"🔍 מריץ ניתוח טכני עבור `{ticker.upper()}`...")
         tech_data = analyze_technical_deep(ticker)
         send_alert(ticker=ticker, tech_data=tech_data, target_chat_id=message.chat.id)
     elif text.startswith('/news_scan'):
         parts = text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "⚠️️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
+            safe_send_message(message.chat.id, "⚠ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`")
             return
         ticker = parts[1]
-        bot.reply_to(message, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker.upper()}`...", parse_mode="Markdown")
+        safe_send_message(message.chat.id, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker.upper()}`...")
         res = analyze_single_ticker_news(ticker)
-        bot.reply_to(message, res, parse_mode="Markdown")
+        safe_send_message(message.chat.id, res)
     elif text.startswith('/test_news'):
-        bot.reply_to(message, "📰 מריץ סריקת אירועים חדשותיים בלייב...")
+        safe_send_message(message.chat.id, "📰 מריץ סריקת אירועים חדשותיים בלייב...")
         scan_breaking_news_events()
     elif text.startswith('/test_tech'):
-        bot.reply_to(message, "📈 מריץ בדיקה טכנית לדוגמה (NVDA)...")
+        safe_send_message(message.chat.id, "📈 מריץ בדיקה טכנית לדוגמה (NVDA)...")
         tech_data = analyze_technical_deep("NVDA")
         send_alert("NVDA", tech_data, message.chat.id)
     elif text.startswith('/portfolio'):
-        bot.reply_to(message, "💼 **תיק מעקב מניות:** כרגע אין מניות רשומות במעקב הפעיל.", parse_mode="Markdown")
+        safe_send_message(message.chat.id, "💼 **תיק מעקב מניות:** כרגע אין מניות רשומות במעקב הפעיל.")
 
 # ---------------------------------------------------------
 # 7. BACKGROUND SCHEDULER & RUNNER
