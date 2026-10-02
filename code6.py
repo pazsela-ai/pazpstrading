@@ -27,36 +27,45 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. DIRECT REST API CALL TO GEMINI AI
+# 1. DIRECT REST API CALL TO GEMINI AI (STABLE V1 & V1BETA)
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
     if not GEMINI_API_KEY:
         return "❌ GEMINI_API_KEY אינו מוגדר בהגדרות הסביבה."
 
-    # שימוש בקריאת REST ישירה עבור יציבות מרבית
-    models = ["gemini-1.5-flash", "gemini-1.5-pro"]
+    # רשימת נתיבים ומודלים נתמכים לבדיקה
+    endpoints = [
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    ]
     
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }]
-        }
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+
+    last_error_msg = ""
+
+    for url in endpoints:
         try:
             res = requests.post(url, json=payload, headers=headers, timeout=12)
             if res.status_code == 200:
                 data = res.json()
-                text = data['candidates'][0]['content']['parts'][0]['text']
-                return text.strip()
+                if 'candidates' in data and len(data['candidates']) > 0:
+                    text = data['candidates'][0]['content']['parts'][0]['text']
+                    return text.strip()
             else:
-                logging.warning(f"Gemini API ({model}) returned status {res.status_code}: {res.text}")
+                last_error_msg = f"Status {res.status_code}: {res.text}"
+                logging.warning(f"Gemini API attempt failed: {last_error_msg}")
         except Exception as e:
-            logging.error(f"Error calling Gemini REST API ({model}): {e}")
+            last_error_msg = str(e)
+            logging.error(f"Error calling Gemini REST API: {e}")
 
-    return "❌ שגיאה בהתקשרות מול Gemini API (בדוק מפתח API או מכסות)."
+    return f"❌ שגיאה מול Gemini API: {last_error_msg[:120]}"
 
 # ---------------------------------------------------------
 # 2. WEBHOOK & COMMANDS SETUP
