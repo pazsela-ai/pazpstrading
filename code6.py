@@ -7,7 +7,6 @@ import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import feedparser
-from google import genai
 from flask import Flask, request
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -22,44 +21,42 @@ RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
 bot = TeleBot(TELEGRAM_TOKEN, threaded=False)
 app = Flask(__name__)
 
-# שמירת מצבי משתמש להזנת סכום מותאם אישית
 user_states = {}
-
-ai_client = None
-if GEMINI_API_KEY:
-    try:
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
-        logging.info("Gemini Client initialized successfully.")
-    except Exception as e:
-        logging.error(f"Failed to initialize Gemini Client: {e}")
-
 last_processed_news_titles = set()
 last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. HELPER: GEMINI AI GENERATOR WITH FALLBACKS
+# 1. DIRECT REST API CALL TO GEMINI AI
 # ---------------------------------------------------------
 
-def generate_ai_response(prompt):
-    if not ai_client:
-        return "❌ מנוע AI אינו מחובר. נא לוודא הגדרת GEMINI_API_KEY."
+def ask_gemini_direct(prompt):
+    if not GEMINI_API_KEY:
+        return "❌ GEMINI_API_KEY אינו מוגדר בהגדרות הסביבה."
 
-    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    # שימוש בקריאת REST ישירה עבור יציבות מרבית
+    models = ["gemini-1.5-flash", "gemini-1.5-pro"]
     
-    for model_name in models_to_try:
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }]
+        }
         try:
-            response = ai_client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            if response and response.text:
-                return response.text.strip()
+            res = requests.post(url, json=payload, headers=headers, timeout=12)
+            if res.status_code == 200:
+                data = res.json()
+                text = data['candidates'][0]['content']['parts'][0]['text']
+                return text.strip()
+            else:
+                logging.warning(f"Gemini API ({model}) returned status {res.status_code}: {res.text}")
         except Exception as e:
-            logging.warning(f"Model {model_name} failed: {e}. Trying fallback...")
-            continue
+            logging.error(f"Error calling Gemini REST API ({model}): {e}")
 
-    return "❌ לא ניתן היה לקבל מענה מכל מודלי Gemini הנתמכים."
+    return "❌ שגיאה בהתקשרות מול Gemini API (בדוק מפתח API או מכסות)."
 
 # ---------------------------------------------------------
 # 2. WEBHOOK & COMMANDS SETUP
@@ -188,7 +185,7 @@ GLOBAL_NEWS_FEEDS = [
 
 def scan_breaking_news_events():
     last_scans["news"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    if not ai_client or not CHAT_ID:
+    if not CHAT_ID or not GEMINI_API_KEY:
         return
 
     collected_articles = []
@@ -216,7 +213,7 @@ def scan_breaking_news_events():
         "אם אין אירוע חריג, ענה 'אין אירוע קריטי'."
     )
 
-    ai_text = generate_ai_response(prompt)
+    ai_text = ask_gemini_direct(prompt)
     if "אין אירוע קריטי" not in ai_text and "❌" not in ai_text:
         msg = f"🚨 **איתות אירוע מתפרץ בזמן אמת!**\n\n{ai_text}"
         bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
@@ -228,8 +225,8 @@ def scan_breaking_news_events():
                 send_alert(tick, tech_data)
 
 def analyze_single_ticker_news(ticker):
-    query = f"{ticker.replace('.TA', '')}+stock"
-    rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    clean_ticker = ticker.replace('.TA', '')
+    rss_url = f"https://news.google.com/rss/search?q={clean_ticker}+stock&hl=en-US&gl=US&ceid=US:en"
 
     try:
         resp = requests.get(rss_url, headers=HEADERS, timeout=6)
@@ -239,8 +236,8 @@ def analyze_single_ticker_news(ticker):
         if not items:
             return f"ℹ️ לא נמצאו כתבות חדשותיות אחרונות עבור `{ticker}`."
 
-        prompt = f"נתח בקצרה בעברית את הידיעות עבור {ticker} ותן המלצה (חיובי/שלילי/ניטרלי):\n" + "\n".join(items)
-        ai_text = generate_ai_response(prompt)
+        prompt = f"אתה אנליסט פיננסי. נתח בקצרה בעברית את הידיעות החדשותיות הבאות עבור מניית {ticker} ותן המלצה (חיובי/שלילי/ניטרלי):\n" + "\n".join(items)
+        ai_text = ask_gemini_direct(prompt)
         
         if "❌" not in ai_text:
             return f"📰 **סיכום חדשות AI עבור {ticker}:**\n\n{ai_text}"
@@ -291,7 +288,6 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
 
     bot.send_message(dest_id, msg, parse_mode="Markdown", reply_markup=keyboard)
 
-# בחירת מטבע (שקלים / דולרים)
 @bot.callback_query_handler(func=lambda call: call.data.startswith('trade_'))
 def handle_trade_click(call):
     _, ticker, entry, sl, tp = call.data.split('_')
@@ -304,12 +300,10 @@ def handle_trade_click(call):
     bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=keyboard)
     bot.answer_callback_query(call.id, text="בחר מטבע לחישוב הסיכון")
 
-# בקשת הזנת סכום מותאם אישית
 @bot.callback_query_handler(func=lambda call: call.data.startswith('currency_'))
 def handle_currency_select(call):
     _, ticker, entry, sl, tp, curr = call.data.split('_')
     
-    # שמירת נתוני המשימה בלשונית המשתמש
     user_states[call.from_user.id] = {
         "action": "awaiting_risk_amount",
         "ticker": ticker,
@@ -332,11 +326,10 @@ def handle_all_messages(message):
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # טיפול בהזנת סכום סיכון מותאם אישית
     if user_id in user_states and user_states[user_id].get("action") == "awaiting_risk_amount":
         try:
             risk_amount = float(text)
-            state = user_states.pop(user_id) # ניקוי מצב
+            state = user_states.pop(user_id)
 
             entry = state["entry"]
             sl = state["sl"]
@@ -369,13 +362,12 @@ def handle_all_messages(message):
             bot.reply_to(message, "⚠️ אנא הזן מספר תקין בלבד (למשל: 200). נסה שוב:")
             return
 
-    # פקודות רגילות
     if text.startswith('/start') or text.startswith('/help'):
         bot.reply_to(message, "🟢 **הבוט PazPSTrading מחובר ופעיל!**\nהקש `/tech NVDA` או `/news_scan NVDA` לבדיקה.", parse_mode="Markdown")
     elif text.startswith('/status'):
         status_msg = (
             "⚙ **סטטוס מערכת:**\n\n"
-            f"• AI Engine: {'✅ פעיל' if GEMINI_API_KEY else '❌ לא מחובר'}\n"
+            f"• AI Engine: {'✅ פעיל (REST API)' if GEMINI_API_KEY else '❌ לא מחובר'}\n"
             f"• סריקת אירועים אוטומטית: 🟢 מופעלת (כל 15 דק')\n"
             f"• סריקת חדשות אחרונה: `{last_scans['news']}`"
         )
