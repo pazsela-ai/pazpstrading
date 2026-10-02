@@ -3,6 +3,7 @@ import logging
 import time
 import requests
 import re
+import urllib.parse
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
@@ -29,40 +30,45 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'}
 
 # ---------------------------------------------------------
-# 1. TRIPLE FAILOVER AI ENGINE (GEMINI -> GROQ -> OPENAI)
+# 1. TRIPLE FAILOVER AI ENGINE (GEMINI STABLE -> GROQ -> OPENAI)
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
-    """ניסיון ראשי: Gemini API דרך REST v1beta תקין"""
+    """קריאה ישירה ל-Gemini API דרך נקודות קצה יציבות בלבד"""
     if not GEMINI_API_KEY:
+        logging.error("GEMINI_API_KEY is missing!")
         return None
 
-    # שימוש במודלים הנתמכים והרשמיים ב-REST
+    # מודלים רשמיים ויציבים הנתמכים ב-REST v1beta
     endpoints = [
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
     ]
     
     headers = {"Content-Type": "application/json"}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
 
     for url in endpoints:
         try:
-            res = requests.post(url, json=payload, headers=headers, timeout=10)
+            res = requests.post(url, json=payload, headers=headers, timeout=12)
             if res.status_code == 200:
                 data = res.json()
                 if 'candidates' in data and len(data['candidates']) > 0:
                     text = data['candidates'][0]['content']['parts'][0]['text']
                     return text.strip()
             else:
-                logging.warning(f"Gemini API Error [{res.status_code}]: {res.text[:150]}")
+                logging.warning(f"Gemini API Error [{res.status_code}]: {res.text[:200]}")
         except Exception as e:
             logging.error(f"Error calling Gemini REST API: {e}")
 
     return None
 
 def ask_groq_direct(prompt):
-    """גיבוי ראשון: Groq API (Llama-3.3-70b)"""
+    """גיבוי ראשון: Groq API"""
     if not GROQ_API_KEY:
         return None
 
@@ -90,7 +96,7 @@ def ask_groq_direct(prompt):
     return None
 
 def ask_openai_direct(prompt):
-    """גיבוי שני: OpenAI API (GPT-4o-mini)"""
+    """גיבוי שני: OpenAI API"""
     if not OPENAI_API_KEY:
         return None
 
@@ -119,21 +125,16 @@ def ask_openai_direct(prompt):
 
 def ask_ai_with_failover(prompt):
     """מנגנון קריאה מרכזי המעביר בקשות בין ספקים באופן שקוף"""
-    # 1. ניסיון ראשי מול Gemini
     res = ask_gemini_direct(prompt)
     if res:
         return res
 
     logging.info("Gemini failed. Falling back to Groq...")
-    
-    # 2. גיבוי ראשון מול Groq
     res = ask_groq_direct(prompt)
     if res:
         return res
 
     logging.info("Groq failed. Falling back to OpenAI...")
-
-    # 3. גיבוי שני מול OpenAI
     res = ask_openai_direct(prompt)
     if res:
         return res
@@ -197,6 +198,7 @@ def telegram_webhook():
 
 def analyze_technical_deep(ticker):
     try:
+        ticker = ticker.upper().strip()
         stock = yf.Ticker(ticker)
         df = stock.history(period="100d", interval="1d")
         if df.empty or len(df) < 20:
@@ -241,7 +243,7 @@ def analyze_technical_deep(ticker):
         recommendation = "🟢 **מומלץ לכניסה (איתות חיובי)**" if is_quality_breakout else "🟡 **ניטרלי / המתנה**"
 
         return {
-            "ticker": ticker.upper(),
+            "ticker": ticker,
             "score": score,
             "is_breakout": is_quality_breakout,
             "recommendation": recommendation,
@@ -307,9 +309,18 @@ def scan_breaking_news_events():
                 send_alert(tick, tech_data)
 
 def analyze_single_ticker_news(ticker):
+    ticker = ticker.strip().upper()
     clean_ticker = ticker.replace('.TA', '')
-    query = f"{clean_ticker}+stock" if not ticker.endswith('.TA') else f"{clean_ticker}+אל+על"
-    rss_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    
+    if ticker.endswith('.TA'):
+        search_query = f"{clean_ticker} stock ISRAEL"
+        hl_param, gl_param, ceid_param = "he", "IL", "IL:he"
+    else:
+        search_query = f"{clean_ticker} stock news"
+        hl_param, gl_param, ceid_param = "en-US", "US", "US:en"
+
+    encoded_query = urllib.parse.quote(search_query)
+    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl={hl_param}&gl={gl_param}&ceid={ceid_param}"
 
     try:
         resp = requests.get(rss_url, headers=HEADERS, timeout=10)
@@ -360,12 +371,12 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
     sl = tech_data["sl"]
     rec = tech_data["recommendation"]
     score = tech_data["score"]
-    currency = "₪" if ".TA" in ticker else "$"
+    currency = "₪" if ".TA" in ticker.upper() else "$"
 
     reasons_text = "\n".join([f"  • {r}" for r in tech_data["reasons"]]) if tech_data["reasons"] else "  • ללא אינדיקטור מיוחד"
 
     msg = (
-        f"📊 **ניתוח איתות - {ticker}** (ציון איכות: {score}/100)\n\n"
+        f"📊 **ניתוח איתות - {ticker.upper()}** (ציון איכות: {score}/100)\n\n"
         f"📣 **המלצה:** {rec}\n\n"
         f"💡 **פרמטרים שנבדקו:**\n"
         f"{reasons_text}\n\n"
@@ -377,8 +388,8 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
     )
 
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker}_{entry}_{sl}_{tp}"))
-    keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.replace('.TA','')}") )
+    keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker.upper()}_{entry}_{sl}_{tp}"))
+    keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.upper().replace('.TA','')}") )
 
     bot.send_message(dest_id, msg, parse_mode="Markdown", reply_markup=keyboard)
 
@@ -476,17 +487,17 @@ def handle_all_messages(message):
         if len(parts) < 2:
             bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/tech NVDA`", parse_mode="Markdown")
             return
-        ticker = parts[1].upper()
-        bot.reply_to(message, f"🔍 מריץ ניתוח טכני עבור `{ticker}`...", parse_mode="Markdown")
+        ticker = parts[1]
+        bot.reply_to(message, f"🔍 מריץ ניתוח טכני עבור `{ticker.upper()}`...", parse_mode="Markdown")
         tech_data = analyze_technical_deep(ticker)
         send_alert(ticker=ticker, tech_data=tech_data, target_chat_id=message.chat.id)
     elif text.startswith('/news_scan'):
         parts = text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
+            bot.reply_to(message, "⚠️️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
             return
-        ticker = parts[1].upper()
-        bot.reply_to(message, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker}`...", parse_mode="Markdown")
+        ticker = parts[1]
+        bot.reply_to(message, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker.upper()}`...", parse_mode="Markdown")
         res = analyze_single_ticker_news(ticker)
         bot.reply_to(message, res, parse_mode="Markdown")
     elif text.startswith('/test_news'):
