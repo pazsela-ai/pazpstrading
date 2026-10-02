@@ -9,6 +9,8 @@ import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
 import feedparser
+from datetime import datetime
+import pytz
 from flask import Flask, request
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -27,17 +29,22 @@ app = Flask(__name__)
 
 user_states = {}
 last_processed_news_titles = set()
-last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
+sent_ticker_cooldowns = {}  # {ticker: timestamp} לשמירת צינון התראות (6 שעות)
+MIN_DAILY_VOLUME_USD = 500000  # סף נזילות מינימלי בדולרים/שקלים
 
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
-WATCHLIST = [
-    "ELAL.TA", "ISRA.TA", "CAMT.TA", "NICE.TA", "TLRD.TA", "ENLT.TA", "NWM.TA", "ESLT.TA",
-    "NVDA", "TSLA", "AMD", "MRNA", "PFE", "DAL", "LMT", "AAPL", "MSFT", "AMZN", "META"
+BROAD_NEWS_FEEDS = [
+    "http://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=airline+flight+cancellation+conflict+defense+war&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%91%D7%99%D7%98%D7%95%D7%9C+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%91%D7%97%D7%95%D7%9F+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he",
+    "https://www.globenewswire.com/rss/feed/subject/pharmaceuticals",
+    "https://news.google.com/rss/search?q=clinical+trial+FDA+approval+phase+cancer+vaccine&hl=en-US&gl=US&ceid=US:en"
 ]
 
 # ---------------------------------------------------------
-# 1. AI ENGINES (FAILOVER)
+# 1. AI ENGINES
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
@@ -107,118 +114,109 @@ def safe_send_message(chat_id, text, reply_markup=None):
         bot.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
 
 # ---------------------------------------------------------
-# 2. TECHNICAL & PRICE ENGINE
+# 2. MARKET HOURS & LIQUIDITY FILTERS
 # ---------------------------------------------------------
 
-def get_stock_price_data(ticker):
+def check_market_status(ticker):
+    """בדיקת שעות וימי מסחר מדויקים לפי שעון ישראל עבור תל אביב וניו יורק"""
+    tz_il = pytz.timezone('Asia/Jerusalem')
+    now = datetime.now(tz_il)
+    weekday = now.weekday() # 0=שני, 1=שלישי ... 5=שישי, 6=שבת
+    current_time = now.time()
+
+    # 1. הבורסה בתל אביב (TASE)
+    if ticker.upper().endswith(".TA"):
+        if weekday in [4, 5]: # שישי/שבת סגור
+            return "🔒 הבורסה בתל אביב סגורה (סוף שבוע)"
+        
+        if weekday == 6: # יום ראשון
+            start_time = datetime.strptime("10:00", "%H:%M").time()
+            end_time = datetime.strptime("16:30", "%H:%M").time()
+        elif weekday == 3: # יום חמישי
+            start_time = datetime.strptime("09:59", "%H:%M").time()
+            end_time = datetime.strptime("16:45", "%H:%M").time()
+        else: # ימים שני, שלישי, רביעי
+            start_time = datetime.strptime("09:59", "%H:%M").time()
+            end_time = datetime.strptime("17:15", "%H:%M").time()
+
+        if start_time <= current_time <= end_time:
+            return "🟢 המסחר בתל אביב פעיל כעת (רציף)"
+        return "🌙 הבורסה בתל אביב סגורה כעת (הוראה ממתינה לפתיחה)"
+
+    # 2. הבורסה בארה"ב (NYSE / NASDAQ)
+    else:
+        if weekday in [5, 6]: # שבת/ראשון סגור
+            return "🔒 הבורסה בארה\"ב סגורה (סוף שבוע)"
+
+        pre_market_start = datetime.strptime("11:00", "%H:%M").time()
+        main_market_start = datetime.strptime("16:30", "%H:%M").time()
+        main_market_end = datetime.strptime("23:00", "%H:%M").time()
+
+        if main_market_start <= current_time <= main_market_end:
+            return "🟢 המסחר בארה\"ב פעיל כעת (שעות רגילות)"
+        elif pre_market_start <= current_time < main_market_start:
+            return "🟡 מסחר מוקדם בארה\"ב (Pre-Market פעיל)"
+        return "🌙 הבורסה בארה\"ב סגורה כעת (הוראה ממתינה ל-Pre-Market / פתיחה)"
+
+def check_liquidity_and_price(ticker, impact_level="MEDIUM"):
+    """בדיקת נזילות וחישוב מחירי יעד דינמיים לפי עוצמת האירוע"""
     try:
         ticker = ticker.upper().strip()
         stock = yf.Ticker(ticker)
         df = stock.history(period="60d", interval="1d")
         if df.empty or len(df) < 5:
-            return None
+            return None, "נתונים לא מספיקים"
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
         latest = df.iloc[-1]
         current_price = float(latest['Close'])
-        atr_val = float(latest['ATR']) if ('ATR' in df and not pd.isna(latest['ATR'])) else current_price * 0.03
+        avg_volume = df['Volume'].tail(20).mean()
+        dollar_volume = avg_volume * current_price
+
+        if dollar_volume < MIN_DAILY_VOLUME_USD:
+            return None, f"נזילות נמוכה מדי (מחזור יומי ממוצע: {int(dollar_volume):,} בלבד)"
+
+        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        atr_val = float(df['ATR'].iloc[-1]) if ('ATR' in df and not pd.isna(df['ATR'].iloc[-1])) else current_price * 0.03
 
         entry_price = round(current_price * 1.002, 2)
-        tp_price = round(entry_price + (atr_val * 2.0), 2)
         sl_price = round(entry_price - (atr_val * 1.2), 2)
+
+        if impact_level == "HIGH":
+            tp1_price = round(entry_price + (atr_val * 2.0), 2)
+            tp2_price = round(entry_price + (atr_val * 4.0), 2)
+        else:
+            tp1_price = round(entry_price + (atr_val * 2.0), 2)
+            tp2_price = None
 
         return {
             "current_price": round(current_price, 2),
             "entry_price": entry_price,
-            "tp": tp_price,
             "sl": sl_price,
-            "atr": atr_val
-        }
+            "tp1": tp1_price,
+            "tp2": tp2_price,
+            "atr": atr_val,
+            "dollar_volume": dollar_volume
+        }, "OK"
     except Exception as e:
-        logging.error(f"Error fetching stock data for {ticker}: {e}")
-        return None
-
-def analyze_technical_deep(ticker):
-    try:
-        ticker = ticker.upper().strip()
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="100d", interval="1d")
-        if df.empty or len(df) < 20:
-            return None
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        df['EMA20'] = ta.ema(df['Close'], length=20)
-        df['EMA50'] = ta.ema(df['Close'], length=min(50, len(df)-1))
-        df['RSI'] = ta.rsi(df['Close'], length=14)
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        df['VOL_SMA20'] = ta.sma(df['Volume'], length=20)
-
-        latest = df.iloc[-1]
-        current_price = float(latest['Close'])
-        atr_val = float(latest['ATR']) if ('ATR' in df and not pd.isna(latest['ATR'])) else current_price * 0.03
-        rsi_val = float(latest['RSI']) if ('RSI' in df and not pd.isna(latest['RSI'])) else 50.0
-        ema20 = float(latest['EMA20']) if ('EMA20' in df and not pd.isna(latest['EMA20'])) else current_price
-        ema50 = float(latest['EMA50']) if ('EMA50' in df and not pd.isna(latest['EMA50'])) else current_price
-        vol_now = float(latest['Volume']) if 'Volume' in df else 0
-        vol_avg = float(latest['VOL_SMA20']) if ('VOL_SMA20' in df and not pd.isna(latest['VOL_SMA20'])) else 1
-
-        score = 0
-        reasons = []
-
-        if current_price >= ema20 >= ema50:
-            score += 30
-            reasons.append("מגמה עולה: מחיר מעל EMA20 ומעל EMA50")
-        if 48 <= rsi_val <= 68:
-            score += 35
-            reasons.append(f"מומנטום בריא: RSI ברמה של {rsi_val:.1f}")
-        if vol_avg > 0 and vol_now > (vol_avg * 1.1):
-            score += 35
-            reasons.append(f"נפח מסחר מוגבר ({int(vol_now/vol_avg*100)}% מהממוצע)")
-
-        entry_price = round(current_price * 1.005, 2)
-        tp_price = round(entry_price + (atr_val * 2.0), 2)
-        sl_price = round(entry_price - (atr_val * 1.2), 2)
-
-        is_quality_breakout = score >= 60
-        recommendation = "🟢 **מומלץ לכניסה (איתות חיובי)**" if is_quality_breakout else "🟡 **ניטרלי / המתנה**"
-
-        return {
-            "ticker": ticker,
-            "score": score,
-            "is_breakout": is_quality_breakout,
-            "recommendation": recommendation,
-            "current_price": round(current_price, 2),
-            "entry_price": entry_price,
-            "tp": tp_price,
-            "sl": sl_price,
-            "rsi": round(rsi_val, 1),
-            "reasons": reasons
-        }
-    except Exception as e:
-        logging.error(f"Error deep analyzing {ticker}: {e}")
-        return None
+        logging.error(f"Error checking liquidity for {ticker}: {e}")
+        return None, str(e)
 
 # ---------------------------------------------------------
-# 3. PER-TICKER ISOLATED NEWS SCANNER & AI ENGINE
+# 3. PER-TICKER ISOLATED NEWS SCANNER
 # ---------------------------------------------------------
 
-BROAD_NEWS_FEEDS = [
-    "http://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=airline+flight+cancellation+conflict+defense+war&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%91%D7%99%D7%98%D7%95%D7%9C+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%91%D7%97%D7%95%D7%9F+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he",
-    "https://www.globenewswire.com/rss/feed/subject/pharmaceuticals",
-    "https://news.google.com/rss/search?q=clinical+trial+FDA+approval+phase+cancer+vaccine&hl=en-US&gl=US&ceid=US:en"
-]
+def is_in_cooldown(ticker):
+    """מניעת התראות חוזרות באותו חלון זמן (6 שעות)"""
+    now = time.time()
+    if ticker in sent_ticker_cooldowns:
+        if now - sent_ticker_cooldowns[ticker] < 21600:
+            return True
+    return False
 
 def scan_breaking_news_events():
-    """סריקת חדשות, חילוץ מניות, ויצירת ניתוח + תכנית עבודה נפרדת לחלוטין לכל מניה"""
-    last_scans["news"] = time.strftime("%Y-%m-%d %H:%M:%S")
     if not CHAT_ID:
         return
 
@@ -239,24 +237,24 @@ def scan_breaking_news_events():
     if not articles:
         return
 
-    # שלב 1: ה-AI מזהה מניות מושפעות ומקשר בינן לבין הידיעות הרלוונטיות בלבד (בפורמט JSON)
     prompt = (
         "אנליסט פיננסי, עיין ברשימת הידיעות החדשותיות:\n"
         + json.dumps(articles, ensure_ascii=False) +
         "\n\nזהה מניות ספציפיות (סימולים באנגלית, למשל ELAL.TA, MRNA, LMT, XOM) שיש לגביהן אירוע משמעותי.\n"
+        "דרג את עוצמת האירוע (impact_level) כ- HIGH (אם מדובר בדרמה אקטואלית/ניסוי קריטי/אירוע מלחמה) או MEDIUM/LOW.\n"
         "החזר JSON בלבד במבנה הבא (ללא טקסט נוסף):\n"
         "{\n"
         '  "tickers": [\n'
         '    {\n'
         '      "ticker": "ELAL.TA",\n'
+        '      "impact_level": "HIGH",\n'
         '      "relevant_news": [{"title": "כותרת שרלוונטית רק לה", "link": "קישור"}],\n'
         '      "analysis": "ניתוח ממוקד בעברית מדוע המניה ספציפית זו מושפעת",\n'
         '      "action": "כניסה / המתנה / יציאה",\n'
-        '      "reason": "הסבר מפורט למה להיכנס או להמתין כולל אזהרת FOMO במידת הצורך"\n'
+        '      "reason": "הסבר מפורט כולל אזהרת FOMO במידת הצורך"\n'
         '    }\n'
         '  ]\n'
         "}\n"
-        "אם אין מניות שמשופעות באופן ישיר, החזר: {\"tickers\": []}"
     )
 
     ai_res = ask_ai_with_failover(prompt)
@@ -264,15 +262,21 @@ def scan_breaking_news_events():
         return
 
     try:
-        # חילוץ קוד ה-JSON מתוך התגובה
         json_match = re.search(r'\{.*\}', ai_res, re.DOTALL)
         if not json_match:
             return
         parsed_data = json.loads(json_match.group(0))
-        
+
         for item in parsed_data.get("tickers", []):
+            ticker = item["ticker"].upper().strip()
+
+            if is_in_cooldown(ticker):
+                logging.info(f"Skipping {ticker} due to active 6h cooldown.")
+                continue
+
             send_per_ticker_news_alert(
-                ticker=item["ticker"],
+                ticker=ticker,
+                impact_level=item.get("impact_level", "MEDIUM"),
                 relevant_news=item.get("relevant_news", []),
                 analysis=item.get("analysis", ""),
                 action=item.get("action", "המתנה"),
@@ -282,149 +286,60 @@ def scan_breaking_news_events():
     except Exception as e:
         logging.error(f"Failed to parse news JSON response: {e}")
 
-def send_per_ticker_news_alert(ticker, relevant_news, analysis, action, reason, target_chat_id):
-    """שליחת התראה נפרדת ומבודדת למניה יחידה עם תכנית עבודה ואסמכתאות"""
+def send_per_ticker_news_alert(ticker, impact_level, relevant_news, analysis, action, reason, target_chat_id):
     ticker = ticker.upper().strip()
-    price_data = get_stock_price_data(ticker)
+
+    price_data, status_msg = check_liquidity_and_price(ticker, impact_level)
+
+    if not price_data:
+        logging.info(f"Filtered out {ticker}: {status_msg}")
+        return
+
+    sent_ticker_cooldowns[ticker] = time.time()
+    market_status = check_market_status(ticker)
     currency = "₪" if ".TA" in ticker else "$"
 
-    # 1. כותרת ייעודית למניה
-    msg = f"📰 **ניתוח אירוע חדשותי ותכנית מסחר: {ticker}**\n\n"
+    msg = f"📰 **ניתוח אירוע חדשותי ותכנית מסחר: {ticker}**\n"
+    msg += f"⏰ **מצב שוק:** {market_status}\n"
+    msg += f"🔥 **עוצמת אירוע:** `{impact_level}`\n\n"
 
-    # 2. אסמכתאות (קישורים לידיעות החדשותיות שהשפיעו עליה)
     msg += "🔗 **אסמכתאות וידיעות רלוונטיות:**\n"
     for news in relevant_news:
-        title = news.get("title", "ידיעה חדשותית")
-        link = news.get("link", "#")
-        msg += f"• [{title}]({link})\n"
+        msg += f"• [{news.get('title', 'ידיעה חדשותית')}]({news.get('link', '#')})\n"
     msg += "\n"
 
-    # 3. ניתוח AI ממוקד למניה הזו בלבד
     msg += f"💡 **ניתוח המשמעות למניה:**\n{analysis}\n\n"
 
-    # 4. תכנית עבודה ייעודית (האם להיכנס/לצאת/מחירים)
     msg += f"📋 **תכנית עבודה ייעודית:**\n"
     msg += f"• **המלצה:** {action}\n"
     msg += f"• **נימוק:** {reason}\n\n"
 
-    if price_data:
-        entry = price_data["entry_price"]
-        tp = price_data["tp"]
-        sl = price_data["sl"]
+    entry = price_data["entry_price"]
+    tp1 = price_data["tp1"]
+    tp2 = price_data["tp2"]
+    sl = price_data["sl"]
 
-        msg += (
-            f"🎯 **פרמטרי פוזיציה מוצעים:**\n"
-            f"• מחיר שוק נוכחי: {currency}{price_data['current_price']}\n"
-            f"• מחיר כניסה מומלץ (Limit): {currency}{entry}\n"
-            f"• יעד רווח (TP): {currency}{tp}\n"
-            f"• סטופ לוס (SL): {currency}{sl}\n"
-        )
+    msg += (
+        f"🎯 **פרמטרי פוזיציה מוצעים (R:R דינמי):**\n"
+        f"• מחיר נוכחי: {currency}{price_data['current_price']}\n"
+        f"• כניסה מומלץ (Limit): {currency}{entry}\n"
+        f"• יעד רווח 1 (TP1): {currency}{tp1}\n"
+    )
 
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker}_{entry}_{sl}_{tp}"))
-        keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.replace('.TA','')}") )
-        safe_send_message(target_chat_id, msg, reply_markup=keyboard)
-    else:
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.replace('.TA','')}") )
-        safe_send_message(target_chat_id, msg, reply_markup=keyboard)
+    if tp2:
+        msg += f"• יעד רווח 2 מורחב (TP2): {currency}{tp2} (למיקסום גל עליות)\n"
 
-def analyze_single_ticker_news(ticker, chat_id=None):
-    """ניתוח חדשות לפי דרישת משתמש (/news_scan TICKER)"""
-    ticker = ticker.strip().upper()
-    clean_ticker = ticker.replace('.TA', '')
-    
-    if ticker.endswith('.TA'):
-        search_query = f"{clean_ticker} stock ISRAEL"
-        hl_param, gl_param, ceid_param = "he", "IL", "IL:he"
-    else:
-        search_query = f"{clean_ticker} stock news"
-        hl_param, gl_param, ceid_param = "en-US", "US", "US:en"
+    msg += f"• סטופ לוס (SL): {currency}{sl}\n"
 
-    encoded_query = urllib.parse.quote(search_query)
-    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl={hl_param}&gl={gl_param}&ceid={ceid_param}"
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker}_{entry}_{sl}_{tp1}"))
+    keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.replace('.TA','')}") )
 
-    try:
-        resp = requests.get(rss_url, headers=HEADERS, timeout=10)
-        feed = feedparser.parse(resp.content)
-        
-        relevant_news = [{"title": e.title, "link": e.link} for e in feed.entries[:4] if hasattr(e, 'title')]
-
-        if not relevant_news:
-            return f"ℹ️ לא נמצאו כתבות חדשותיות אחרונות עבור `{ticker}`."
-
-        prompt = (
-            f"אתה אנליסט פיננסי. נתח את הידיעות החדשותיות הבאות עבור מניית {ticker}:\n"
-            + json.dumps(relevant_news, ensure_ascii=False) +
-            "\n\nהחזר תשובה ב-JSON בלבד במבנה הבא:\n"
-            "{\n"
-            f'  "analysis": "ניתוח קצר וממוקד בעברית למניית {ticker}",\n'
-            '  "action": "כניסה / המתנה / יציאה",\n'
-            '  "reason": "נימוק האם להכנס/לצאת ואזהרת FOMO במידת הצורך"\n'
-            "}"
-        )
-        
-        ai_res = ask_ai_with_failover(prompt)
-        if ai_res:
-            json_match = re.search(r'\{.*\}', ai_res, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group(0))
-                send_per_ticker_news_alert(
-                    ticker=ticker,
-                    relevant_news=relevant_news,
-                    analysis=data.get("analysis", ""),
-                    action=data.get("action", "המתנה"),
-                    reason=data.get("reason", ""),
-                    target_chat_id=chat_id or CHAT_ID
-                )
-                return None
-        return "❌ לא ניתן היה להשלים את הניתוח כעת."
-    except Exception as e:
-        logging.error(f"Error in analyze_single_ticker_news: {e}")
-        return f"❌ שגיאה בניתוח חדשות: {e}"
+    safe_send_message(target_chat_id, msg, reply_markup=keyboard)
 
 # ---------------------------------------------------------
 # 4. TELEGRAM CALLBACKS & BOT HANDLERS
 # ---------------------------------------------------------
-
-def send_alert(ticker, tech_data=None, target_chat_id=None):
-    dest_id = target_chat_id or CHAT_ID
-    if not dest_id:
-        return
-
-    if not tech_data:
-        tech_data = analyze_technical_deep(ticker)
-
-    if not tech_data:
-        safe_send_message(dest_id, f"❌ לא ניתן לשלוף נתונים עבור `{ticker}`.")
-        return
-
-    entry = tech_data["entry_price"]
-    tp = tech_data["tp"]
-    sl = tech_data["sl"]
-    rec = tech_data["recommendation"]
-    score = tech_data["score"]
-    currency = "₪" if ".TA" in ticker.upper() else "$"
-
-    reasons_text = "\n".join([f"  • {r}" for r in tech_data["reasons"]]) if tech_data["reasons"] else "  • ללא אינדיקטור מיוחד"
-
-    msg = (
-        f"📊 **ניתוח איתות טכני - {ticker.upper()}** (ציון: {score}/100)\n\n"
-        f"📣 **המלצה:** {rec}\n\n"
-        f"💡 **פרמטרים שנבדקו:**\n"
-        f"{reasons_text}\n\n"
-        f"🎯 **תכנית עבודה מוצעת:**\n"
-        f"• מחיר נוכחי: {currency}{tech_data['current_price']}\n"
-        f"• מחיר כניסה מומלץ (Limit): {currency}{entry}\n"
-        f"• יעד רווח (TP): {currency}{tp}\n"
-        f"• סטופ לוס (SL): {currency}{sl}\n"
-    )
-
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker.upper()}_{entry}_{sl}_{tp}"))
-    keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.upper().replace('.TA','')}") )
-
-    safe_send_message(dest_id, msg, reply_markup=keyboard)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('trade_'))
 def handle_trade_click(call):
@@ -481,7 +396,7 @@ def handle_all_messages(message):
                 f"• **סטופ לוס (SL):** {curr_symbol}{sl} (סיכון של {curr_symbol}{risk_per_share:.2f} למניה)\n\n"
                 f"👉 **כדי לסכן בדיוק {curr_symbol}{risk_amount} - עליך לקנות:** `{shares_count}` מניות\n"
                 f"• **שווי פוזיציה כולל:** {curr_symbol}{total_cost}\n"
-                f"• **רווח פוטנציאלי ביעד (TP):** {curr_symbol}{potential_profit}\n"
+                f"• **רווח פוטנציאלי ביעד (TP1):** {curr_symbol}{potential_profit}\n"
             )
             safe_send_message(message.chat.id, calc_msg)
             return
@@ -490,17 +405,9 @@ def handle_all_messages(message):
             return
 
     if text.startswith('/start'):
-        safe_send_message(message.chat.id, "🟢 **הבוט PazPSTrading פעיל ומעודכן!**\nהקש `/tech NVDA` או `/news_scan ELAL.TA` לבדיקה.")
-    elif text.startswith('/news_scan'):
-        parts = text.split()
-        if len(parts) < 2:
-            safe_send_message(message.chat.id, "⚠ יש לציין סימול מניה. לדוגמה: `/news_scan ELAL.TA`")
-            return
-        safe_send_message(message.chat.id, f"🔎 מריץ ניתוח חדשות מבודד עבור `{parts[1].upper()}`...")
-        res = analyze_single_ticker_news(parts[1], chat_id=message.chat.id)
-        if res: safe_send_message(message.chat.id, res)
+        safe_send_message(message.chat.id, "🟢 **הבוט PazPSTrading פעיל ומעודכן כולל מסנני נזילות ושעות מסחר!**")
     elif text.startswith('/test_news'):
-        safe_send_message(message.chat.id, "📰 מריץ סריקת אירועים מבודדת לכל מניה...")
+        safe_send_message(message.chat.id, "📰 מריץ סריקת אירועים מעודכנת...")
         scan_breaking_news_events()
 
 # ---------------------------------------------------------
@@ -509,7 +416,7 @@ def handle_all_messages(message):
 
 @app.route('/')
 def home():
-    return "OK - Per-Ticker Isolated Event Trading Bot Active!", 200
+    return "OK - Advanced Event Trading Bot Active!", 200
 
 @app.route('/init_webhook', methods=['GET', 'POST'])
 def init_webhook():
