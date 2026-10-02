@@ -44,7 +44,6 @@ def ask_gemini_direct(prompt):
         logging.error("GEMINI_API_KEY is missing!")
         return None
 
-    # נקודות קצה מעודכנות ומודלים נתמכים ב-v1beta
     endpoints = [
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
@@ -83,7 +82,6 @@ def ask_groq_direct(prompt):
         "Content-Type": "application/json"
     }
     
-    # מודלים פעילים ב-Groq
     groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     
     for model in groq_models:
@@ -98,8 +96,6 @@ def ask_groq_direct(prompt):
             if res.status_code == 200:
                 data = res.json()
                 return data['choices'][0]['message']['content'].strip()
-            else:
-                logging.warning(f"Groq API Error [{res.status_code}] ({model}): {res.text[:150]}")
         except Exception as e:
             logging.error(f"Error calling Groq API ({model}): {e}")
 
@@ -125,8 +121,6 @@ def ask_openai_direct(prompt):
         if res.status_code == 200:
             data = res.json()
             return data['choices'][0]['message']['content'].strip()
-        else:
-            logging.warning(f"OpenAI API Error [{res.status_code}]: {res.text[:150]}")
     except Exception as e:
         logging.error(f"Error calling OpenAI API: {e}")
 
@@ -147,10 +141,9 @@ def ask_ai_with_failover(prompt):
     if res:
         return res
 
-    return "❌ שגיאה: כל ספקי ה-AI (Gemini, Groq, OpenAI) אינם זמינים כעת. אנא בדוק/י מפתחות API ומכסות."
+    return "❌ שגיאה: כל ספקי ה-AI אינם זמינים כעת."
 
 def safe_send_message(chat_id, text, reply_markup=None):
-    """שליחה בטוחה המונעת קריסה עקב תווי Markdown לא תקינים מה-AI"""
     try:
         bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup)
     except Exception as e:
@@ -167,7 +160,7 @@ def setup_bot_commands():
             types.BotCommand("start", "הפעלת הבוט ותפריט ראשי"),
             types.BotCommand("status", "בדיקת סטטוס מערכת"),
             types.BotCommand("tech", "ניתוח טכני מעמיק (למשל /tech NVDA)"),
-            types.BotCommand("news_scan", "ניתוח חדשות AI (למשל /news_scan NVDA)"),
+            types.BotCommand("news_scan", "ניתוח חדשות + תכנית מסחר (למשל /news_scan ELAL.TA)"),
             types.BotCommand("test_news", "הרצת בדיקת חדשות לייב"),
             types.BotCommand("test_tech", "הרצת בדיקה טכנית בלייב"),
             types.BotCommand("portfolio", "מעקב תיק מניות")
@@ -209,8 +202,40 @@ def telegram_webhook():
     return 'Forbidden', 403
 
 # ---------------------------------------------------------
-# 3. TECHNICAL ENGINE & WATCHLIST SCANNER
+# 3. TECHNICAL & PRICE ENGINE
 # ---------------------------------------------------------
+
+def get_stock_price_data(ticker):
+    """שליפת מחירי שוק נזילים וחישוב פרמטרים של תכנית עבודה"""
+    try:
+        ticker = ticker.upper().strip()
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="60d", interval="1d")
+        if df.empty or len(df) < 5:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        latest = df.iloc[-1]
+        current_price = float(latest['Close'])
+        atr_val = float(latest['ATR']) if ('ATR' in df and not pd.isna(latest['ATR'])) else current_price * 0.03
+
+        entry_price = round(current_price * 1.002, 2)
+        tp_price = round(entry_price + (atr_val * 2.0), 2)
+        sl_price = round(entry_price - (atr_val * 1.2), 2)
+
+        return {
+            "current_price": round(current_price, 2),
+            "entry_price": entry_price,
+            "tp": tp_price,
+            "sl": sl_price,
+            "atr": atr_val
+        }
+    except Exception as e:
+        logging.error(f"Error fetching stock data for {ticker}: {e}")
+        return None
 
 def analyze_technical_deep(ticker):
     try:
@@ -286,7 +311,7 @@ def scan_watchlist_technical():
             logging.error(f"Error in watchlist scan for {ticker}: {e}")
 
 # ---------------------------------------------------------
-# 4. EXPANDED BROAD EVENT-DRIVEN NEWS ENGINE
+# 4. EVENT-DRIVEN NEWS ENGINE
 # ---------------------------------------------------------
 
 BROAD_NEWS_FEEDS = [
@@ -299,6 +324,7 @@ BROAD_NEWS_FEEDS = [
 ]
 
 def scan_breaking_news_events():
+    """סריקה אוטומטית - מקפיצה התרעה מיידית ע"פ החדשות ללא תלות בניתוח טכני"""
     last_scans["news"] = time.strftime("%Y-%m-%d %H:%M:%S")
     if not CHAT_ID:
         return
@@ -321,30 +347,26 @@ def scan_breaking_news_events():
 
     prompt = (
         "אתה אנליסט פיננסי בכיר ומסוחר אירועים (Event-Driven Trader).\n"
-        "קרא את כותרות החדשות והדיווחים הבאים שנאספו כעת בזמן אמת:\n"
+        "קרא את כותרות החדשות הבאות שנאספו כעת בזמן אמת:\n"
         + "\n".join([f"- {t}" for t in collected_articles]) +
         "\n\nתפקידך לסווג את הידיעות ולחלץ המלצות מסחר מעשיות:\n"
-        "1. **סיווג אירועים קריטיים:** זהה אם יש אירוע מהותי (ניסוי קליני/FDA, עסקאות M&A, אירועים ביטחוניים/תעופתיים, רגולציה/דוחות 8-K, סייבר, שרשרת אספקה).\n"
-        "2. **זיהוי מניות מושפעות:** רשום מפורשות סימולי מניות באנגלית (לדוגמה: MRNA, ELAL.TA, ESLT.TA, DAL, NVDA, PFE).\n"
-        "3. **המלצת השקעה ומסחר:** לכל מניה שזוהתה, ספק המלצה ברורה:\n"
-        "   - **כיוון פוזיציה:** (קנייה / שורט / מעקב בלבד)\n"
-        "   - **אופק זמן:** (מסחר יומי, סווינג לטווח קצר, השקעה לטווח בינוני)\n"
-        "   - **רציונל וטריגר לכניסה:** הסבר קצר מדוע האירוע יוצר הזדמנות מסחר ומהו התנאי לכניסה.\n\n"
-        "אם אין אף אירוע דרמטי בעל השפעה מסחרית ישירה, ענה בדיוק: 'אין אירוע קריטי'."
+        "1. **זהה אירועים קריטיים:** ניסוי קליני/FDA, עסקאות M&A, אירועים ביטחוניים/תעופתיים, רגולציה.\n"
+        "2. **חלץ מניות מושפעות:** רשום מפורשות סימולים באנגלית (למשל: MRNA, ELAL.TA, ESLT.TA, DAL, NVDA).\n"
+        "3. **המלצת מסחר ורציונל:** ספק נימוק קצר מדוע יש פוטנציאל השקעה.\n"
+        "שים לב: אם המניה כבר רשמה ענייה חדה, הזהר מכניסה מוקדמת והמלץ על כניסה זהירה.\n\n"
+        "אם אין אף אירוע דרמטי, ענה בדיוק: 'אין אירוע קריטי'."
     )
 
     ai_text = ask_ai_with_failover(prompt)
     if "אין אירוע קריטי" not in ai_text and "❌" not in ai_text:
-        msg = f"🚨 **איתות אירוע מתפרץ + המלצת השקעה!**\n\n{ai_text}"
-        safe_send_message(CHAT_ID, msg)
-        
         found_tickers = re.findall(r'\b[A-Z]{2,5}(?:\.TA)?\b', ai_text)
+        
+        # שליחת ההתרעה המיידית של החדשות ללא תלות בציון טכני
         for tick in set(found_tickers):
-            tech_data = analyze_technical_deep(tick)
-            if tech_data:
-                send_alert(tick, tech_data)
+            send_news_trade_alert(tick, ai_text, CHAT_ID)
 
-def analyze_single_ticker_news(ticker):
+def analyze_single_ticker_news(ticker, chat_id=None):
+    """ניתוח חדשות נקודתי בתוספת תכנית עבודה מספרית וכפתורי חישוב סיכון"""
     ticker = ticker.strip().upper()
     clean_ticker = ticker.replace('.TA', '')
     
@@ -360,10 +382,8 @@ def analyze_single_ticker_news(ticker):
 
     try:
         resp = requests.get(rss_url, headers=HEADERS, timeout=10)
-        
         if resp.status_code != 200:
-            logging.error(f"Google News RSS status code: {resp.status_code}")
-            return f"⚠️ לא ניתן לשלוף חדשות מ-Google News כרגע (קוד שגיאה: {resp.status_code})."
+            return f"⚠️ לא ניתן לשלוף חדשות כרגע (קוד שגיאה: {resp.status_code})."
 
         feed = feedparser.parse(resp.content)
         items = [f"• {e.title}" for e in feed.entries[:5] if hasattr(e, 'title')]
@@ -372,20 +392,55 @@ def analyze_single_ticker_news(ticker):
             return f"ℹ️ לא נמצאו כתבות חדשותיות אחרונות עבור `{ticker}`."
 
         prompt = (
-            f"אתה אנליסט פיננסי. נתח בקצרה בעברית את הידיעות החדשותיות הבאות עבור מניית {ticker}:\n"
+            f"אתה אנליסט פיננסי בכיר. נתח בקצרה בעברית את הידיעות החדשותיות הבאות עבור מניית {ticker}:\n"
             + "\n".join(items) +
-            "\n\nספק סיכום קצר, הערכת השפעה על המחיר, והמלצת מסחר/השקעה מפורשת (קנייה / שורט / המתנה)."
+            "\n\nספק סיכום קצר, הערכת השפעה על המחיר, והמלצת מסחר. "
+            "אם המניה רשמה עלייה חדה בעקבות החדשות, ציין זאת במפורש והדגש האם עדיף להמתין לתיקון/כניסה בזהירות."
         )
         
         ai_text = ask_ai_with_failover(prompt)
         
         if ai_text and "❌" not in ai_text:
-            return f"📰 **סיכום חדשות והמלצת השקעה עבור {ticker}:**\n\n{ai_text}"
+            send_news_trade_alert(ticker, ai_text, chat_id)
+            return None
         return ai_text
 
     except Exception as e:
         logging.error(f"Error in analyze_single_ticker_news: {e}")
         return f"❌ שגיאה בניתוח חדשות: {e}"
+
+def send_news_trade_alert(ticker, ai_summary, target_chat_id=None):
+    """בניית התרעת חדשות הכוללת תכנית עבודה מספרית וכפתורי פעולה"""
+    dest_id = target_chat_id or CHAT_ID
+    if not dest_id:
+        return
+
+    price_data = get_stock_price_data(ticker)
+    currency = "₪" if ".TA" in ticker.upper() else "$"
+
+    msg = f"📰 **ניתוח חדשות + תכנית עבודה - {ticker.upper()}**\n\n{ai_summary}\n\n"
+
+    if price_data:
+        entry = price_data["entry_price"]
+        tp = price_data["tp"]
+        sl = price_data["sl"]
+        
+        msg += (
+            f"🎯 **תכנית עבודה מוצעת (מבוססת תנודתיות שוק):**\n"
+            f"• מחיר נוכחי: {currency}{price_data['current_price']}\n"
+            f"• מחיר כניסה מומלץ (Limit): {currency}{entry}\n"
+            f"• יעד רווח (TP): {currency}{tp}\n"
+            f"• סטופ לוס (SL): {currency}{sl}\n"
+        )
+
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker.upper()}_{entry}_{sl}_{tp}"))
+        keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.upper().replace('.TA','')}") )
+        safe_send_message(dest_id, msg, reply_markup=keyboard)
+    else:
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.upper().replace('.TA','')}") )
+        safe_send_message(dest_id, msg, reply_markup=keyboard)
 
 # ---------------------------------------------------------
 # 5. ALERT MESSAGING & CALLBACKS
@@ -413,7 +468,7 @@ def send_alert(ticker, tech_data=None, target_chat_id=None):
     reasons_text = "\n".join([f"  • {r}" for r in tech_data["reasons"]]) if tech_data["reasons"] else "  • ללא אינדיקטור מיוחד"
 
     msg = (
-        f"📊 **ניתוח איתות - {ticker.upper()}** (ציון איכות: {score}/100)\n\n"
+        f"📊 **ניתוח איתות טכני - {ticker.upper()}** (ציון: {score}/100)\n\n"
         f"📣 **המלצה:** {rec}\n\n"
         f"💡 **פרמטרים שנבדקו:**\n"
         f"{reasons_text}\n\n"
@@ -456,7 +511,7 @@ def handle_currency_select(call):
     }
 
     symbol = "$" if curr == "USD" else "₪"
-    safe_send_message(call.message.chat.id, f"✍️️ **אנא הקלד/י כעת בטרמינל את סכום הסיכון המבוקש ב-{symbol}:**\n(לדוגמה: 150 או 500)")
+    safe_send_message(call.message.chat.id, f"✍ **אנא הקלד/י כעת את סכום הסיכון המבוקש ב-{symbol}:**\n(לדוגמה: 150 או 500)")
     bot.answer_callback_query(call.id)
 
 # ---------------------------------------------------------
@@ -505,7 +560,7 @@ def handle_all_messages(message):
             return
 
     if text.startswith('/start') or text.startswith('/help'):
-        safe_send_message(message.chat.id, "🟢 **הבוט PazPSTrading מחובר ופעיל!**\nהקש `/tech NVDA` או `/news_scan NVDA` לבדיקה.")
+        safe_send_message(message.chat.id, "🟢 **הבוט PazPSTrading מחובר ופעיל!**\nהקש `/tech NVDA` או `/news_scan ELAL.TA` לבדיקה.")
     elif text.startswith('/status'):
         active_providers = []
         if GEMINI_API_KEY: active_providers.append("Gemini")
@@ -532,12 +587,13 @@ def handle_all_messages(message):
     elif text.startswith('/news_scan'):
         parts = text.split()
         if len(parts) < 2:
-            safe_send_message(message.chat.id, "⚠ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`")
+            safe_send_message(message.chat.id, "⚠ יש לציין סימול מניה. לדוגמה: `/news_scan ELAL.TA`")
             return
         ticker = parts[1]
         safe_send_message(message.chat.id, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker.upper()}`...")
-        res = analyze_single_ticker_news(ticker)
-        safe_send_message(message.chat.id, res)
+        res = analyze_single_ticker_news(ticker, chat_id=message.chat.id)
+        if res:
+            safe_send_message(message.chat.id, res)
     elif text.startswith('/test_news'):
         safe_send_message(message.chat.id, "📰 מריץ סריקת אירועים חדשותיים בלייב...")
         scan_breaking_news_events()
