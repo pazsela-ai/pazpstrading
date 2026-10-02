@@ -40,15 +40,15 @@ WATCHLIST = [
 # ---------------------------------------------------------
 
 def ask_gemini_direct(prompt):
-    """קריאה יציבה ל-Gemini API דרך נקודות קצה נתמכות בלבד"""
+    """קריאה יציבה ל-Gemini API דרך מודלים נתמכים ועדכניים"""
     if not GEMINI_API_KEY:
         logging.error("GEMINI_API_KEY is missing!")
         return None
 
-    endpoints = [
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
+    # מודלים נתמכים בלבד
+    gemini_models = [
+        "gemini-1.5-flash",
+        "gemini-1.5-pro"
     ]
     
     headers = {"Content-Type": "application/json"}
@@ -58,7 +58,8 @@ def ask_gemini_direct(prompt):
         }]
     }
 
-    for url in endpoints:
+    for model in gemini_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
         try:
             res = requests.post(url, json=payload, headers=headers, timeout=12)
             if res.status_code == 200:
@@ -67,14 +68,14 @@ def ask_gemini_direct(prompt):
                     text = data['candidates'][0]['content']['parts'][0]['text']
                     return text.strip()
             else:
-                logging.warning(f"Gemini API Error [{res.status_code}]: {res.text[:150]}")
+                logging.warning(f"Gemini API Error [{res.status_code}] ({model}): {res.text[:150]}")
         except Exception as e:
-            logging.error(f"Error calling Gemini REST API: {e}")
+            logging.error(f"Error calling Gemini REST API ({model}): {e}")
 
     return None
 
 def ask_groq_direct(prompt):
-    """גיבוי ראשון: Groq API"""
+    """גיבוי ראשון: Groq API עם מודלים פעילים מעודכנים"""
     if not GROQ_API_KEY:
         return None
 
@@ -84,7 +85,12 @@ def ask_groq_direct(prompt):
         "Content-Type": "application/json"
     }
     
-    groq_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+    # מודלים עדכניים שפעילים כעת ב-Groq
+    groq_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama3-8b-8192"
+    ]
     
     for model in groq_models:
         payload = {
@@ -290,7 +296,7 @@ BROAD_NEWS_FEEDS = [
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&datea=&dateb=&owner=include&start=0&count=40&output=atom",
     "https://news.google.com/rss/search?q=pharma+FDA+clinical+trial+cancer+acquisition+merger&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=aviation+airline+defense+conflict+war+sanctions&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%98%D7%97%D7%95%D7%9F+%D7%A4%D7%90%D7%A8%D7%9E%D7%94+%D7%91%D7%95%D7%A8%D7%A1%D7%94+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he"
+    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%91%D7%97%D7%95%D7%9F+%D7%A4%D7%90%D7%A8%D7%9E%D7%94+%D7%91%D7%95%D7%A8%D7%A1%D7%94+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he"
 ]
 
 def scan_breaking_news_events():
@@ -528,7 +534,7 @@ def handle_all_messages(message):
     elif text.startswith('/news_scan'):
         parts = text.split()
         if len(parts) < 2:
-            bot.reply_to(message, "⚠️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
+            bot.reply_to(message, "⚠️️ יש לציין סימול מניה. לדוגמה: `/news_scan NVDA`", parse_mode="Markdown")
             return
         ticker = parts[1]
         bot.reply_to(message, f"🔎 מריץ ניתוח חדשות ב-AI עבור `{ticker.upper()}`...", parse_mode="Markdown")
