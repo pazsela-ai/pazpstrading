@@ -30,6 +30,7 @@ last_scans = {"news": "טרם בוצעה", "tech": "טרם בוצעה"}
 
 HEADERS = {'User-Agent': 'PazPSTradingBot/1.0 (contact@pazpstrading.com)'}
 
+# רשימת מעקב טכני בלבד (לסורק השעתי הנייטרלי)
 WATCHLIST = [
     "ELAL.TA", "ISRA.TA", "CAMT.TA", "NICE.TA", "TLRD.TA", "ENLT.TA", "NWM.TA", "ESLT.TA",
     "NVDA", "TSLA", "AMD", "MRNA", "PFE", "DAL", "LMT", "AAPL", "MSFT", "AMZN", "META"
@@ -172,7 +173,7 @@ def setup_bot_commands():
 @app.route('/')
 @app.route('/health')
 def home():
-    return "OK - Event & Dynamic Risk Calculator Active!", 200
+    return "OK - Event-Driven & Dynamic Risk Calculator Active!", 200
 
 @app.route('/init_webhook', methods=['GET', 'POST'])
 def init_webhook():
@@ -311,20 +312,28 @@ def scan_watchlist_technical():
             logging.error(f"Error in watchlist scan for {ticker}: {e}")
 
 # ---------------------------------------------------------
-# 4. EVENT-DRIVEN NEWS ENGINE
+# 4. EVENT-DRIVEN NEWS ENGINE (אקטואליה, הסקה אוטונומית ללא WATCHLIST)
 # ---------------------------------------------------------
 
 BROAD_NEWS_FEEDS = [
-    "https://www.businesswire.com/rss/home/?rss=G1NSRmRZXVR3e1xRWA==",
+    # מבזקי אקטואליה וחדשות עולמיות גולמיות
+    "http://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-US&gl=US&ceid=US:en",
+    
+    # תעופה, ביטחון, גיאופוליטיקה ומתיחויות
+    "https://news.google.com/rss/search?q=airline+flight+cancellation+conflict+defense+war&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%91%D7%99%D7%98%D7%95%D7%9C+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%91%D7%97%D7%95%D7%9F+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he",
+
+    # ניסויים קליניים, פארמה ואישורי FDA (גולמי)
     "https://www.globenewswire.com/rss/feed/subject/pharmaceuticals",
-    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&datea=&dateb=&owner=include&start=0&count=40&output=atom",
-    "https://news.google.com/rss/search?q=pharma+FDA+clinical+trial+cancer+acquisition+merger&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=aviation+airline+defense+conflict+war+sanctions&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%91%D7%97%D7%95%D7%9F+%D7%A4%D7%90%D7%A8%D7%9E%D7%94+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he"
+    "https://news.google.com/rss/search?q=clinical+trial+FDA+approval+phase+cancer+vaccine&hl=en-US&gl=US&ceid=US:en",
+    
+    # הודעות חברות רשמיות ומהותיות (SEC 8-K)
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&datea=&dateb=&owner=include&start=0&count=30&output=atom"
 ]
 
 def scan_breaking_news_events():
-    """סריקה אוטומטית - מקפיצה התרעה מיידית ע"פ החדשות ללא תלות בניתוח טכני"""
+    """סריקה אוטומטית של אקטואליה + הסקת AI אוטונומית על מניות ללא תלות ב-WATCHLIST"""
     last_scans["news"] = time.strftime("%Y-%m-%d %H:%M:%S")
     if not CHAT_ID:
         return
@@ -346,22 +355,23 @@ def scan_breaking_news_events():
         return
 
     prompt = (
-        "אתה אנליסט פיננסי בכיר ומסוחר אירועים (Event-Driven Trader).\n"
-        "קרא את כותרות החדשות הבאות שנאספו כעת בזמן אמת:\n"
+        "אתה מנוע AI למסחר מבוסס אירועים עולמיים (Event-Driven Trading AI).\n"
+        "להלן כותרות חדשות אקטואליה, גיאופוליטיקה, ביטחון, תעופה ופארמה שנאספו כעת מזמן אמת:\n"
         + "\n".join([f"- {t}" for t in collected_articles]) +
-        "\n\nתפקידך לסווג את הידיעות ולחלץ המלצות מסחר מעשיות:\n"
-        "1. **זהה אירועים קריטיים:** ניסוי קליני/FDA, עסקאות M&A, אירועים ביטחוניים/תעופתיים, רגולציה.\n"
-        "2. **חלץ מניות מושפעות:** רשום מפורשות סימולים באנגלית (למשל: MRNA, ELAL.TA, ESLT.TA, DAL, NVDA).\n"
-        "3. **המלצת מסחר ורציונל:** ספק נימוק קצר מדוע יש פוטנציאל השקעה.\n"
-        "שים לב: אם המניה כבר רשמה ענייה חדה, הזהר מכניסה מוקדמת והמלץ על כניסה זהירה.\n\n"
-        "אם אין אף אירוע דרמטי, ענה בדיוק: 'אין אירוע קריטי'."
+        "\n\n**תפקידך לסרוק את החדשות הללו ולהסיק השלכות בורסאיות ישירות ועקיפות:**\n"
+        "1. נתח כל אירוע אקטואלי (למשל: ביטולי טיסות/מתיחות, ניסוי קליני, אישור תרופה, עסקה, מחסור במשאבים).\n"
+        "2. שאל את עצמך: 'איזה מניות ספציפיות בעולם או בישראל עשויות לעלות/להרוויח כתוצאה מהאירוע הזה?'\n"
+        "3. חלץ את סימולי המניות המדויקים באנגלית (למשל: ELAL.TA, ISRA.TA, MRNA, PFE, NVDA, ESLT.TA, DAL, LMT).\n"
+        "4. עבור כל מניה, ספק נימוק קצר וחד שמסביר את הקשר הסיבתי בין הידיעה האקטואלית לפוטנציאל העלייה במניה.\n"
+        "5. אזהרת FOMO: אם הכתבה מצביעה על כך שהמניה כבר זינקה, ציין זאת והמלץ על כניסה זהירה.\n\n"
+        "אם אין אף ידיעה אקטואלית שיש לה השפעה מסחרית מובהקת, ענה בדיוק: 'אין אירוע קריטי'."
     )
 
     ai_text = ask_ai_with_failover(prompt)
     if "אין אירוע קריטי" not in ai_text and "❌" not in ai_text:
         found_tickers = re.findall(r'\b[A-Z]{2,5}(?:\.TA)?\b', ai_text)
         
-        # שליחת ההתרעה המיידית של החדשות ללא תלות בציון טכני
+        # הקפצת התרעה מיידית לכל מניה שחולצה אוטונומית
         for tick in set(found_tickers):
             send_news_trade_alert(tick, ai_text, CHAT_ID)
 
@@ -418,7 +428,7 @@ def send_news_trade_alert(ticker, ai_summary, target_chat_id=None):
     price_data = get_stock_price_data(ticker)
     currency = "₪" if ".TA" in ticker.upper() else "$"
 
-    msg = f"📰 **ניתוח חדשות + תכנית עבודה - {ticker.upper()}**\n\n{ai_summary}\n\n"
+    msg = f"📰 **ניתוח אירוע חדשותי + תכנית עבודה - {ticker.upper()}**\n\n{ai_summary}\n\n"
 
     if price_data:
         entry = price_data["entry_price"]
@@ -570,7 +580,7 @@ def handle_all_messages(message):
         status_msg = (
             "⚙ **סטטוס מערכת:**\n\n"
             f"• AI Engine: {'✅ מחובר (' + ', '.join(active_providers) + ')' if active_providers else '❌ ללא מפתח פעיל'}\n"
-            f"• סריקת אירועים אוטומטית: 🟢 מופעלת (כל 15 דק')\n"
+            f"• סריקת אירועים אקטואליים: 🟢 מופעלת (כל 15 דק')\n"
             f"• סריקת חדשות אחרונה: `{last_scans['news']}`\n"
             f"• סריקה טכנית אחרונה: `{last_scans['tech']}`"
         )
@@ -595,7 +605,7 @@ def handle_all_messages(message):
         if res:
             safe_send_message(message.chat.id, res)
     elif text.startswith('/test_news'):
-        safe_send_message(message.chat.id, "📰 מריץ סריקת אירועים חדשותיים בלייב...")
+        safe_send_message(message.chat.id, "📰 מריץ סריקת אירועים אקטואליים וניתוח הברסאי בלייב...")
         scan_breaking_news_events()
     elif text.startswith('/test_tech'):
         safe_send_message(message.chat.id, "📈 מריץ בדיקה טכנית לדוגמה (NVDA)...")
