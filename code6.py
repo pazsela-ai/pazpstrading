@@ -1,597 +1,499 @@
 import os
-import logging
 import time
-import requests
-import re
-import urllib.parse
 import json
+import logging
+import datetime
+import pytz
+import feedparser
+import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-import yfinance as yf
-import feedparser
-from datetime import datetime
-import pytz
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask, request
-from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 
+# --- Google Gemini SDK ---
+import google.generativeai as genai
+
+# --- Groq & OpenAI SDKs ---
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+# ==========================================
+# 1. הגדרות לוגים ומשתני סביבה
+# ==========================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
-CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 
-bot = TeleBot(TELEGRAM_TOKEN, threaded=False)
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '').strip()
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '').strip()
+
+RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
+
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 app = Flask(__name__)
 
-user_states = {}
-last_processed_news_titles = set()
-sent_ticker_cooldowns = {}  # {ticker: timestamp} צינון התראות (6 שעות)
-MIN_DAILY_VOLUME_USD = 500000  # סף נזילות מינימלי
+# ==========================================
+# 2. שמירת מצב בזיכרון קבוע (Persistent Storage)
+# ==========================================
+DATA_FILE = "bot_state.json"
 
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+def load_state():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"שגיאה בטעינת קובץ מצב: {e}")
+    return {"processed_news": [], "cooldowns": {}}
 
-# רשימת מניות במעקב מורחבת לסריקה טכנית סדירה (מישור 2)
+def save_state(state):
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logging.error(f"שגיאה בשמירת קובץ מצב: {e}")
+
+state = load_state()
+processed_news_ids = set(state.get("processed_news", []))
+sent_ticker_cooldowns = state.get("cooldowns", {})
+
+def update_cooldown(ticker):
+    sent_ticker_cooldowns[ticker] = time.time()
+    state["cooldowns"] = sent_ticker_cooldowns
+    save_state(state)
+
+def is_in_cooldown(ticker, hours=12):
+    last_time = sent_ticker_cooldowns.get(ticker, 0)
+    return (time.time() - last_time) < (hours * 3600)
+
+def mark_news_processed(news_id):
+    processed_news_ids.add(news_id)
+    # שמירת 300 ידיעות אחרונות בזיכרון הדיסק
+    state["processed_news"] = list(processed_news_ids)[-300:]
+    save_state(state)
+
+# ==========================================
+# 3. הגדרות רשימות ומקורות חדשות
+# ==========================================
+
+# רשימת מעקב בלעדית לניתוח הטכני הסדיר
 WATCHLIST = [
-    # --- הבורסה בתל אביב (ישראל) ---
-    "ELAL.TA", "ESLT.TA", "CAMT.TA", "POLI.TA", "LUMI.TA", "DISI.TA", "MZTF.TA",
-    "NICE.TA", "ENLT.TA", "TLRD.TA", "NOVR.TA", "ISRA.TA", "ENOG.TA", "BIG.TA",
-
-    # --- טכנולוגיה, AI ושבבים (ארה"ב) ---
-    "NVDA", "TSLA", "AMD", "AAPL", "MSFT", "AMZN", "META", "GOOGL",
-    "AVGO", "SMCI", "ARM", "MU", "TSM", "QCOM", "INTC",
-
-    # --- סייבר, תוכנה וענן (ארה"ב) ---
-    "PLTR", "PANW", "CRWD", "SNOW", "NET",
-
-    # --- קריפטו, פינטק וצמיחה מהירה ---
-    "COIN", "MSTR", "MARA", "SQ", "PYPL", "RIVN",
-
-    # --- ביטחון, תעופה ותעשייה ---
-    "LMT", "NOC", "RTX", "BA", "GE", "DAL", "UAL",
-
-    # --- פארמה וביוטכנולוגיה ---
-    "MRNA", "PFE", "LLY", "NVO", "BNTX",
-
-    # --- אנרגיה וסחורות ---
-    "XOM", "CVX", "OXY", "SLB"
+    "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AMD", "INTC", "PLTR",
+    "MARA", "RIOT", "COIN", "BA", "LMT", "NOC", "RTX", "PFE", "MRNA", "LLY",
+    "TEVA.TA", "NICE.TA", "LUMI.TA", "DSSL.TA", "ICL.TA"
 ]
 
+# פידים מורחבים לסורק החדשות (ביו-טק, תעופה, ביטחון, גיאופוליטיקה וחוזים)
 BROAD_NEWS_FEEDS = [
-    "http://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=airline+flight+cancellation+conflict+defense+war&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=%D7%AA%D7%A2%D7%95%D7%A4%D7%94+%D7%91%D7%99%D7%98%D7%95%D7%9C+%D7%90%D7%9C+%D7%A2%D7%9C+%D7%91%D7%99%D7%91%D7%97%D7%95%D7%9F+%D7%92%D7%96&hl=he&gl=IL&ceid=IL:he",
-    "https://www.globenewswire.com/rss/feed/subject/pharmaceuticals",
-    "https://news.google.com/rss/search?q=clinical+trial+FDA+approval+phase+cancer+vaccine&hl=en-US&gl=US&ceid=US:en"
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://news.google.com/rss/search?q=defense+military+contract+deal+stock&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=FDA+approval+phase+trial+cancer+pharma+stock&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=airline+aviation+incident+contract+stock&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=cybersecurity+tech+acquisition+stock&hl=en-US&gl=US&ceid=US:en"
 ]
 
-# ---------------------------------------------------------
-# 1. AI ENGINES
-# ---------------------------------------------------------
-
-def ask_gemini_direct(prompt):
-    if not GEMINI_API_KEY:
-        return None
-    endpoints = [
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
-    ]
-    headers = {"Content-Type": "application/json"}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
-    for url in endpoints:
-        try:
-            res = requests.post(url, json=payload, headers=headers, timeout=12)
-            if res.status_code == 200:
-                data = res.json()
-                if 'candidates' in data and len(data['candidates']) > 0:
-                    parts = data['candidates'][0].get('content', {}).get('parts', [])
-                    if parts and 'text' in parts[0]:
-                        return parts[0]['text'].strip()
-        except Exception as e:
-            logging.error(f"Error calling Gemini API: {e}")
-    return None
-
-def ask_groq_direct(prompt):
-    if not GROQ_API_KEY:
-        return None
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    for model in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]:
-        try:
-            res = requests.post(url, json={"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}, headers=headers, timeout=10)
-            if res.status_code == 200:
-                return res.json()['choices'][0]['message']['content'].strip()
-        except Exception as e:
-            logging.error(f"Error calling Groq API ({model}): {e}")
-    return None
-
-def ask_openai_direct(prompt):
-    if not OPENAI_API_KEY:
-        return None
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    try:
-        res = requests.post(url, json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}, headers=headers, timeout=10)
-        if res.status_code == 200:
-            return res.json()['choices'][0]['message']['content'].strip()
-    except Exception as e:
-        logging.error(f"Error calling OpenAI API: {e}")
-    return None
-
-def ask_ai_with_failover(prompt):
-    res = ask_gemini_direct(prompt)
-    if res: return res
-    res = ask_groq_direct(prompt)
-    if res: return res
-    res = ask_openai_direct(prompt)
-    if res: return res
-    return None
-
-def safe_send_message(chat_id, text, reply_markup=None):
-    try:
-        bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=reply_markup, disable_web_page_preview=True)
-    except Exception as e:
-        logging.warning(f"Failed to send Markdown message: {e}")
-        bot.send_message(chat_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
-
-# ---------------------------------------------------------
-# 2. MARKET HOURS & LIQUIDITY FILTERS
-# ---------------------------------------------------------
-
+# ==========================================
+# 4. בדיקת שעות מסחר מותאמת
+# ==========================================
 def check_market_status(ticker):
-    """בדיקת שעות וימי מסחר מדויקים לפי שעון ישראל עבור תל אביב וניו יורק"""
-    tz_il = pytz.timezone('Asia/Jerusalem')
-    now = datetime.now(tz_il)
-    weekday = now.weekday()
+    is_israel = ticker.endswith('.TA')
+    tz = pytz.timezone('Asia/Jerusalem')
+    now = datetime.datetime.now(tz)
+    weekday = now.weekday() # 0=Monday ... 6=Sunday
     current_time = now.time()
 
-    if ticker.upper().endswith(".TA"):
-        if weekday in [4, 5]: # שישי/שבת סגור
-            return "🔒 הבורסה בתל אביב סגורה (סוף שבוע)"
-        
-        if weekday == 6: # יום ראשון
-            start_time = datetime.strptime("10:00", "%H:%M").time()
-            end_time = datetime.strptime("16:30", "%H:%M").time()
-        elif weekday == 3: # יום חמישי
-            start_time = datetime.strptime("09:59", "%H:%M").time()
-            end_time = datetime.strptime("16:45", "%H:%M").time()
-        else: # ימים שני, שלישי, רביעי
-            start_time = datetime.strptime("09:59", "%H:%M").time()
-            end_time = datetime.strptime("17:15", "%H:%M").time()
-
-        if start_time <= current_time <= end_time:
-            return "🟢 המסחר בתל אביב פעיל כעת (רציף)"
-        return "🌙 הבורסה בתל אביב סגורה כעת (הוראה ממתינה לפתיחה)"
+    if is_israel:
+        # ישראל: ראשון (6) עד חמישי (3)
+        if weekday in [4, 5]: # שישי, שבת
+            return False, "הבורסה בת\"א סגורה (סוף שבוע)"
+        open_time = datetime.time(9, 50)
+        close_time = datetime.time(17, 15) if weekday == 6 else datetime.time(17, 25)
+        if open_time <= current_time <= close_time:
+            return True, "המסחר בת\"א פעיל כעת"
+        return False, "הבורסה בת\"א סגורה כעת"
     else:
-        if weekday in [5, 6]: # שבת/ראשון סגור
-            return "🔒 הבורסה בארה\"ב סגורה (סוף שבוע)"
-
-        pre_market_start = datetime.strptime("11:00", "%H:%M").time()
-        main_market_start = datetime.strptime("16:30", "%H:%M").time()
-        main_market_end = datetime.strptime("23:00", "%H:%M").time()
-
-        if main_market_start <= current_time <= main_market_end:
-            return "🟢 המסחר בארה\"ב פעיל כעת (שעות רגילות)"
-        elif pre_market_start <= current_time < main_market_start:
-            return "🟡 מסחר מוקדם בארה\"ב (Pre-Market פעיל)"
-        return "🌙 הבורסה בארה\"ב סגורה כעת (הוראה ממתינה ל-Pre-Market / פתיחה)"
-
-def check_liquidity_and_price(ticker, impact_level="MEDIUM"):
-    try:
-        ticker = ticker.upper().strip()
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="60d", interval="1d")
-        if df.empty or len(df) < 5:
-            return None, "נתונים לא מספיקים"
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        latest = df.iloc[-1]
-        current_price = float(latest['Close'])
-        avg_volume = df['Volume'].tail(20).mean()
-        dollar_volume = avg_volume * current_price
-
-        if dollar_volume < MIN_DAILY_VOLUME_USD:
-            return None, f"נזילות נמוכה מדי (מחזור יומי ממוצע: {int(dollar_volume):,} בלבד)"
-
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        atr_val = float(df['ATR'].iloc[-1]) if ('ATR' in df and not pd.isna(df['ATR'].iloc[-1])) else current_price * 0.03
-
-        entry_price = round(current_price * 1.002, 2)
-        sl_price = round(entry_price - (atr_val * 1.2), 2)
-
-        if impact_level == "HIGH":
-            tp1_price = round(entry_price + (atr_val * 2.0), 2)
-            tp2_price = round(entry_price + (atr_val * 4.0), 2)
+        # ארה"ב: שני (0) עד שישי (4)
+        if weekday in [5, 6]: # שבת, ראשון
+            return False, "הבורסה בארה\"ב סגורה (סוף שבוע)"
+        
+        reg_open = datetime.time(16, 30)
+        reg_close = datetime.time(23, 0)
+        
+        if reg_open <= current_time <= reg_close:
+            return True, "המסחר בארה\"ב פעיל (שעות רגילות)"
         else:
-            tp1_price = round(entry_price + (atr_val * 2.0), 2)
-            tp2_price = None
+            return False, "הבורסה בארה\"ב סגורה כעת"
 
-        return {
-            "current_price": round(current_price, 2),
-            "entry_price": entry_price,
-            "sl": sl_price,
-            "tp1": tp1_price,
-            "tp2": tp2_price,
-            "atr": atr_val,
-            "dollar_volume": dollar_volume
-        }, "OK"
-    except Exception as e:
-        logging.error(f"Error checking liquidity for {ticker}: {e}")
-        return None, str(e)
-
-# ---------------------------------------------------------
-# 3. TECHNICAL ENGINE (מישור 2 - סריקה טכנית סדירה)
-# ---------------------------------------------------------
-
-def analyze_technical_deep(ticker):
-    """ניתוח טכני מעמיק למניות ברשימת המעקב (WATCHLIST)"""
+# ==========================================
+# 5. שליפת מחירי Real-Time ונתונים טכניים
+# ==========================================
+def fetch_realtime_data(ticker):
     try:
-        ticker = ticker.upper().strip()
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="100d", interval="1d")
-        if df.empty or len(df) < 20:
+        t = yf.Ticker(ticker)
+        # שליפת מחירי 1m לקבלת Real-Time מדויק
+        df_min = t.history(period="1d", interval="1m")
+        if not df_min.empty:
+            current_price = float(df_min['Close'].iloc[-1])
+        else:
+            df_day = t.history(period="5d")
+            if df_day.empty: return None
+            current_price = float(df_day['Close'].iloc[-1])
+
+        df = t.history(period="100d")
+        if len(df) < 50:
             return None
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
+        # חישוב אינדיקטורים טכניים
         df['EMA20'] = ta.ema(df['Close'], length=20)
-        df['EMA50'] = ta.ema(df['Close'], length=min(50, len(df)-1))
+        df['EMA50'] = ta.ema(df['Close'], length=50)
         df['RSI'] = ta.rsi(df['Close'], length=14)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        df['VOL_SMA20'] = ta.sma(df['Volume'], length=20)
+        df['Vol_SMA20'] = ta.sma(df['Volume'], length=20)
 
         latest = df.iloc[-1]
-        current_price = float(latest['Close'])
-        atr_val = float(latest['ATR']) if ('ATR' in df and not pd.isna(latest['ATR'])) else current_price * 0.03
-        rsi_val = float(latest['RSI']) if ('RSI' in df and not pd.isna(latest['RSI'])) else 50.0
-        ema20 = float(latest['EMA20']) if ('EMA20' in df and not pd.isna(latest['EMA20'])) else current_price
-        ema50 = float(latest['EMA50']) if ('EMA50' in df and not pd.isna(latest['EMA50'])) else current_price
-        vol_now = float(latest['Volume']) if 'Volume' in df else 0
-        vol_avg = float(latest['VOL_SMA20']) if ('VOL_SMA20' in df and not pd.isna(latest['VOL_SMA20'])) else 1
+        avg_vol = latest['Vol_SMA20']
+        dollar_volume = current_price * avg_vol if avg_vol else 0
+
+        return {
+            "price": current_price,
+            "ema20": float(latest['EMA20']),
+            "ema50": float(latest['EMA50']),
+            "rsi": float(latest['RSI']),
+            "atr": float(latest['ATR']),
+            "volume": float(latest['Volume']),
+            "avg_volume": float(avg_vol),
+            "dollar_volume": dollar_volume
+        }
+    except Exception as e:
+        logging.error(f"שגיאה בשליפת נתונים עבור {ticker}: {e}")
+        return None
+
+# ==========================================
+# 6. מנוע AI כפול עם מנגנון גיבוי (Failover)
+# ==========================================
+def query_ai_engine(prompt):
+    # 1. Google Gemini
+    if GEMINI_API_KEY:
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel('gemini-2.0-flash')
+            res = model.generate_content(prompt)
+            if res.text: return res.text
+        except Exception as e:
+            logging.warning(f"Gemini נכשל, עובר לגיבוי: {e}")
+
+    # 2. Groq
+    if GROQ_API_KEY and Groq:
+        try:
+            client = Groq(api_key=GROQ_API_KEY)
+            res = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return res.choices[0].message.content
+        except Exception as e:
+            logging.warning(f"Groq נכשל, עובר לגיבוי: {e}")
+
+    # 3. OpenAI
+    if OPENAI_API_KEY and OpenAI:
+        try:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            res = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return res.choices[0].message.content
+        except Exception as e:
+            logging.error(f"OpenAI נכשל: {e}")
+
+    return None
+
+# ==========================================
+# 7. סורק חדשות ואירועים (Event-Driven & Catalyst Engine)
+# ==========================================
+def scan_breaking_news_events():
+    logging.info("מתחיל סריקת חדשות ואירועים מתפרצים...")
+    for feed_url in BROAD_NEWS_FEEDS:
+        parsed = feedparser.parse(feed_url)
+        for entry in parsed.entries[:5]:
+            news_id = entry.get('id', entry.get('link'))
+            
+            if news_id in processed_news_ids:
+                continue
+
+            title = entry.title
+            summary = entry.get('summary', '')
+
+            # Prompt מתקדם להסקה רוחבית, קטליזטורים עתידיים והיפותטיים
+            prompt = f"""
+אתה אנליסט פיננסי בכיר ואסטרטג מסחר בורסאי המתמחה בזיהוי השפעות רוחביות והשלכות מסדר שני (Second-Order Effects) וקטליזטורים עתידיים (Catalyst Events).
+
+נתח את הידיעה החדשותית הבאה:
+כותרת: {title}
+תקציר: {summary}
+
+מטרת העל: לזהות אילו מניות (בארה"ב או בישראל) עשויות להרוויח דרמטית מהאירוע, כולל תרחישים היפותטיים, צופי פני עתיד, ניסויים קליניים, הסכמים, או תקלות/אירועים המשפיעים לטובה על מתחרים.
+
+דוגמאות לחשיבה אנליטית:
+1. אירוע/תקרית בחברת תעופה (למשל תקלה או כמעט התרסקות) -> הסקה על מעבר נוסעים ועלייה בביקוש למניות תעופה מתחרות או מקומיות (למשל מניות תעופה ישראליות / DAL / AAL).
+2. ניסוי קליני, תכנית לניסוי או פיתוח חדשני בתרופה (למשל: "חברה X צפויה להתחיל ניסוי לתרופה...") -> פוטנציאל זינוק חזק לחברה המפתחת.
+3. הסלמה ביטחונית / איומים -> עלייה בביקוש למערכות הגנה אווירת, רחפנים וסייבר (מניות ביטחוניות/סייבר).
+
+הוראות ביצוע:
+- בצע הסקה הגיונית וחופשית (אינך מוגבל לרשימה מסוימת).
+- אם מצאת מניה ספציפית בעלת פוטנציאל רווח בעקבות הידיעה, החזר JSON מבוקר בלבד:
+{{
+  "relevant": true,
+  "ticker": "הטיקר המדויק שחולץ (לדוגמה: MRNA, LMT, DAL, ESRX.TA וכו')",
+  "impact": "HIGH/MEDIUM",
+  "analysis": "הסבר אנליטי קצר על השרשרת הסיבתית: מה קרה באירוע ואיך הוא מוביל לפוטנציאל הרווח במניה המומלצת",
+  "reason": "נימוק קצר לתכנית העבודה והזרז (Catalyst) המוביל"
+}}
+
+אם הידיעה כללית לחלוטין ואין ממנה שום שרשרת סיבתית למניה ספציפית, החזר:
+{{"relevant": false}}
+"""
+            res_text = query_ai_engine(prompt)
+            if not res_text:
+                continue
+
+            try:
+                clean_text = res_text.replace("```json", "").replace("```", "").strip()
+                data_json = json.loads(clean_text)
+
+                if data_json.get("relevant"):
+                    ticker = data_json.get("ticker").upper()
+                    
+                    if is_in_cooldown(ticker, hours=8):
+                        mark_news_processed(news_id)
+                        continue
+
+                    # שליפת נתוני אמת לכל מניה שחולצה
+                    market_data = fetch_realtime_data(ticker)
+                    if not market_data:
+                        mark_news_processed(news_id)
+                        continue
+
+                    price = market_data['price']
+                    atr = market_data['atr']
+                    is_active, market_desc = check_market_status(ticker)
+
+                    sl = round(price - (1.2 * atr), 2)
+                    tp1 = round(price + (2.0 * atr), 2)
+                    tp2 = round(price + (4.0 * atr), 2)
+
+                    msg = (
+                        f"📰 *ניתוח אירוע חדשותי ותכנית מסחר: {ticker}*\n"
+                        f"⏰ מצב שוק: {('🟢' if is_active else '🔴')} {market_desc}\n"
+                        f"🔥 עוצמת אירוע: *{data_json.get('impact')}*\n\n"
+                        f"🔗 *אסמכתאות וידיעות רלוונטיות:*\n• [{title}]({entry.link})\n\n"
+                        f"💡 *ניתוח המשמעות למניה:*\n{data_json.get('analysis')}\n\n"
+                        f"📋 *תכנית עבודה יעודית:*\n"
+                        f"• המלצה: כניסה\n"
+                        f"• נימוק: {data_json.get('reason')}\n\n"
+                        f"🎯 *פרמטרי פוזיציה מוצעים (R:R דינמי):*\n"
+                        f"• מחיר נוכחי: ${price:.2f}\n"
+                        f"• כניסה מומלצת (Limit): ${price:.2f}\n"
+                        f"• יעד רווח 1 (TP1): ${tp1:.2f}\n"
+                        f"• יעד רווח 2 מורחב (TP2): ${tp2:.2f}\n"
+                        f"• סטופ לוס (SL): ${sl:.2f}\n"
+                    )
+
+                    markup = InlineKeyboardMarkup()
+                    markup.add(
+                        InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"calc_{ticker}_{price}_{sl}_{tp1}"),
+                        InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/symbols/{ticker.replace('.TA', '')}")
+                    )
+
+                    bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown", reply_markup=markup)
+                    update_cooldown(ticker)
+                    mark_news_processed(news_id)
+
+            except Exception as e:
+                logging.error(f"שגיאה בפענוח JSON מ-AI: {e}")
+                mark_news_processed(news_id)
+
+# ==========================================
+# 8. סורק ניתוח טכני סדיר (Watchlist בלבד)
+# ==========================================
+def scan_watchlist_technical():
+    logging.info("מתחיל סריקה טכנית יזומה...")
+    for ticker in WATCHLIST:
+        is_active, market_desc = check_market_status(ticker)
+        
+        # לא מפיקים איתותים טכניים כשהשוק סגור
+        if not is_active:
+            continue
+
+        if is_in_cooldown(ticker, hours=12):
+            continue
+
+        data = fetch_realtime_data(ticker)
+        if not data or data['dollar_volume'] < 500000:
+            continue
+
+        price = data['price']
+        ema20 = data['ema20']
+        ema50 = data['ema50']
+        rsi = data['rsi']
+        vol = data['volume']
+        avg_vol = data['avg_volume']
+        atr = data['atr']
+
+        # בדיקת קרבה לממוצע (0% עד 2.5% מעל EMA20)
+        pct_from_ema20 = (price - ema20) / ema20
+        is_near_ema20 = 0 <= pct_from_ema20 <= 0.025
+        
+        is_uptrend = price > ema20 and ema20 > ema50
+        is_rsi_healthy = 50 <= rsi <= 68
+        is_volume_high = vol >= (avg_vol * 1.2)
 
         score = 0
         reasons = []
 
-        if current_price >= ema20 >= ema50:
+        if is_uptrend:
             score += 30
-            reasons.append("מגמה עולה: מחיר מעל EMA20 ומעל EMA50")
-        if 48 <= rsi_val <= 68:
+            reasons.append("מגמה עולה (מחיר מעל EMA20 ו-EMA50)")
+        if is_near_ema20:
             score += 35
-            reasons.append(f"מומנטום בריא: RSI ברמה של {rsi_val:.1f}")
-        if vol_avg > 0 and vol_now > (vol_avg * 1.1):
-            score += 35
-            reasons.append(f"נפח מסחר מוגבר ({int(vol_now/vol_avg*100)}% מהממוצע)")
+            reasons.append("מחיר קרוב ונתמך על EMA20 (נקודת כניסה אידיאלית)")
+        if is_rsi_healthy:
+            score += 20
+            reasons.append(f"מומנטום בריא (RSI: {rsi:.1f})")
+        if is_volume_high:
+            score += 15
+            reasons.append("נפח מסחר מוגבר מעל הממוצע")
 
-        entry_price = round(current_price * 1.002, 2)
-        tp_price = round(entry_price + (atr_val * 2.0), 2)
-        sl_price = round(entry_price - (atr_val * 1.2), 2)
+        # ציון מחמיר (75+) בלבד
+        if score >= 75:
+            entry_price = price
+            sl = round(entry_price - (1.2 * atr), 2)
+            tp1 = round(entry_price + (2.0 * atr), 2)
 
-        is_quality_breakout = score >= 65
-        recommendation = "🟢 **איתות חיובי לכניסה**" if is_quality_breakout else "🟡 **ניטרלי / המתנה**"
-
-        return {
-            "ticker": ticker,
-            "score": score,
-            "is_breakout": is_quality_breakout,
-            "recommendation": recommendation,
-            "current_price": round(current_price, 2),
-            "entry_price": entry_price,
-            "tp1": tp_price,
-            "sl": sl_price,
-            "rsi": round(rsi_val, 1),
-            "reasons": reasons
-        }
-    except Exception as e:
-        logging.error(f"Error deep analyzing {ticker}: {e}")
-        return None
-
-def scan_watchlist_technical():
-    """ריצה מחזורית אוטומטית על מניות ה-WATCHLIST (מישור 2)"""
-    if not CHAT_ID:
-        return
-    logging.info("Starting Technical Watchlist Scan...")
-    for ticker in WATCHLIST:
-        try:
-            tech_data = analyze_technical_deep(ticker)
-            if tech_data and tech_data["is_breakout"]:
-                if not is_in_cooldown(ticker):
-                    send_technical_alert(ticker, tech_data)
-        except Exception as e:
-            logging.error(f"Error scanning ticker {ticker}: {e}")
-
-def send_technical_alert(ticker, tech_data):
-    """שליחת איתות טכני למניה מה-WATCHLIST"""
-    sent_ticker_cooldowns[ticker] = time.time()
-    market_status = check_market_status(ticker)
-    currency = "₪" if ".TA" in ticker.upper() else "$"
-
-    reasons_text = "\n".join([f"  • {r}" for r in tech_data["reasons"]])
-
-    msg = (
-        f"📊 **איתות טכני אוטומטי (Watchlist): {ticker.upper()}**\n"
-        f"⏰ **מצב שוק:** {market_status}\n"
-        f"📈 **צינון טכני:** {tech_data['score']}/100\n\n"
-        f"📣 **המלצה:** {tech_data['recommendation']}\n\n"
-        f"💡 **אינדיקטורים שנלכדו:**\n{reasons_text}\n\n"
-        f"🎯 **תכנית עבודה מוצעת:**\n"
-        f"• מחיר נוכחי: {currency}{tech_data['current_price']}\n"
-        f"• מחיר כניסה (Limit): {currency}{tech_data['entry_price']}\n"
-        f"• יעד רווח (TP1): {currency}{tech_data['tp1']}\n"
-        f"• סטופ לוס (SL): {currency}{tech_data['sl']}\n"
-    )
-
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker.upper()}_{tech_data['entry_price']}_{tech_data['sl']}_{tech_data['tp1']}"))
-    keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.upper().replace('.TA','')}") )
-
-    safe_send_message(CHAT_ID, msg, reply_markup=keyboard)
-
-# ---------------------------------------------------------
-# 4. NEWS & EVENT ENGINE (מישור 1 - סורק חדשות)
-# ---------------------------------------------------------
-
-def is_in_cooldown(ticker):
-    now = time.time()
-    if ticker in sent_ticker_cooldowns:
-        if now - sent_ticker_cooldowns[ticker] < 21600: # 6 שעות צינון
-            return True
-    return False
-
-def scan_breaking_news_events():
-    if not CHAT_ID:
-        return
-
-    articles = []
-    for feed_url in BROAD_NEWS_FEEDS:
-        try:
-            resp = requests.get(feed_url, headers=HEADERS, timeout=8)
-            feed = feedparser.parse(resp.content)
-            for entry in feed.entries[:5]:
-                title = getattr(entry, 'title', '')
-                link = getattr(entry, 'link', '')
-                if title and title not in last_processed_news_titles:
-                    articles.append({"title": title, "link": link})
-                    last_processed_news_titles.add(title)
-        except Exception as e:
-            logging.error(f"Feed fetch error {feed_url}: {e}")
-
-    if not articles:
-        return
-
-    prompt = (
-        "אנליסט פיננסי, עיין ברשימת הידיעות החדשותיות:\n"
-        + json.dumps(articles, ensure_ascii=False) +
-        "\n\nזהה מניות ספציפיות (סימולים באנגלית, למשל ELAL.TA, MRNA, LMT, XOM) שיש לגביהן אירוע משמעותי.\n"
-        "דרג את עוצמת האירוע (impact_level) כ- HIGH (אם מדובר בדרמה אקטואלית/ניסוי קריטי/אירוע מלחמה) או MEDIUM/LOW.\n"
-        "החזר JSON בלבד במבנה הבא (ללא טקסט נוסף):\n"
-        "{\n"
-        '  "tickers": [\n'
-        '    {\n'
-        '      "ticker": "ELAL.TA",\n'
-        '      "impact_level": "HIGH",\n'
-        '      "relevant_news": [{"title": "כותרת שרלוונטית רק לה", "link": "קישור"}],\n'
-        '      "analysis": "ניתוח ממוקד בעברית מדוע המניה ספציפית זו מושפעת",\n'
-        '      "action": "כניסה / המתנה / יציאה",\n'
-        '      "reason": "הסבר מפורט כולל אזהרת FOMO במידת הצורך"\n'
-        '    }\n'
-        '  ]\n'
-        "}\n"
-    )
-
-    ai_res = ask_ai_with_failover(prompt)
-    if not ai_res:
-        return
-
-    try:
-        json_match = re.search(r'\{.*\}', ai_res, re.DOTALL)
-        if not json_match:
-            return
-        parsed_data = json.loads(json_match.group(0))
-
-        for item in parsed_data.get("tickers", []):
-            ticker = item["ticker"].upper().strip()
-
-            if is_in_cooldown(ticker):
-                continue
-
-            send_per_ticker_news_alert(
-                ticker=ticker,
-                impact_level=item.get("impact_level", "MEDIUM"),
-                relevant_news=item.get("relevant_news", []),
-                analysis=item.get("analysis", ""),
-                action=item.get("action", "המתנה"),
-                reason=item.get("reason", ""),
-                target_chat_id=CHAT_ID
+            msg = (
+                f"📊 *איתות טכני אוטומטי: {ticker}*\n"
+                f"⏰ מצב שוק: 🟢 {market_desc}\n"
+                f"📈 ציון טכני: *{score}/100*\n\n"
+                f"📣 *המלצה:* איתות חיובי לכניסה\n\n"
+                f"💡 *אינדיקטורים שנלכדו:*\n" +
+                "\n".join([f"• {r}" for r in reasons]) +
+                f"\n\n🎯 *תכנית עבודה מוצעת:*\n"
+                f"• מחיר נוכחי: ${price:.2f}\n"
+                f"• מחיר כניסה (Limit): ${entry_price:.2f}\n"
+                f"• יעד רווח (TP1): ${tp1:.2f}\n"
+                f"• סטופ לוס (SL): ${sl:.2f}\n"
             )
-    except Exception as e:
-        logging.error(f"Failed to parse news JSON response: {e}")
 
-def send_per_ticker_news_alert(ticker, impact_level, relevant_news, analysis, action, reason, target_chat_id):
-    ticker = ticker.upper().strip()
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"calc_{ticker}_{entry_price}_{sl}_{tp1}"),
+                InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/symbols/{ticker.replace('.TA', '')}")
+            )
 
-    price_data, status_msg = check_liquidity_and_price(ticker, impact_level)
+            bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown", reply_markup=markup)
+            update_cooldown(ticker)
 
-    if not price_data:
-        logging.info(f"Filtered out {ticker}: {status_msg}")
-        return
+# ==========================================
+# 9. מחשבון סיכון אינטראקטיבי בטלגרם
+# ==========================================
+user_calc_state = {}
 
-    sent_ticker_cooldowns[ticker] = time.time()
-    market_status = check_market_status(ticker)
-    currency = "₪" if ".TA" in ticker else "$"
-
-    msg = f"📰 **ניתוח אירוע חדשותי ותכנית מסחר: {ticker}**\n"
-    msg += f"⏰ **מצב שוק:** {market_status}\n"
-    msg += f"🔥 **עוצמת אירוע:** `{impact_level}`\n\n"
-
-    msg += "🔗 **אסמכתאות וידיעות רלוונטיות:**\n"
-    for news in relevant_news:
-        msg += f"• [{news.get('title', 'ידיעה חדשותית')}]({news.get('link', '#')})\n"
-    msg += "\n"
-
-    msg += f"💡 **ניתוח המשמעות למניה:**\n{analysis}\n\n"
-
-    msg += f"📋 **תכנית עבודה ייעודית:**\n"
-    msg += f"• **המלצה:** {action}\n"
-    msg += f"• **נימוק:** {reason}\n\n"
-
-    entry = price_data["entry_price"]
-    tp1 = price_data["tp1"]
-    tp2 = price_data["tp2"]
-    sl = price_data["sl"]
-
-    msg += (
-        f"🎯 **פרמטרי פוזיציה מוצעים (R:R דינמי):**\n"
-        f"• מחיר נוכחי: {currency}{price_data['current_price']}\n"
-        f"• כניסה מומלצת (Limit): {currency}{entry}\n"
-        f"• יעד רווח 1 (TP1): {currency}{tp1}\n"
-    )
-
-    if tp2:
-        msg += f"• יעד רווח 2 מורחב (TP2): {currency}{tp2} (למיקסום גל עליות)\n"
-
-    msg += f"• סטופ לוס (SL): {currency}{sl}\n"
-
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"trade_{ticker}_{entry}_{sl}_{tp1}"))
-    keyboard.add(types.InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/chart/?symbol={ticker.replace('.TA','')}") )
-
-    safe_send_message(target_chat_id, msg, reply_markup=keyboard)
-
-# ---------------------------------------------------------
-# 5. TELEGRAM CALLBACKS & BOT HANDLERS
-# ---------------------------------------------------------
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('trade_'))
-def handle_trade_click(call):
-    _, ticker, entry, sl, tp = call.data.split('_')
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    buttons = [
-        types.InlineKeyboardButton("💵 חישוב בדולרים ($)", callback_data=f"currency_{ticker}_{entry}_{sl}_{tp}_USD"),
-        types.InlineKeyboardButton("₪ חישוב בשקלים (₪)", callback_data=f"currency_{ticker}_{entry}_{sl}_{tp}_ILS")
-    ]
-    keyboard.add(*buttons)
-    bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=keyboard)
-    bot.answer_callback_query(call.id, text="בחר מטבע לחישוב הסיכון")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('currency_'))
-def handle_currency_select(call):
-    _, ticker, entry, sl, tp, curr = call.data.split('_')
-    user_states[call.from_user.id] = {
-        "action": "awaiting_risk_amount",
-        "ticker": ticker,
-        "entry": float(entry),
-        "sl": float(sl),
-        "tp": float(tp),
-        "curr": curr
+@bot.callback_query_handler(func=lambda call: call.data.startswith('calc_'))
+def handle_calc_callback(call):
+    _, ticker, entry, sl, tp1 = call.data.split('_')
+    user_calc_state[call.from_user.id] = {
+        'ticker': ticker,
+        'entry': float(entry),
+        'sl': float(sl),
+        'tp1': float(tp1)
     }
-    symbol = "$" if curr == "USD" else "₪"
-    safe_send_message(call.message.chat.id, f"✍ **אנא הקלד/י כעת את סכום הסיכון המבוקש ב-{symbol}:**\n(לדוגמה: 150 או 500)")
-    bot.answer_callback_query(call.id)
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("💵 דולר ($)", callback_data="curr_USD"),
+        InlineKeyboardButton("₪ שקל (ILS)", callback_data="curr_ILS")
+    )
+    bot.send_message(call.message.chat.id, "בחר את מטבע התיק שלך לחישוב הסיכון:", reply_markup=markup)
 
-@bot.message_handler(func=lambda message: True)
-def handle_all_messages(message):
-    user_id = message.from_user.id
-    text = message.text.strip()
+@bot.callback_query_handler(func=lambda call: call.data.startswith('curr_'))
+def handle_currency_choice(call):
+    currency = call.data.split('_')[1]
+    user_calc_state[call.from_user.id]['currency'] = currency
+    msg = bot.send_message(call.message.chat.id, f"הקלד את סכום הסיכון הכספי שברצונך לסכן בעסקה זו ({'$' if currency=='USD' else '₪'}):")
+    bot.register_next_step_handler(msg, process_risk_amount)
 
-    if user_id in user_states and user_states[user_id].get("action") == "awaiting_risk_amount":
-        try:
-            risk_amount = float(text)
-            state = user_states.pop(user_id)
-
-            entry, sl, tp, ticker, curr = state["entry"], state["sl"], state["tp"], state["ticker"], state["curr"]
-            risk_per_share = entry - sl
-            if risk_per_share <= 0:
-                bot.reply_to(message, "❌ שגיאה: סטופ לוס גבוה/שווה למחיר הכניסה.")
-                return
-
-            shares_count = int(risk_amount / risk_per_share)
-            total_cost = round(shares_count * entry, 2)
-            potential_profit = round(shares_count * (tp - entry), 2)
-            curr_symbol = "$" if curr == "USD" else "₪"
-
-            calc_msg = (
-                f"📐 **חישוב פוזיציה מותאם אישית עבור {ticker}:**\n\n"
-                f"• **סכום סיכון מוגדר:** {curr_symbol}{risk_amount}\n"
-                f"• **מחיר כניסה מומלץ:** {curr_symbol}{entry}\n"
-                f"• **סטופ לוס (SL):** {curr_symbol}{sl} (סיכון של {curr_symbol}{risk_per_share:.2f} למניה)\n\n"
-                f"👉 **כדי לסכן בדיוק {curr_symbol}{risk_amount} - עליך לקנות:** `{shares_count}` מניות\n"
-                f"• **שווי פוזיציה כולל:** {curr_symbol}{total_cost}\n"
-                f"• **רווח פוטנציאלי ביעד (TP1):** {curr_symbol}{potential_profit}\n"
-            )
-            safe_send_message(message.chat.id, calc_msg)
-            return
-        except ValueError:
-            bot.reply_to(message, "⚠ אנא הזן מספר תקין בלבד (למשל: 200). נסה שוב:")
-            return
-
-    if text.startswith('/start'):
-        safe_send_message(message.chat.id, "🟢 **הבוט PazPSTrading פעיל! סורק באופן רציף גם אירועים חדשותיים וגם איתותים טכניים ל-Watchlist.**")
-    elif text.startswith('/tech'):
-        parts = text.split()
-        if len(parts) > 1:
-            ticker = parts[1].upper().strip()
-            tech_data = analyze_technical_deep(ticker)
-            if tech_data:
-                send_technical_alert(ticker, tech_data)
-            else:
-                safe_send_message(message.chat.id, f"❌ לא ניתן לשלוף ניתוח טכני עבור `{ticker}`.")
-        else:
-            safe_send_message(message.chat.id, "⚠ יש לציין סימול מניה. לדוגמה: `/tech NVDA`")
-    elif text.startswith('/test_news'):
-        safe_send_message(message.chat.id, "📰 מריץ סריקת אירועים חדשותיים...")
-        scan_breaking_news_events()
-    elif text.startswith('/test_tech'):
-        safe_send_message(message.chat.id, "📊 מריץ סריקה טכנית לכל ה-Watchlist...")
-        scan_watchlist_technical()
-
-# ---------------------------------------------------------
-# 6. WEBHOOK & SCHEDULERS
-# ---------------------------------------------------------
-
-@app.route('/')
-def home():
-    return "OK - Dual-Engine Event & Technical Trading Bot Active!", 200
-
-@app.route('/init_webhook', methods=['GET', 'POST'])
-def init_webhook():
-    if not TELEGRAM_TOKEN or not RENDER_EXTERNAL_URL:
-        return "Missing variables", 400
-    url = f"{RENDER_EXTERNAL_URL.rstrip('/')}/{TELEGRAM_TOKEN}"
+def process_risk_amount(message):
     try:
-        bot.remove_webhook()
-        time.sleep(1)
-        res = bot.set_webhook(url=url)
-        return f"Success! Webhook set to {url}" if res else "Telegram rejected webhook", 200
-    except Exception as e:
-        return f"Error: {e}", 500
+        risk_amount = float(message.text.strip())
+        state = user_calc_state.get(message.from_user.id)
+        if not state:
+            bot.send_message(message.chat.id, "פג תוקף החישוב, נסה ללחוץ שוב על המקש.")
+            return
 
-@app.route(f'/{TELEGRAM_TOKEN}', methods=['POST'])
-def telegram_webhook():
-    if request.headers.get('content-type') == 'application/json':
-        try:
-            json_string = request.get_data().decode('utf-8')
-            update = types.Update.de_json(json_string)
-            bot.process_new_updates([update])
-            return 'OK', 200
-        except Exception as e:
-            logging.error(f"Webhook error: {e}")
-            return 'OK', 200
-    return 'Forbidden', 403
+        entry = state['entry']
+        sl = state['sl']
+        tp1 = state['tp1']
+        risk_per_share = abs(entry - sl)
 
-# תזמון שני מנועי הסריקה
-scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)  # מישור 1: חדשות
-scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)   # מישור 2: ניתוח טכני סדיר
+        if risk_per_share == 0:
+            bot.send_message(message.chat.id, "שגיאה בחישוב המרחק לסטופ לוס.")
+            return
+
+        shares = int(risk_amount / risk_per_share)
+        total_position = shares * entry
+        potential_profit = shares * abs(tp1 - entry)
+        curr_symbol = "$" if state.get('currency') == 'USD' else "₪"
+
+        reply = (
+            f"🧮 *תוצאות חישוב גודל פוזיציה עבור {state['ticker']}*\n\n"
+            f"• כמות מניות לקנייה: *{shares} מניות*\n"
+            f"• שווי פוזיציה כולל: *{curr_symbol}{total_position:,.2f}*\n"
+            f"• סיכון מקסימלי בעסקה: *{curr_symbol}{risk_amount:,.2f}*\n"
+            f"• רווח פוטנציאלי ביעד (TP1): *{curr_symbol}{potential_profit:,.2f}*\n"
+        )
+        bot.send_message(message.chat.id, reply, parse_mode="Markdown")
+    except ValueError:
+        bot.send_message(message.chat.id, "נא להזין מספר תקין בלבד.")
+
+# ==========================================
+# 10. תזמון משימות (APScheduler) ו-Flask Webhook
+# ==========================================
+scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
+
+# סורק טכני - כל 60 דקות, סורק חדשות - כל 15 דקות
+scheduler.add_job(scan_watchlist_technical, 'interval', minutes=60)
+scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
 scheduler.start()
 
+@app.route('/', methods=['GET'])
+def index():
+    return "PazPSTrading Bot is running!", 200
+
+@app.route(f'/{TELEGRAM_BOT_TOKEN}', methods=['POST'])
+def webhook():
+    json_string = request.get_data().decode('utf-8')
+    update = telebot.types.Update.de_json(json_string)
+    bot.process_new_updates([update])
+    return "OK", 200
+
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/{TELEGRAM_BOT_TOKEN}"
+        bot.remove_webhook()
+        bot.set_webhook(url=webhook_url)
+        logging.info(f"Webhook set to {webhook_url}")
+    
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
