@@ -80,12 +80,12 @@ def is_in_cooldown(ticker, hours=12):
 
 def mark_news_processed(news_id):
     processed_news_ids.add(news_id)
-    # שמירת 300 ידיעות אחרונות בזיכרון הדיסק
-    state["processed_news"] = list(processed_news_ids)[-300:]
+    # שמירת 500 ידיעות אחרונות בזיכרון הדיסק למניעת כפילויות
+    state["processed_news"] = list(processed_news_ids)[-500:]
     save_state(state)
 
 # ==========================================
-# 3. הגדרות רשימות ומקורות חדשות
+# 3. הגדרות רשימות ומקורות חדשות רוחביים
 # ==========================================
 
 # רשימת מעקב בלעדית לניתוח הטכני הסדיר
@@ -95,13 +95,26 @@ WATCHLIST = [
     "TEVA.TA", "NICE.TA", "LUMI.TA", "DSSL.TA", "ICL.TA"
 ]
 
-# פידים מורחבים לסורק החדשות (ביו-טק, תעופה, ביטחון, גיאופוליטיקה וחוזים)
+# פידים רוחביים וכלל-נושאיים (כיסוי מלא: עסקים, מבזקים, גיאופוליטיקה ואירועים גלובליים)
 BROAD_NEWS_FEEDS = [
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://news.google.com/rss/search?q=defense+military+contract+deal+stock&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=FDA+approval+phase+trial+cancer+pharma+stock&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=airline+aviation+incident+contract+stock&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=cybersecurity+tech+acquisition+stock&hl=en-US&gl=US&ceid=US:en"
+    # --- Google News: פידים כלליים ורוחביים (ראשיים) ---
+    "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en",  # Google News - כלכלה ועסקים עולמיים (ראשי)
+    "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-US&gl=US&ceid=US:en",     # Google News - חדשות עולם וגיאופוליטיקה
+    "https://news.google.com/rss?hl=he&gl=IL&ceid=IL:he",                                      # Google News - כותרות ראשיות בישראל (עברית)
+    "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=he&gl=IL&ceid=IL:he",    # Google News - כלכלה ועסקים בישראל
+
+    # --- ערוצי כלכלה ומבזקים מובילים בישראל ---
+    "https://www.calcalist.co.il/Integration/StoryRss1854.xml",  # כלכליסט - שוק ההון ומבזקים
+    "https://www.globes.co.il/news/rss/rssfeed.aspx?folderid=585", # גלובס - שוק ההון
+    "https://www.bizportal.co.il/rss/flash",                       # ביזפורטל - מבזקים בזמן אמת
+
+    # --- הודעות לעיתונות רשמיות בזמן אמת (כלל החברות הציבוריות) ---
+    "https://www.prnewswire.com/rss/news-releases-list.rss",     # PR Newswire - הודעות כלליות
+    "https://feed.businesswire.com/rss/home/?rss=G1QFDFWBXkZeGV1XWA==", # BusinessWire - הודעות כלליות
+
+    # --- סוכנויות ידיעות וכלכלה בינלאומיות ---
+    "https://feeds.bbci.co.uk/news/world/rss.xml",                # BBC World News
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories"  # MarketWatch Top Stories
 ]
 
 # ==========================================
@@ -236,30 +249,31 @@ def scan_breaking_news_events():
             title = entry.title
             summary = entry.get('summary', '')
 
-            # Prompt מתקדם להסקה רוחבית, קטליזטורים עתידיים והיפותטיים
+            # Prompt מתקדם להסקה רוחבית, קטליזטורים עתידיים והיפותטיים (תומך עברית ואנגלית)
             prompt = f"""
 אתה אנליסט פיננסי בכיר ואסטרטג מסחר בורסאי המתמחה בזיהוי השפעות רוחביות והשלכות מסדר שני (Second-Order Effects) וקטליזטורים עתידיים (Catalyst Events).
 
-נתח את הידיעה החדשותית הבאה:
+נתח את הידיעה החדשותית הבאה (העשויה להיות בעברית או באנגלית):
 כותרת: {title}
 תקציר: {summary}
 
-מטרת העל: לזהות אילו מניות (בארה"ב או בישראל) עשויות להרוויח דרמטית מהאירוע, כולל תרחישים היפותטיים, צופי פני עתיד, ניסויים קליניים, הסכמים, או תקלות/אירועים המשפיעים לטובה על מתחרים.
+מטרת העל: לזהות אילו מניות (בארה"ב או בישראל בבורסת תל אביב) עשויות להרוויח דרמטית מהאירוע, כולל תרחישים היפותטיים, צופי פני עתיד, ניסויים קליניים, הסכמים, או תקלות/אירועים המשפיעים לטובה על מתחרים.
 
 דוגמאות לחשיבה אנליטית:
-1. אירוע/תקרית בחברת תעופה (למשל תקלה או כמעט התרסקות) -> הסקה על מעבר נוסעים ועלייה בביקוש למניות תעופה מתחרות או מקומיות (למשל מניות תעופה ישראליות / DAL / AAL).
-2. ניסוי קליני, תכנית לניסוי או פיתוח חדשני בתרופה (למשל: "חברה X צפויה להתחיל ניסוי לתרופה...") -> פוטנציאל זינוק חזק לחברה המפתחת.
-3. הסלמה ביטחונית / איומים -> עלייה בביקוש למערכות הגנה אווירת, רחפנים וסייבר (מניות ביטחוניות/סייבר).
+1. אירוע/תקרית בחברת תעופה (למשל תקלה או כמעט התרסקות) -> הסקה על מעבר נוסעים ועלייה בביקוש למניות תעופה מתחרות או מקומיות (למשל: ESRX.TA, DAL, AAL).
+2. ניסוי קליני, תכנית לניסוי או פיתוח חדשני בתרופה -> פוטנציאל זינוק חזק לחברה המפתחת (למשל: MRNA, PFE, TEVA.TA).
+3. הסלמה ביטחונית / איומים -> עלייה בביקוש למערכות הגנה אווירת, רחפנים וסייבר (למשל: LMT, NOC, DSSL.TA).
 
 הוראות ביצוע:
 - בצע הסקה הגיונית וחופשית (אינך מוגבל לרשימה מסוימת).
-- אם מצאת מניה ספציפית בעלת פוטנציאל רווח בעקבות הידיעה, החזר JSON מבוקר בלבד:
+- אם המניה נסחרת בתל אביב, הצג את הטיקר בפורמט yfinance תקין (למשל: ESRX.TA, LUMI.TA, TEVA.TA).
+- אם מצאת מניה ספציפית בעלת פוטנציאל רווח בעקבות הידיעה, החזר JSON בלבד:
 {{
   "relevant": true,
   "ticker": "הטיקר המדויק שחולץ (לדוגמה: MRNA, LMT, DAL, ESRX.TA וכו')",
   "impact": "HIGH/MEDIUM",
-  "analysis": "הסבר אנליטי קצר על השרשרת הסיבתית: מה קרה באירוע ואיך הוא מוביל לפוטנציאל הרווח במניה המומלצת",
-  "reason": "נימוק קצר לתכנית העבודה והזרז (Catalyst) המוביל"
+  "analysis": "הסבר אנליטי קצר וחד בעברית על השרשרת הסיבתית: מה קרה באירוע ואיך הוא מוביל לפוטנציאל הרווח במניה המומלצת",
+  "reason": "נימוק קצר בעברית לתכנית העבודה והזרז (Catalyst) המוביל"
 }}
 
 אם הידיעה כללית לחלוטין ואין ממנה שום שרשרת סיבתית למניה ספציפית, החזר:
