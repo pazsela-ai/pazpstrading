@@ -14,10 +14,18 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# AI SDKs
+# AI SDKs with safe imports
 import google.generativeai as genai
-from groq import Groq
-from openai import OpenAI
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 # ---------------------------------------------------------------------------
 # 0. Logging Configuration
@@ -47,8 +55,8 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+groq_client = Groq(api_key=GROQ_API_KEY) if Groq and GROQ_API_KEY else None
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
 
 # Flask App
 app = Flask(__name__)
