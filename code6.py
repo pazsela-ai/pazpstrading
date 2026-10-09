@@ -48,17 +48,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 
-# Initialize Telegram Bot
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False) if TELEGRAM_BOT_TOKEN else None
 
-# Initialize AI Clients
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 groq_client = Groq(api_key=GROQ_API_KEY) if Groq and GROQ_API_KEY else None
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OpenAI and OPENAI_API_KEY else None
 
-# Flask App
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
@@ -89,12 +86,27 @@ WATCHLIST = [
 ]
 
 BROAD_NEWS_FEEDS = [
+    # --- חדשות כלליות ---
     "http://feeds.bbci.co.uk/news/world/rss.xml",
     "https://www.ynet.co.il/Integration/StoryRss1854.xml",
+
+    # --- תעופה, ביטחון, מזרח תיכון ---
     "https://news.google.com/rss/search?q=aviation+airline+incident+flight&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=war+military+strike+tensions+Middle+East&hl=en-US&gl=US&ceid=US:en",
+
+    # --- פארמה, ניסויים רפואיים, FDA ---
     "https://news.google.com/rss/search?q=pharma+FDA+approval+clinical+trial+phase&hl=en-US&gl=US&ceid=US:en",
+
+    # --- אנרגיה, נפט, גז ---
     "https://news.google.com/rss/search?q=oil+gas+strait+hormuz+pipeline+energy&hl=en-US&gl=US&ceid=US:en",
+
+    # --- עסקאות, רכישות, מיזוגים, חוזים ---
+    "https://news.google.com/rss/search?q=acquisition+merger+deal+contract+partnership&hl=en-US&gl=US&ceid=US:en",
+
+    # --- מדיניות גאו-פוליטית, מכסים, סנקציות, שבבים ---
+    "https://news.google.com/rss/search?q=sanctions+tariffs+semiconductor+export+policy&hl=en-US&gl=US&ceid=US:en",
+
+    # --- דיווחי SEC 8-K, דוחות כספיים ומאיה ---
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&start=0&count=40&output=atom",
     "https://news.google.com/rss/search?q=earnings+report+quarterly+results+revenue+EPS+beat+miss&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=site:maya.tase.co.il+דוח+מיידי+OR+דוח+כספי+OR+תוצאות&hl=he&gl=IL&ceid=IL:he",
@@ -120,7 +132,7 @@ def call_ai_failover(prompt: str) -> str:
             completion = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2
+                temperature=0.1
             )
             res_text = completion.choices[0].message.content
             if res_text:
@@ -133,7 +145,7 @@ def call_ai_failover(prompt: str) -> str:
             completion = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2
+                temperature=0.1
             )
             res_text = completion.choices[0].message.content
             if res_text:
@@ -286,18 +298,28 @@ def scan_breaking_news_events(is_test: bool = False):
                 summary = entry.get("summary", entry.get("description", ""))
 
                 prompt = f"""
-אתה מנוע AI למסחר פיננסי. קרא את הידיעה/הדיווח ובצע ניתוח והסקה אנליטית.
+אתה מנוע אנליטי למסחר פיננסי. קרא את הידיעה הבאה והערך את אימפקט ההשקעה:
 
 כותרת: {title}
 תקציר: {summary}
 
+הנחיות לניתוח:
+1. זהה אם הידיעה עוסקת באירוע בעל משמעות כלכלית/מסחרית:
+   - עסקאות, רכישות, מיזוגים, חוזי ענק, שותפויות.
+   - ניסויים רפואיים, אישורי FDA, התפתחויות פארמה.
+   - שינויים גאו-פוליטיים, מכסים, סנקציות, הסכמי סחר, מדיניות שבבים/טכנולוגיה.
+   - דוחות כספיים, תוצאות רבעוניות, דיווחי 8-K/מאיה.
+   - אירועים ביטחוניים/תעופתיים/אנרגטיים המשפיעים ישירות על נפט, תעופה או ביטחון.
+2. התאם Ticker ספציפי בארה"ב או בישראל (עם סיומת .TA). בצע הסקה הגיונית רק אם יש זיקה כלכלית ברורה!
+3. אם הידיעה היא פוליטיקה כללית, פלילים, רכילות או ללא השפעה מסחרית ניכרת - החזר "NONE".
+
 החזר JSON בלבד:
 {{
-  "ticker": "ELAL.TA",
+  "ticker": "NONE",
   "category": "NEWS_EVENT",
   "intensity": "HIGH",
-  "analysis": "הסבר מפורט בעברית",
-  "recommendation": "המלצה בעברית"
+  "analysis": "הסבר מפורט בעברית על ההסקה וההשפעה המסחרית",
+  "recommendation": "המלצת מסחר קצרה בעברית"
 }}
 """
                 ai_raw = call_ai_failover(prompt)
@@ -311,16 +333,21 @@ def scan_breaking_news_events(is_test: bool = False):
                     continue
 
                 ticker = str(data.get("ticker", "")).strip().upper()
-                if not ticker or ticker in ["NONE", "NULL"]:
+                if not ticker or ticker in ["NONE", "NULL", "N/A"]:
+                    continue
+
+                market_info = check_market_status(ticker)
+                # סינון שוק סגור (רץ בלייב בלבד, עוקף בטסט)
+                if market_info["status"] == "CLOSED" and not is_test:
+                    logger.info(f"Market for {ticker} is CLOSED. Skipping automatic alert.")
                     continue
 
                 if not is_test and is_in_cooldown(ticker):
                     continue
 
-                market_info = check_market_status(ticker)
                 price_data = check_liquidity_and_price(ticker)
                 if not price_data.get("valid"):
-                    price_data = {"current_price": 100.0, "atr": 2.0, "sl": 97.6, "tp1": 104.0, "tp2": 108.0}
+                    continue
 
                 send_telegram_alert(
                     ticker=ticker,
@@ -505,13 +532,11 @@ def setup_webhook():
         except Exception as e:
             logger.error(f"Failed to set Webhook: {e}")
 
-# Scheduler Setup
 scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
 scheduler.add_job(scan_breaking_news_events, "interval", minutes=15)
 scheduler.add_job(scan_watchlist_technical, "interval", minutes=30)
 scheduler.start()
 
-# Set Webhook automatically on start
 setup_webhook()
 
 if __name__ == "__main__":
