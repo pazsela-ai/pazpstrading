@@ -100,32 +100,10 @@ BROAD_NEWS_FEEDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# 3. AI Failover Engine
+# 3. AI Failover Engine (Updated with valid models)
 # ---------------------------------------------------------------------------
 def call_ai_failover(prompt: str) -> str:
-    if GEMINI_API_KEY:
-        for model_name in ['gemini-2.0-flash', 'gemini-1.5-flash']:
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(prompt)
-                if response and response.text:
-                    return response.text
-            except Exception as e:
-                logger.warning(f"Gemini {model_name} failed: {e}")
-
-    if groq_client:
-        try:
-            completion = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
-            )
-            res_text = completion.choices[0].message.content
-            if res_text:
-                return res_text
-        except Exception as e:
-            logger.warning(f"Groq failed: {e}")
-
+    # 1. Try OpenAI First
     if openai_client:
         try:
             completion = openai_client.chat.completions.create(
@@ -138,6 +116,32 @@ def call_ai_failover(prompt: str) -> str:
                 return res_text
         except Exception as e:
             logger.warning(f"OpenAI failed: {e}")
+
+    # 2. Try Gemini
+    if GEMINI_API_KEY:
+        for model_name in ['gemini-1.5-flash', 'gemini-1.5-pro']:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt)
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                logger.warning(f"Gemini {model_name} failed: {e}")
+
+    # 3. Try Groq
+    if groq_client:
+        for model_name in ["llama-3.1-70b-versatile", "llama3-70b-8192"]:
+            try:
+                completion = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1
+                )
+                res_text = completion.choices[0].message.content
+                if res_text:
+                    return res_text
+            except Exception as e:
+                logger.warning(f"Groq {model_name} failed: {e}")
 
     return ""
 
@@ -275,11 +279,9 @@ def scan_breaking_news_events(is_test: bool = False):
     for feed_url in BROAD_NEWS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
-            # מעבר על כל הכתבות בפיד (ללא הגבלה מלאכותית)
             for entry in feed.entries:
                 art_id = entry.get("id", entry.get("link", entry.get("title", "")))
                 
-                # מניעת כפילויות קשיחה
                 if art_id in seen_articles:
                     continue
                 seen_articles.add(art_id)
@@ -287,7 +289,6 @@ def scan_breaking_news_events(is_test: bool = False):
                 title = entry.get("title", "")
                 summary = entry.get("summary", entry.get("description", ""))
 
-                # סינון כתבות שפורסמו לפני למעלה מ-24 שעות
                 pub_parsed = entry.get("published_parsed")
                 if pub_parsed:
                     pub_dt = datetime(*pub_parsed[:6])
@@ -330,11 +331,9 @@ def scan_breaking_news_events(is_test: bool = False):
                 score = int(data.get("score", 0))
                 ticker = str(data.get("ticker", "")).strip().upper()
 
-                # סינון לפי סף איכות דינמי (ציון לפחות 70)
                 if score < 70 or not ticker or ticker in ["NONE", "NULL", "N/A"]:
                     continue
 
-                # 1. בדיקת שעות מסחר - חסימה מוחלטת כשהשוק סגור!
                 market_info = check_market_status(ticker)
                 if market_info["status"] == "CLOSED":
                     logger.info(f"Market for {ticker} is CLOSED ({market_info['market']}). Skipping alert.")
@@ -364,7 +363,6 @@ def scan_watchlist_technical(is_test: bool = False):
     logger.info("Starting scan_watchlist_technical...")
     for ticker in WATCHLIST:
         try:
-            # 1. בדיקת שעות מסחר - חסימה מוחלטת כשהשוק סגור!
             market_info = check_market_status(ticker)
             if market_info["status"] == "CLOSED":
                 continue
