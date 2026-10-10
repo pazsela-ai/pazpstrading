@@ -86,39 +86,17 @@ WATCHLIST = [
 ]
 
 BROAD_NEWS_FEEDS = [
-    # --- חדשות כלליות ועולמיות ---
     "http://feeds.bbci.co.uk/news/world/rss.xml",
     "https://www.ynet.co.il/Integration/StoryRss1854.xml",
-
-    # --- תעופה, ביטחון, מזרח תיכון ---
     "https://news.google.com/rss/search?q=aviation+airline+incident+flight&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=war+military+strike+tensions+Middle+East&hl=en-US&gl=US&ceid=US:en",
-
-    # --- פארמה, ניסויים קליניים, FDA ---
     "https://news.google.com/rss/search?q=pharma+FDA+approval+clinical+trial+phase&hl=en-US&gl=US&ceid=US:en",
-
-    # --- אנרגיה, נפט, גז ---
     "https://news.google.com/rss/search?q=oil+gas+strait+hormuz+pipeline+energy&hl=en-US&gl=US&ceid=US:en",
-
-    # --- עסקאות, רכישות, מיזוגים, חוזי ענק ---
     "https://news.google.com/rss/search?q=acquisition+merger+deal+contract+partnership&hl=en-US&gl=US&ceid=US:en",
-
-    # --- מאקרו, מדיניות גאו-פוליטית, סנקציות, מכסים, שבבים, ריבית ---
     "https://news.google.com/rss/search?q=sanctions+tariffs+semiconductor+export+policy&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=Federal+Reserve+interest+rates+inflation+CPI&hl=en-US&gl=US&ceid=US:en",
-
-    # --- סייבר, פריצות ואבטחה ---
-    "https://news.google.com/rss/search?q=cyberattack+data+breach+cybersecurity&hl=en-US&gl=US&ceid=US:en",
-
-    # --- שינויי מנכ"לים, הגבלים עסקיים ותביעות ---
-    "https://news.google.com/rss/search?q=CEO+steps+down+resigns+activist+investor&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=antitrust+lawsuit+DOJ+FTC+investigation&hl=en-US&gl=US&ceid=US:en",
-
-    # --- דיווחי SEC 8-K, דוחות כספיים ומאיה ---
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&start=0&count=40&output=atom",
-    "https://news.google.com/rss/search?q=earnings+report+quarterly+results+revenue+EPS+beat+miss&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=site:maya.tase.co.il+דוח+מיידי+OR+דוח+כספי+OR+תוצאות&hl=he&gl=IL&ceid=IL:he",
-    "https://news.google.com/rss/search?q=PR+Newswire+earnings+release+quarterly&hl=en-US&gl=US&ceid=US:en"
+    "https://news.google.com/rss/search?q=earnings+report+quarterly+results+revenue+EPS+beat&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=site:maya.tase.co.il+דוח+מיידי+OR+דוח+כספי+OR+תוצאות&hl=he&gl=IL&ceid=IL:he"
 ]
 
 # ---------------------------------------------------------------------------
@@ -174,12 +152,12 @@ def check_market_status(ticker: str) -> dict:
     time_str = now_il.strftime("%H:%M")
 
     if is_israel:
-        if weekday in [6, 0, 1, 2, 3]:
+        if weekday in [6, 0, 1, 2, 3]: # Sunday to Thursday
             if "09:59" <= time_str <= "17:30":
                 return {"status": "OPEN", "market": "Israel (TASE)"}
         return {"status": "CLOSED", "market": "Israel (TASE)"}
     else:
-        if weekday in [0, 1, 2, 3, 4]:
+        if weekday in [0, 1, 2, 3, 4]: # Monday to Friday
             if "11:00" <= time_str < "16:30":
                 return {"status": "PRE_MARKET", "market": "US Markets"}
             elif "16:30" <= time_str <= "23:00":
@@ -244,11 +222,11 @@ def send_telegram_alert(ticker: str, alert_type: str, analysis: str, recommendat
     m_name = market_info.get("market", "N/A")
 
     if "EARNINGS" in alert_type or "REPORT" in alert_type:
-        badge = "📑 איתות דיווח חברה / דוח כספי"
+        badge = "📑 איתות דיווח חברה / דוח כספי (קנייה)"
     elif "NEWS" in alert_type:
-        badge = "🚨 איתות חדשותי מתפרץ"
+        badge = "🚨 איתות חדשותי מתפרץ (קנייה)"
     else:
-        badge = "📊 איתות סורק טכני"
+        badge = "📊 איתות סורק טכני (קנייה)"
 
     intensity_badge = "🔥 HIGH" if intensity.upper() == "HIGH" else "⚡ MEDIUM"
 
@@ -263,8 +241,8 @@ def send_telegram_alert(ticker: str, alert_type: str, analysis: str, recommendat
 
     msg += (
         f"\n<b>💡 ניתוח והסקה:</b>\n{analysis}\n\n"
-        f"<b>📌 המלצה:</b> {recommendation}\n\n"
-        f"<b>🎯 פרמטרי פוזיציה:</b>\n"
+        f"<b>📌 המלצת קנייה:</b> {recommendation}\n\n"
+        f"<b>🎯 פרמטרי פוזיציה (BUY):</b>\n"
         f"• מחיר כניסה משוער: <b>${price:.2f}</b>\n"
         f"• Stop Loss (SL): <b>${sl:.2f}</b>\n"
         f"• Target 1 (TP1): <b>${tp1:.2f}</b>\n"
@@ -297,38 +275,46 @@ def scan_breaking_news_events(is_test: bool = False):
     for feed_url in BROAD_NEWS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:5]:
+            # מעבר על כל הכתבות בפיד (ללא הגבלה מלאכותית)
+            for entry in feed.entries:
                 art_id = entry.get("id", entry.get("link", entry.get("title", "")))
-                if not is_test and art_id in seen_articles:
+                
+                # מניעת כפילויות קשיחה
+                if art_id in seen_articles:
                     continue
                 seen_articles.add(art_id)
+
                 title = entry.get("title", "")
                 summary = entry.get("summary", entry.get("description", ""))
 
+                # סינון כתבות שפורסמו לפני למעלה מ-24 שעות
+                pub_parsed = entry.get("published_parsed")
+                if pub_parsed:
+                    pub_dt = datetime(*pub_parsed[:6])
+                    if datetime.utcnow() - pub_dt > timedelta(hours=24):
+                        continue
+
                 prompt = f"""
-אתה מנוע AI אנליטי חופשי ומבריק למסחר פיננסי. תפקידך לקרוא את הכתבה/הדיווח ולהפעיל ניתוח והסקה כלכלית עצמאית (Deductive Reasoning):
+אתה מנוע AI אנליטי מבריק למסחר פיננסי. תפקידך לנתח את הידיעה הבאה ולדרג את פוטנציאל ההשקעה:
 
 כותרת הידיעה: {title}
 תקציר הידיעה: {summary}
 
-משימה והנחיות:
-1. קבע אם הידיעה כוללת אירוע פנדמנטלי/מסחרי/מאקרו בעל אימפקט ממשי:
-   - עסקאות, מיזוגים, רכישות, חוזי ענק, שותפויות.
-   - ניסויים קליניים, אישורי FDA, התפתחויות פארמה.
-   - שינויים גאו-פוליטיים, מכסים, סנקציות, מדיניות שבבים/טכנולוגיה, ריבית.
-   - מתקפות סייבר, שיבושים בשרשרת אספקה/ספנות.
-   - דוחות כספיים, תוצאות רבעוניות, שינויי הנהלה/מנכ"לים.
-   - אירועים ביטחוניים/תעופתיים/אנרגטיים.
-2. זהה באופן עצמאי לחלוטין איזו מניה נסחרת (בארה"ב או בישראל עם סיומת .TA) מושפעת ביותר מהאירוע הזה. אל תגביל את עצמך לרשימה סגורה!
-3. אם הידיעה היא חדשות כלליות, רכילות, פלילים או ללא השפעה מסחרית ישירה שניתן להסיק ממנה - החזר "NONE".
+הנחיות לדירוג וניתוח:
+1. **המלצות קנייה בלבד (BUY / LONG):** נתח האם לידיעה יש אימפקט חיובי (עליית מחיר / הזדמנות מסחרית) על מניה ספציפית בארה"ב או בישראל (.TA). אם הידיעה שלילית (SELL / SHORT) - החזר "NONE".
+2. **דירוג פוטנציאל ההשקעה (score 1-100):**
+   - דרג 70 ומעלה רק אם לידיעה יש משמעות כלכלית/פנדמנטלית ממשית (עסקה, ניסוי קליני, אישור FDA, דוח כספי חזק, חוזה ענק, או אירוע מאקרו/גאו-פוליטי משפיע).
+   - אם מדובר ברעשי רקע, פוליטיקה, פלילים או אירוע ללא אימפקט מסחרי - תן ציון נמוך מ-70 והחזר "NONE".
+3. **ללא הזיות:** חלץ Ticker רק אם יש קשר סיבתי-כלכלי הגיוני.
 
-החזר JSON בלבד, ללא שום טקסט נוסף:
+החזר JSON בלבד:
 {{
   "ticker": "NONE",
+  "score": 0,
   "category": "NEWS_EVENT",
   "intensity": "HIGH",
-  "analysis": "הסבר מפורט בעברית על ההסקה וההשפעה המסחרית",
-  "recommendation": "המלצת מסחר קצרה בעברית"
+  "analysis": "הסבר מפורט בעברית על ההסקה וההזדמנות החיובית",
+  "recommendation": "המלצת קנייה קצרה בעברית"
 }}
 """
                 ai_raw = call_ai_failover(prompt)
@@ -341,17 +327,20 @@ def scan_breaking_news_events(is_test: bool = False):
                 except Exception:
                     continue
 
+                score = int(data.get("score", 0))
                 ticker = str(data.get("ticker", "")).strip().upper()
-                if not ticker or ticker in ["NONE", "NULL", "N/A"]:
+
+                # סינון לפי סף איכות דינמי (ציון לפחות 70)
+                if score < 70 or not ticker or ticker in ["NONE", "NULL", "N/A"]:
                     continue
 
+                # 1. בדיקת שעות מסחר - חסימה מוחלטת כשהשוק סגור!
                 market_info = check_market_status(ticker)
-                # סינון שוק סגור (רץ בלייב בלבד, עוקף בטסט)
-                if market_info["status"] == "CLOSED" and not is_test:
-                    logger.info(f"Market for {ticker} is CLOSED. Skipping automatic alert.")
+                if market_info["status"] == "CLOSED":
+                    logger.info(f"Market for {ticker} is CLOSED ({market_info['market']}). Skipping alert.")
                     continue
 
-                if not is_test and is_in_cooldown(ticker):
+                if is_in_cooldown(ticker):
                     continue
 
                 price_data = check_liquidity_and_price(ticker)
@@ -375,11 +364,12 @@ def scan_watchlist_technical(is_test: bool = False):
     logger.info("Starting scan_watchlist_technical...")
     for ticker in WATCHLIST:
         try:
-            if not is_test and is_in_cooldown(ticker):
+            # 1. בדיקת שעות מסחר - חסימה מוחלטת כשהשוק סגור!
+            market_info = check_market_status(ticker)
+            if market_info["status"] == "CLOSED":
                 continue
 
-            market_info = check_market_status(ticker)
-            if market_info["status"] == "CLOSED" and not is_test:
+            if is_in_cooldown(ticker):
                 continue
 
             t = yf.Ticker(ticker)
@@ -437,11 +427,11 @@ def scan_watchlist_technical(is_test: bool = False):
 if bot:
     @bot.message_handler(commands=['start'])
     def cmd_start(message):
-        bot.reply_to(message, "👋 PazPSTrading Bot פעיל וזמין! שלח /test_news או /test_tech לבדיקה.")
+        bot.reply_to(message, "👋 PazPSTrading Bot פעיל וזמין! סריקת החדשות והטכני פועלות בזמן אמת בשעות המסחר.")
 
     @bot.message_handler(commands=['test_news', 'news_scan'])
     def cmd_test_news(message):
-        bot.reply_to(message, "🧪 מריץ סריקת חדשות ודוחות כספיים בזמן אמת...")
+        bot.reply_to(message, "🧪 מריץ סריקת חדשות בזמן אמת (רק מניות שהשוק שלהן פתוח כעת)...")
         scan_breaking_news_events(is_test=True)
         bot.send_message(message.chat.id, "✅ סריקת החדשות הסתיימה.")
 
