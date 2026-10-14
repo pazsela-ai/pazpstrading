@@ -168,29 +168,33 @@ def check_market_status(ticker: str) -> dict:
                 return {"status": "OPEN", "market": "US Markets"}
         return {"status": "CLOSED", "market": "US Markets"}
 
-def check_liquidity_and_price(ticker: str) -> dict:
+def check_liquidity_and_price(ticker: str, custom_sl=None, custom_tp1=None) -> dict:
     try:
         t = yf.Ticker(ticker)
-        df = t.history(period="60d", interval="1d")
+        df = t.history(period="100d", interval="1d")
         if df.empty or len(df) < 20:
             return {"valid": False, "reason": "Insufficient market data"}
-
-        df.ta.atr(length=14, append=True)
-        atr_col = [c for c in df.columns if c.startswith("ATRr_")]
-        atr_val = df[atr_col[0]].iloc[-1] if atr_col else (df["High"].iloc[-1] - df["Low"].iloc[-1])
 
         current_price = df["Close"].iloc[-1]
         avg_vol_20 = df["Volume"].tail(20).mean()
         dollar_volume = current_price * avg_vol_20
 
-        sl = max(0.01, current_price - (1.2 * atr_val))
-        tp1 = current_price + (2.0 * atr_val)
-        tp2 = current_price + (4.0 * atr_val)
+        # שימוש בפרמטרי סטופ לוס ויעד מותאמים (3% ו-6%) במידה וסופקו מראש
+        if custom_sl is not None and custom_tp1 is not None:
+            sl = custom_sl
+            tp1 = custom_tp1
+            tp2 = current_price * 1.12
+        else:
+            df.ta.atr(length=14, append=True)
+            atr_col = [c for c in df.columns if c.startswith("ATRr_")]
+            atr_val = df[atr_col[0]].iloc[-1] if atr_col else (df["High"].iloc[-1] - df["Low"].iloc[-1])
+            sl = max(0.01, current_price - (1.2 * atr_val))
+            tp1 = current_price + (2.0 * atr_val)
+            tp2 = current_price + (4.0 * atr_val)
 
         return {
             "valid": True,
             "current_price": float(current_price),
-            "atr": float(atr_val),
             "sl": float(sl),
             "tp1": float(tp1),
             "tp2": float(tp2),
@@ -230,7 +234,7 @@ def send_telegram_alert(ticker: str, alert_type: str, analysis: str, recommendat
     elif "NEWS" in alert_type:
         badge = "🚨 איתות חדשותי מתפרץ (קנייה)"
     else:
-        badge = "📊 איתות סורק טכני (קנייה)"
+        badge = "🎯 התראת כניסה: אסטרטגיית שייטת ממוצע 20"
 
     intensity_badge = "🔥 HIGH" if intensity.upper() == "HIGH" else "⚡ MEDIUM"
 
@@ -248,12 +252,12 @@ def send_telegram_alert(ticker: str, alert_type: str, analysis: str, recommendat
         f"<b>📌 המלצת קנייה:</b> {recommendation}\n\n"
         f"<b>🎯 פרמטרי פוזיציה (BUY):</b>\n"
         f"• מחיר כניסה משוער: <b>${price:.2f}</b>\n"
-        f"• Stop Loss (SL): <b>${sl:.2f}</b>\n"
-        f"• Target 1 (TP1): <b>${tp1:.2f}</b>\n"
+        f"• Stop Loss (3%): <b>${sl:.2f}</b>\n"
+        f"• Target 1 (6%): <b>${tp1:.2f}</b>\n"
     )
 
     if intensity.upper() == "HIGH" and tp2 > 0:
-        msg += f"• Target 2 (TP2): <b>${tp2:.2f}</b>\n"
+        msg += f"• Target 2: <b>${tp2:.2f}</b>\n"
 
     tv_ticker = ticker.replace(".TA", "")
     tv_url = f"https://www.tradingview.com/symbols/{tv_ticker}/"
@@ -360,7 +364,11 @@ def scan_breaking_news_events(is_test: bool = False):
             logger.error(f"Error scanning feed {feed_url}: {e}")
 
 def scan_watchlist_technical(is_test: bool = False):
-    logger.info("Starting scan_watchlist_technical...")
+    """
+    סורק את ה-Watchlist על פי אסטרטגיית 'שייטת ממוצע 20' בלבד.
+    בוחן עמידה ב-100% מהתנאים בדיוק כפי שהוגדרו.
+    """
+    logger.info("Starting scan_watchlist_technical (MA20 Pullback Strategy)...")
     for ticker in WATCHLIST:
         try:
             market_info = check_market_status(ticker)
@@ -371,51 +379,124 @@ def scan_watchlist_technical(is_test: bool = False):
                 continue
 
             t = yf.Ticker(ticker)
-            df = t.history(period="60d", interval="1d")
+            df = t.history(period="100d", interval="1d")
             if df.empty or len(df) < 50:
                 continue
 
-            df.ta.ema(length=20, append=True)
-            df.ta.ema(length=50, append=True)
-            df.ta.rsi(length=14, append=True)
+            # חישוב ממוצעים נעים
+            df['SMA20'] = df['Close'].rolling(window=20).mean()
+            df['SMA40'] = df['Close'].rolling(window=40).mean()
+            df['SMA50'] = df['Close'].rolling(window=50).mean()
 
-            close = df["Close"].iloc[-1]
-            ema20 = df["EMA_20"].iloc[-1]
-            ema50 = df["EMA_50"].iloc[-1]
-            rsi = df["RSI_14"].iloc[-1]
-            vol_curr = df["Volume"].iloc[-1]
-            vol_avg20 = df["Volume"].tail(20).mean()
+            df = df.dropna()
+            if len(df) < 11:
+                continue
 
-            score = 0
-            reasons = []
+            curr_row = df.iloc[-1]
+            close_price = float(curr_row['Close'])
+            open_price = float(curr_row['Open'])
+            high_price = float(curr_row['High'])
+            low_price = float(curr_row['Low'])
 
-            if close > ema20:
-                score += 25
-                reasons.append("מחיר מעל EMA20")
-            if close > ema50:
-                score += 25
-                reasons.append("מחיר מעל EMA50")
-            if 48 <= rsi <= 68:
-                score += 25
-                reasons.append(f"RSI בריא ({rsi:.1f})")
-            if vol_curr > (1.1 * vol_avg20):
-                score += 25
-                reasons.append("נפח מסחר גבוה")
+            sma20 = float(curr_row['SMA20'])
+            sma40 = float(curr_row['SMA40'])
+            sma50 = float(curr_row['SMA50'])
 
-            if score >= 65:
-                p_data = check_liquidity_and_price(ticker)
-                if not p_data.get("valid"):
-                    continue
+            # ----------------------------------------------------
+            # תנאי 1: מגמה כללית (Trend)
+            # ----------------------------------------------------
+            # SMA20 נמצא מעל SMA40 או SMA50
+            ma_trend_ok = (sma20 > sma40) or (sma20 > sma50)
+            if not ma_trend_ok:
+                continue
 
-                send_telegram_alert(
-                    ticker=ticker,
-                    alert_type="TECHNICAL_SCAN",
-                    analysis=f"איתות טכני חיובי זוהה! ציון: {score}/100. פרמטרים: {', '.join(reasons)}.",
-                    recommendation="מומנטום חיובי לפריצה.",
-                    intensity="HIGH" if score >= 85 else "MEDIUM",
-                    price_data=p_data,
-                    market_info=market_info
-                )
+            # שיפוע ממוצע 20 חיובי ב-5 עד 10 הנרות האחרונים
+            sma20_5d_ago = float(df['SMA20'].iloc[-6])
+            sma20_10d_ago = float(df['SMA20'].iloc[-11])
+            slope_ok = (sma20 > sma20_5d_ago) and (sma20_5d_ago > sma20_10d_ago)
+            if not slope_ok:
+                continue
+
+            # ----------------------------------------------------
+            # תנאי 2: מרחק המחיר מממוצע 20 (Proximity / Distance)
+            # ----------------------------------------------------
+            # הגבוה ב-3 הימים האחרונים היה מעל ממוצע 20
+            high_3d = df['High'].iloc[-3:].max()
+            if high_3d <= sma20:
+                continue
+
+            # מרחק מחיר נוכחי ושפל מממוצע 20
+            dist_close = ((close_price - sma20) / sma20) * 100
+            dist_low = ((low_price - sma20) / sma20) * 100
+
+            # בין 0% ל-1.5% בלבד מממוצע 20
+            is_close = (dist_low <= 1.5 and dist_close >= -0.5) or (0 <= dist_close <= 1.5)
+            if not is_close:
+                continue
+
+            # פוסל חדיר: אם המחיר נמצא יותר מ-2% מעל ממוצע 20
+            if dist_close > 2.0:
+                continue
+
+            # ----------------------------------------------------
+            # תנאי 3: תגובת המחיר / נר אישור (Confirmation Trigger)
+            # ----------------------------------------------------
+            body_size = abs(close_price - open_price)
+            total_range = high_price - low_price
+            is_red = close_price < open_price
+
+            # בדיקה שאין נר אדום רחב ששובר את הממוצע
+            is_wide_red = is_red and (close_price < sma20) and (body_size > 0.6 * total_range)
+            if is_wide_red:
+                continue
+
+            # א. נר פטיש (Hammer)
+            lower_wick = min(open_price, close_price) - low_price
+            is_hammer = (lower_wick >= 2 * body_size) and (low_price <= sma20)
+
+            # ב. נר ירוק בולע/חזק
+            is_closed_upper_half = close_price >= (low_price + 0.5 * total_range)
+            is_strong_green = (close_price > open_price) and is_closed_upper_half and (low_price <= sma20 * 1.01)
+
+            if not (is_hammer or is_strong_green):
+                continue
+
+            pattern_name = "נר פטיש" if is_hammer else "נר ירוק עקב נגיעה ב-MA20"
+
+            # ----------------------------------------------------
+            # תנאי 4: בדיקת התאמת סטופ-לוס (3% Stop Loss Check)
+            # ----------------------------------------------------
+            entry_price = close_price
+            stop_loss = entry_price * 0.97  # סטופ לוס 3%
+            take_profit = entry_price * 1.06  # יעד רווח 6%
+
+            # סטופ לוס חייב לשבת מתחת לממוצע 20
+            if stop_loss >= sma20:
+                continue
+
+            # ----------------------------------------------------
+            # הפקת ההתראה במידה וכל התנאים התקיימו 100%
+            # ----------------------------------------------------
+            p_data = check_liquidity_and_price(ticker, custom_sl=stop_loss, custom_tp1=take_profit)
+            if not p_data.get("valid"):
+                continue
+
+            analysis_str = (
+                f"• <b>מיקום ממוצע 20:</b> ${sma20:.2f} (מרחק: {dist_close:.2f}%)\n"
+                f"• <b>תבנית שנצפתה:</b> {pattern_name}\n"
+                f"• <b>בדיקת סטופ לוס 3%:</b> ${stop_loss:.2f} (מתחת לתמיכת MA20 מבוססת)"
+            )
+
+            send_telegram_alert(
+                ticker=ticker,
+                alert_type="TECHNICAL_SCAN_MA20",
+                analysis=analysis_str,
+                recommendation="כניסה מומלצת על בסיס נגיעה ואישור תמיכה ב-MA20.",
+                intensity="HIGH",
+                price_data=p_data,
+                market_info=market_info
+            )
+
         except Exception as e:
             logger.error(f"Error scanning technical {ticker}: {e}")
 
@@ -435,7 +516,7 @@ if bot:
 
     @bot.message_handler(commands=['test_tech'])
     def cmd_test_tech(message):
-        bot.reply_to(message, "🧪 מריץ סריקת Watchlist טכנית...")
+        bot.reply_to(message, "🧪 מריץ סריקת Watchlist טכנית (אסטרטגיית 'שייטת ממוצע 20')...")
         scan_watchlist_technical(is_test=True)
         bot.send_message(message.chat.id, "✅ סריקת Watchlist הסתיימה.")
 
