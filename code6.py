@@ -3,9 +3,10 @@ import re
 import json
 import time
 import logging
+import threading
 from datetime import datetime, timedelta
 import pytz
-from flask import Flask, request
+from flask import Flask
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -35,9 +36,6 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '').strip()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', '').strip()
 
-RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
-
-# Initialize TeleBot & Flask
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 app = Flask(__name__)
 
@@ -488,43 +486,38 @@ def process_risk_amount(message, ticker, entry, sl, curr):
         bot.reply_to(message, "ערך לא תקין. אנא הזן מספר בלבד.")
 
 # ---------------------------------------------------------------------------
-# WEBHOOK & FLASK ROUTES
+# FLASK DUMMY SERVER FOR RENDER HEALTH CHECK
 # ---------------------------------------------------------------------------
 @app.route('/', methods=['GET', 'HEAD'])
 def index():
     return "PazPSTrading Bot is active & running!", 200
 
-@app.route('/webhook', methods=['POST'])
-@app.route(f'/{TELEGRAM_BOT_TOKEN}', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    else:
-        return 'Invalid content-type', 403
-
-# Setup Webhook and Scheduler only when executed directly or on WSGI start
-def setup_bot():
-    if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        logger.info(f"Setting Webhook to: {webhook_url}")
-        try:
-            bot.remove_webhook()
-            time.sleep(1)
-            bot.set_webhook(url=webhook_url)
-        except Exception as e:
-            logger.error(f"Error setting webhook: {e}")
-
-# Run setup
-setup_bot()
-
-scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
-scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
-scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)
-scheduler.start()
-
-if __name__ == '__main__':
+def run_flask_dummy():
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
+
+# ---------------------------------------------------------------------------
+# MAIN STARTUP
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    # 1. Start Flask in background thread to satisfy Render's HTTP Port check
+    flask_thread = threading.Thread(target=run_flask_dummy)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # 2. Start Scheduler
+    scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
+    scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
+    scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)
+    scheduler.start()
+
+    # 3. Clean any existing Webhooks to force direct Polling
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except Exception as e:
+        logger.warning(f"Failed removing webhook: {e}")
+
+    # 4. Start Infinite Telegram Polling
+    logger.info("Bot is starting polling now...")
+    bot.infinity_polling(timeout=20, long_polling_timeout=20)
