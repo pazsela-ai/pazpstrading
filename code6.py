@@ -488,9 +488,9 @@ def process_risk_amount(message, ticker, entry, sl, curr):
         bot.reply_to(message, "ערך לא תקין. אנא הזן מספר בלבד.")
 
 # ---------------------------------------------------------------------------
-# WEBHOOK & FLASK ROUTES (EXECUTED ON GUNICORN STARTUP)
+# WEBHOOK & FLASK ROUTES
 # ---------------------------------------------------------------------------
-@app.route('/', methods=['GET'])
+@app.route('/', methods=['GET', 'HEAD'])
 def index():
     return "PazPSTrading Bot is active & running!", 200
 
@@ -505,20 +505,20 @@ def webhook():
     else:
         return 'Invalid content-type', 403
 
-def init_app():
-    """ Runs automatically when Gunicorn loads this module """
+# Setup Webhook and Scheduler only when executed directly or on WSGI start
+def setup_bot():
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        logger.info(f"Setting Webhook via Gunicorn to: {webhook_url}")
+        logger.info(f"Setting Webhook to: {webhook_url}")
         try:
             bot.remove_webhook()
             time.sleep(1)
             bot.set_webhook(url=webhook_url)
         except Exception as e:
-            logger.error(f"Failed setting webhook: {e}")
+            logger.error(f"Error setting webhook: {e}")
 
-# Global Initialization
-init_app()
+# Run setup
+setup_bot()
 
 scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
 scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
@@ -526,5 +526,5 @@ scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)
 scheduler.start()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
