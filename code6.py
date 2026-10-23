@@ -79,16 +79,72 @@ WATCHLIST = [
     # --- ארה"ב: פארמה, בריאות וביוטק ---
     "PFE", "MRNA", "LLY", "NVO", "JNJ", "ABBV", "WMT", "COST", "TGT", "DIS", "NFLX",
 
-    # --- ישראל (בורסת תל אביב - .TA) ---
-    "TEVA.TA", "NICE.TA", "ICL.TA", "TSEM.TA", "ELBT.TA", "CAMT.TA", "PRIO.TA",
-    "POLI.TA", "LUMI.TA", "DISB.TA", "MZTF.TA", "FIBI.TA", "ENLT.TA", "ENOG.TA",
-    "AZRG.TA", "NMVG.TA", "DELT.TA", "DNYA.TA", "PHRE.TA"
+    # =========================================================================
+    # --- ישראל: בורסת תל אביב (.TA) - 50 המניות המובילות והנזילות ביותר ---
+    # =========================================================================
+    # בנקים ופיננסים
+    "LUMI.TA",  # בנק לאומי
+    "POLI.TA",  # בנק הפועלים
+    "DISB.TA",  # בנק דיסקונט
+    "MZTF.TA",  # בנק מזרחי טפחות
+    "FIBI.TA",  # הבנק הבינלאומי
+    "HARL.TA",  # הראל השקעות
+    "CLIS.TA",  # כלל ביטוח
+    "MNX.TA",   # מגדל ביטוח
+    "PHNX.TA",  # הפניקס
+
+    # טכנולוגיה, דואליות וסמיקונדקטורס
+    "TEVA.TA",  # טבע
+    "NICE.TA",  # נייס
+    "CAMT.TA",  # קמטק
+    "TSEM.TA",  # טאואר
+    "ELBT.TA",  # אלביט מערכות
+    "PRIO.TA",  # פריורטק
+    "NOVA.TA",  # נובה
+    "MTRX.TA",  # מטריקס
+    "ONE.TA",   # וואן טכנולוגיות
+    "HIL.TA",   # חילן
+
+    # אנרגיה, דלק ותשתיות
+    "ICL.TA",   # איי.סי.אל (כיל)
+    "DLEKG.TA", # קבוצת דלק
+    "ENLT.TA",  # אנלייט אנרגיה
+    "ENOG.TA",  # אנרג'יאן
+    "ORL.TA",   # בזן (בתי זיקוק)
+    "PZL.TA",   # פז נפט
+    "SPEN.TA",  # שפיר הנדסה
+    "ELCO.TA",  # אלקו
+
+    # נדל"ן ובינוי
+    "AZRG.TA",  # עזריאלי
+    "AMOT.TA",  # אמות
+    "GTC.TA",   # גזית גלוב / ג'י סיטי
+    "BIG.TA",   # ביג
+    "MRE.TA",   # מבנה
+    "DELT.TA",  # דניה סיבוס
+    "DNYA.TA",  # דלק רכב
+    "ISCN.TA",  # נכסים ובניין
+
+    # תקשורת, קמעונאות ותעשייה
+    "BEZQ.TA",  # בזק
+    "CEL.TA",   # סלקום
+    "PTNR.TA",  # פרטנר
+    "SAE.TA",   # שופרסל
+    "RUMI.TA",  # רמי לוי
+    "FOX.TA",   # פוקס
+    "ELECTRA.TA", # אלקטרה
+    "PHRE.TA",  # פריון נטוורק
+    "NMVG.TA",  # נובולוג
+    "DIMRI.TA", # דמרי
+    "ICEN.TA",  # קנון הולדינגס
+    "ILCO.TA",  # החברה לישראל
+    "STRS.TA",  # שטראוס
+    "ESLT.TA"   # אלביט מערכות
 ]
 
 BROAD_NEWS_FEEDS = [
+    # --- מקורות בינלאומיים וחדשות ארה"ב ---
     "http://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://www.ynet.co.il/Integration/StoryRss1854.xml",
-    "https://www.ynet.co.il/Integration/StoryRss6.xml",
     "https://news.google.com/rss/search?q=aviation+airline+incident+flight&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=war+military+strike+tensions+Middle+East&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=pharma+FDA+approval+clinical+trial+phase&hl=en-US&gl=US&ceid=US:en",
@@ -97,8 +153,29 @@ BROAD_NEWS_FEEDS = [
     "https://news.google.com/rss/search?q=sanctions+tariffs+semiconductor+export+policy&hl=en-US&gl=US&ceid=US:en",
     "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&start=0&count=40&output=atom",
     "https://news.google.com/rss/search?q=earnings+report+quarterly+results+revenue+EPS+beat&hl=en-US&gl=US&ceid=US:en",
+
+    # =========================================================================
+    # --- מקורות חדשות כלכליות ודיווחים בישראל (בורסת תל אביב) ---
+    # =========================================================================
+    # Ynet
+    "https://www.ynet.co.il/Integration/StoryRss1854.xml", # מבזקי חדשות Ynet
+    "https://www.ynet.co.il/Integration/StoryRss6.xml",    # Ynet כלכלה
+
+    # מאי"ה (מערכת אינטרנט להודעות - TASE Maya)
     "https://news.google.com/rss/search?q=site:maya.tase.co.il+דוח+מיידי+OR+דוח+כספי+OR+תוצאות&hl=he&gl=IL&ceid=IL:he",
-    "https://news.google.com/rss/search?q=גלובס+מניות+OR+בורסה+OR+דוחות&hl=he&gl=IL&ceid=IL:he"
+    "https://news.google.com/rss/search?q=site:maya.tase.co.il+רכישה+OR+מיזוג+OR+חוזה&hl=he&gl=IL&ceid=IL:he",
+
+    # גלובס (Globes)
+    "https://www.globes.co.il/webservice/rss/rssfeeder.asmx/FeederNode?folderID=585", # גלובס שוק ההון
+    "https://www.globes.co.il/webservice/rss/rssfeeder.asmx/FeederNode?folderID=829", # גלובס מניות
+    "https://news.google.com/rss/search?q=site:globes.co.il+בורסה+OR+מניות+OR+דוחות&hl=he&gl=IL&ceid=IL:he",
+
+    # כלכליסט (Calcalist) & TheMarker
+    "https://news.google.com/rss/search?q=site:calcalist.co.il+בורסה+OR+מניות+OR+דוחות&hl=he&gl=IL&ceid=IL:he",
+    "https://news.google.com/rss/search?q=site:themarker.com+בורסה+OR+מניות+OR+דוחות&hl=he&gl=IL&ceid=IL:he",
+
+    # חדשות כלליות בישראל על מניות וחברות
+    "https://news.google.com/rss/search?q=בורסת+תל+אביב+OR+מניות+ישראל+OR+דוח+כספי&hl=he&gl=IL&ceid=IL:he"
 ]
 
 # ---------------------------------------------------------------------------
