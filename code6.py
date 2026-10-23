@@ -4,9 +4,8 @@ import json
 import time
 import logging
 from datetime import datetime, timedelta
-import threading
 import pytz
-from flask import Flask
+from flask import Flask, request
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -35,6 +34,8 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '').strip()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', '').strip()
+
+RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 
 # Initialize TeleBot & Flask
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
@@ -487,37 +488,43 @@ def process_risk_amount(message, ticker, entry, sl, curr):
         bot.reply_to(message, "ערך לא תקין. אנא הזן מספר בלבד.")
 
 # ---------------------------------------------------------------------------
-# FLASK SERVER (Keep-Alive for Render)
+# WEBHOOK & FLASK ROUTES (EXECUTED ON GUNICORN STARTUP)
 # ---------------------------------------------------------------------------
 @app.route('/', methods=['GET'])
 def index():
     return "PazPSTrading Bot is active & running!", 200
 
-def run_flask():
+@app.route('/webhook', methods=['POST'])
+@app.route(f'/{TELEGRAM_BOT_TOKEN}', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '', 200
+    else:
+        return 'Invalid content-type', 403
+
+def init_app():
+    """ Runs automatically when Gunicorn loads this module """
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        logger.info(f"Setting Webhook via Gunicorn to: {webhook_url}")
+        try:
+            bot.remove_webhook()
+            time.sleep(1)
+            bot.set_webhook(url=webhook_url)
+        except Exception as e:
+            logger.error(f"Failed setting webhook: {e}")
+
+# Global Initialization
+init_app()
+
+scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
+scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
+scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)
+scheduler.start()
+
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-
-# ---------------------------------------------------------------------------
-# SCHEDULER & MAIN ENTRY POINT
-# ---------------------------------------------------------------------------
-if __name__ == '__main__':
-    # Remove Webhook if existed to avoid conflict with polling
-    try:
-        bot.remove_webhook()
-    except Exception as e:
-        logger.warning(f"Failed to remove webhook: {e}")
-
-    # Start Flask Server in background thread
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-
-    # Start APScheduler
-    scheduler = BackgroundScheduler(timezone="Asia/Jerusalem")
-    scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
-    scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)
-    scheduler.start()
-
-    # Start Bot Polling
-    logger.info("Bot started polling...")
-    bot.infinity_polling()
