@@ -82,10 +82,7 @@ TZ_US = pytz.timezone("America/New_York")
 # ==========================================
 
 def analyze_with_ai(prompt: str) -> str:
-    """
-    Executes AI requests with direct failover: OpenAI -> Gemini -> Groq.
-    """
-    # 1. Try OpenAI
+    """Executes AI requests with direct failover: OpenAI -> Gemini -> Groq."""
     if OPENAI_API_KEY:
         try:
             client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -98,7 +95,6 @@ def analyze_with_ai(prompt: str) -> str:
         except Exception as e:
             logging.error(f"OpenAI API error: {e}. Falling back to Gemini...")
 
-    # 2. Try Gemini
     if GEMINI_API_KEY:
         try:
             model = genai.GenerativeModel("gemini-1.5-flash")
@@ -107,7 +103,6 @@ def analyze_with_ai(prompt: str) -> str:
         except Exception as e:
             logging.error(f"Gemini API error: {e}. Falling back to Groq...")
 
-    # 3. Try Groq
     if groq_client:
         try:
             response = groq_client.chat.completions.create(
@@ -127,24 +122,19 @@ def analyze_with_ai(prompt: str) -> str:
 # ==========================================
 
 def check_market_status(ticker: str) -> str:
-    """
-    Determines market state based on exchange rules.
-    """
     now_il = datetime.datetime.now(TZ_IL)
-    weekday = now_il.weekday()  # Mon=0, ..., Sun=6
+    weekday = now_il.weekday()
 
     if ticker.endswith(".TA"):
-        # Israeli Market: Sun-Thu
-        if weekday in [6, 0, 1, 2, 3]:  # Sunday to Thursday
+        if weekday in [6, 0, 1, 2, 3]:
             current_time = now_il.time()
             if datetime.time(10, 0) <= current_time <= datetime.time(17, 25):
                 return "IL_REGULAR"
         return "CLOSED"
     else:
-        # US Market: Mon-Fri
         now_us = datetime.datetime.now(TZ_US)
         us_weekday = now_us.weekday()
-        if us_weekday < 5:  # Mon-Fri
+        if us_weekday < 5:
             us_time = now_us.time()
             if datetime.time(4, 0) <= us_time < datetime.time(9, 30):
                 return "US Markets (PRE_MARKET)"
@@ -156,10 +146,6 @@ def check_market_status(ticker: str) -> str:
 
 
 def check_liquidity_and_price(ticker: str) -> tuple[bool, float, float]:
-    """
-    Validates minimum average volume ($500K daily liquidity).
-    Returns (is_liquid, current_price, avg_volume_usd).
-    """
     try:
         data = yf.Ticker(ticker)
         hist = data.history(period="20d")
@@ -179,11 +165,10 @@ def check_liquidity_and_price(ticker: str) -> tuple[bool, float, float]:
 
 
 def is_in_cooldown(ticker: str) -> bool:
-    """Checks if ticker was alerted within the last 6 hours."""
     now = datetime.datetime.now()
     if ticker in sent_ticker_cooldowns:
         last_sent = sent_ticker_cooldowns[ticker]
-        if (now - last_sent).total_seconds() < 21600:  # 6 hours
+        if (now - last_sent).total_seconds() < 21600:
             return True
     return False
 
@@ -197,7 +182,6 @@ def set_cooldown(ticker: str):
 # ==========================================
 
 def parse_ai_json(text: str) -> dict:
-    """Extracts valid JSON from AI string response."""
     try:
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
@@ -208,10 +192,6 @@ def parse_ai_json(text: str) -> dict:
 
 
 def scan_breaking_news_events():
-    """
-    Scans RSS feeds for high-conviction positive earnings/news.
-    Filters out previews, mixed reports, and low-conviction signals.
-    """
     logging.info("Starting Breaking News Scan...")
     
     for feed_url in BROAD_NEWS_FEEDS:
@@ -226,7 +206,6 @@ def scan_breaking_news_events():
                 summary = entry.get("summary", "")
                 content_text = f"{title}\n{summary}"
 
-                # Strict AI Prompting for News Filtering
                 prompt = f"""
                 You are a senior hedge fund analyst filtering financial news for high-probability BUY trade setups.
                 Analyze the following news item:
@@ -257,7 +236,6 @@ def scan_breaking_news_events():
 
                 processed_news_links.add(link)
 
-                # Strictly Validate Parameters
                 if not parsed.get("is_relevant_trade") or not parsed.get("ticker"):
                     continue
 
@@ -266,10 +244,6 @@ def scan_breaking_news_events():
                 mixed = parsed.get("mixed_or_negative_signals", True)
                 is_actual = parsed.get("is_earnings_actual_report", False)
 
-                # SUPER FILTER CONDITIONS:
-                # - Must NOT have mixed/negative signals
-                # - Must be actual earnings/news (not preview)
-                # - Quality score must be >= 8.5
                 if mixed or not is_actual or score < 8.5:
                     logging.info(f"Skipped {ticker}: Score={score}, Mixed={mixed}, Actual={is_actual}")
                     continue
@@ -285,12 +259,10 @@ def scan_breaking_news_events():
                 if not is_liquid or price <= 0:
                     continue
 
-                # Calculate Risk Parameters (3% SL, 6% TP1, 12% TP2)
                 sl = round(price * 0.97, 2)
                 tp1 = round(price * 1.06, 2)
                 tp2 = round(price * 1.12, 2)
 
-                # Send Telegram Alert
                 msg = (
                     f"🚨 **איתות חדשותי מתפרץ (קנייה)**\n"
                     f"**מניה:** {ticker} | **עוצמה:** HIGH 🔥\n"
@@ -320,14 +292,10 @@ def scan_breaking_news_events():
 
 
 # ==========================================
-# 4. TECHNICAL WATCHLIST SCANNER (MA20 PULLBACK)
+# 4. TECHNICAL WATCHLIST SCANNER
 # ==========================================
 
 def scan_watchlist_technical():
-    """
-    Scans Watchlist against the 'MA20 Pullback Strategy' (שייטת ממוצע 20).
-    Requires ALL 4 threshold conditions to pass.
-    """
     logging.info("Starting Technical Watchlist Scan...")
 
     for ticker in WATCHLIST:
@@ -347,7 +315,6 @@ def scan_watchlist_technical():
             if df.empty or len(df) < 30:
                 continue
 
-            # Flatten MultiIndex columns if present
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
@@ -359,17 +326,14 @@ def scan_watchlist_technical():
             curr_sma40 = float(df['SMA40'].iloc[-1]) if 'SMA40' in df and not pd.isna(df['SMA40'].iloc[-1]) else curr_sma20
             curr_sma50 = float(df['SMA50'].iloc[-1]) if 'SMA50' in df and not pd.isna(df['SMA50'].iloc[-1]) else curr_sma20
 
-            # Condition 1: General Uptrend
             trend_ok = curr_sma20 > curr_sma40 or curr_sma20 > curr_sma50
             if not trend_ok:
                 continue
 
-            # Condition 2: Proximity to MA20 (0% - 1.5% distance, reject > 2%)
             dist_percent = ((price - curr_sma20) / curr_sma20) * 100
             if not (0.0 <= dist_percent <= 1.5):
                 continue
 
-            # Condition 3: Confirmation Candle (Hammer or strong green after touch)
             open_price = float(df['Open'].iloc[-1])
             high_price = float(df['High'].iloc[-1])
             low_price = float(df['Low'].iloc[-1])
@@ -384,7 +348,6 @@ def scan_watchlist_technical():
             if not (is_hammer or is_strong_green):
                 continue
 
-            # Condition 4: 3% Stop Loss sits below MA20
             sl_price = round(price * 0.97, 2)
             if sl_price >= curr_sma20:
                 continue
@@ -465,9 +428,9 @@ if bot:
         except Exception as e:
             logging.error(f"Risk calculation error: {e}")
 
-    @bot.message_handler(commands=['start'])
-    def cmd_start(message):
-        bot.reply_to(message, "🤖 PazPSTrading Bot פעיל ומוכן לפעולה!")
+    @bot.message_handler(commands=['start', 'status'])
+    def cmd_start_or_status(message):
+        bot.reply_to(message, "🤖 PazPSTrading Bot פעיל, מחובר לשרת ומוכן לפעולה!")
 
     @bot.message_handler(commands=['test_news'])
     def cmd_test_news(message):
@@ -481,7 +444,7 @@ if bot:
 
 
 # ==========================================
-# 6. FLASK WEBHOOK & AP-SCHEDULER SETUP
+# 6. FLASK WEBHOOK & SCHEDULER INITIALIZATION
 # ==========================================
 
 @app.route("/", methods=["GET"])
@@ -498,22 +461,23 @@ def webhook():
         return '', 200
     return 'Invalid', 400
 
-def setup_scheduler():
-    scheduler = BackgroundScheduler(timezone=pytz.utc)
-    # Scan RSS news feeds every 15 minutes
+
+# GLOBAL INITIALIZATION (Runs under Gunicorn & Direct Python)
+scheduler = BackgroundScheduler(timezone=pytz.utc)
+if not scheduler.running:
     scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
-    # Scan technical watchlist every 30 minutes
     scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)
     scheduler.start()
 
-if __name__ == "__main__":
-    setup_scheduler()
-    
-    if bot and RENDER_EXTERNAL_URL:
+if bot and RENDER_EXTERNAL_URL:
+    try:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         bot.remove_webhook()
         bot.set_webhook(url=webhook_url)
-        logging.info(f"Webhook set to: {webhook_url}")
+        logging.info(f"Webhook successfully registered to: {webhook_url}")
+    except Exception as e:
+        logging.error(f"Failed to set Webhook: {e}")
 
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
