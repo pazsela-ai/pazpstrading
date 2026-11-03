@@ -15,7 +15,6 @@ import feedparser
 
 # OpenAI & Alternative AI Providers
 import openai
-import google.generativeai as genai
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,8 +32,14 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
+# Gemini Client (New SDK)
+gemini_client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    try:
+        from google import genai
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        logging.warning(f"Gemini initialization failed: {e}")
 
 groq_client = None
 if GROQ_API_KEY:
@@ -45,7 +50,7 @@ if GROQ_API_KEY:
         logging.warning(f"Groq initialization failed: {e}")
 
 # Initialize Telegram Bot & Flask App
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False) if TELEGRAM_BOT_TOKEN else None
 app = Flask(__name__)
 
 # Cooldown Tracker (In-Memory)
@@ -95,10 +100,12 @@ def analyze_with_ai(prompt: str) -> str:
         except Exception as e:
             logging.error(f"OpenAI API error: {e}. Falling back to Gemini...")
 
-    if GEMINI_API_KEY:
+    if gemini_client:
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content(prompt)
+            response = gemini_client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=prompt
+            )
             return response.text
         except Exception as e:
             logging.error(f"Gemini API error: {e}. Falling back to Groq...")
@@ -444,12 +451,21 @@ if bot:
 
 
 # ==========================================
-# 6. FLASK WEBHOOK & SCHEDULER INITIALIZATION
+# 6. FLASK WEBHOOK & SCHEDULER SETUP
 # ==========================================
 
 @app.route("/", methods=["GET"])
 def index():
     return "PazPSTrading Bot is running smoothly!", 200
+
+@app.route("/set_webhook", methods=["GET"])
+def set_webhook_route():
+    if bot and RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        bot.remove_webhook()
+        bot.set_webhook(url=webhook_url)
+        return f"Webhook successfully set to {webhook_url}", 200
+    return "Failed to set Webhook", 400
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -462,21 +478,21 @@ def webhook():
     return 'Invalid', 400
 
 
-# GLOBAL INITIALIZATION (Runs under Gunicorn & Direct Python)
+# Start Background Scheduler
 scheduler = BackgroundScheduler(timezone=pytz.utc)
 if not scheduler.running:
     scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
     scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)
     scheduler.start()
 
+# Auto-set Webhook on Module Load
 if bot and RENDER_EXTERNAL_URL:
     try:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
         bot.remove_webhook()
         bot.set_webhook(url=webhook_url)
-        logging.info(f"Webhook successfully registered to: {webhook_url}")
     except Exception as e:
-        logging.error(f"Failed to set Webhook: {e}")
+        logging.error(f"Error registering Webhook: {e}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
