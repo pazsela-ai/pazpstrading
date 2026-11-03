@@ -136,7 +136,7 @@ def check_market_status(ticker: str) -> str:
         if weekday in [6, 0, 1, 2, 3]:
             current_time = now_il.time()
             if datetime.time(10, 0) <= current_time <= datetime.time(17, 25):
-                return "IL_REGULAR"
+                return "Israel (TASE) (OPEN)"
         return "CLOSED"
     else:
         now_us = datetime.datetime.now(TZ_US)
@@ -266,6 +266,7 @@ def scan_breaking_news_events():
                 if not is_liquid or price <= 0:
                     continue
 
+                currency_sym = "₪" if ticker.endswith(".TA") else "$"
                 sl = round(price * 0.97, 2)
                 tp1 = round(price * 1.06, 2)
                 tp2 = round(price * 1.12, 2)
@@ -278,10 +279,10 @@ def scan_breaking_news_events():
                     f"💡 **ניתוח והסקה:**\n{parsed.get('summary_hebrew', '')}\n\n"
                     f"📌 **המלצת קנייה:** {parsed.get('recommendation_hebrew', '')}\n\n"
                     f"🎯 **פרמטרי פוזיציה (BUY):**\n"
-                    f"• מחיר כניסה משוער: ${price:.2f}\n"
-                    f"• Stop Loss (3%): ${sl:.2f}\n"
-                    f"• Target 1 (6%): ${tp1:.2f}\n"
-                    f"• Target 2 (12%): ${tp2:.2f}"
+                    f"• מחיר כניסה משוער: {currency_sym}{price:.2f}\n"
+                    f"• Stop Loss (3%): {currency_sym}{sl:.2f}\n"
+                    f"• Target 1 (6%): {currency_sym}{tp1:.2f}\n"
+                    f"• Target 2 (12%): {currency_sym}{tp2:.2f}"
                 )
 
                 markup = InlineKeyboardMarkup()
@@ -360,17 +361,25 @@ def scan_watchlist_technical():
                 continue
 
             tp1_price = round(price * 1.06, 2)
+            tp2_price = round(price * 1.12, 2)
+            currency_sym = "₪" if ticker.endswith(".TA") else "$"
 
-            pattern_desc = "נר פטיש שנגע ב-MA20" if is_hammer else "נר ירוק חזק בעקבות בדיקת MA20"
+            pattern_desc = "נר פטיש" if is_hammer else "נר ירוק חזק עקב נגיעה ב-MA20"
 
             msg = (
-                f"🎯 **התראת כניסה טכנית: {ticker}**\n"
-                f"• מחיר נוכחי: ${price:.2f}\n"
-                f"• מיקום ממוצע 20: ${curr_sma20:.2f} (מרחק: {dist_percent:.2f}%)\n"
+                f"🎯 **התראת כניסה: אסטרטגיית שייטת ממוצע 20**\n"
+                f"**מניה:** {ticker} | **עוצמה:** HIGH 🔥\n"
+                f"**מצב שוק:** {market_status}\n\n"
+                f"💡 **ניתוח והסקה:**\n"
+                f"• מיקום ממוצע 20: {currency_sym}{curr_sma20:.2f} (מרחק: {dist_percent:.2f}%)\n"
                 f"• תבנית שנצפתה: {pattern_desc}\n"
-                f"• מחיר כניסה מומלץ: ${price:.2f}\n"
-                f"• סטופ לוס (3%): ${sl_price:.2f} (ממוקם מתחת לתמיכת MA20)\n"
-                f"• יעד רווח ראשון (6%): ${tp1_price:.2f}"
+                f"• בדיקת סטופ לוס 3%: {currency_sym}{sl_price:.2f} (מתחת לתמיכת MA20)\n\n"
+                f"📌 **המלצת קנייה:** כניסה מומלצת על בסיס נגיעה ואישור תמיכה ב-MA20.\n\n"
+                f"🎯 **פרמטרי פוזיציה (BUY):**\n"
+                f"• מחיר כניסה משוער: {currency_sym}{price:.2f}\n"
+                f"• Stop Loss (3%): {currency_sym}{sl_price:.2f}\n"
+                f"• Target 1 (6%): {currency_sym}{tp1_price:.2f}\n"
+                f"• Target 2 (12%): {currency_sym}{tp2_price:.2f}"
             )
 
             markup = InlineKeyboardMarkup()
