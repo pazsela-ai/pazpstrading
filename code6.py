@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import warnings
 import pytz
 import datetime
 import telebot
@@ -12,9 +13,16 @@ import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import feedparser
-
-# OpenAI & Alternative AI Providers
 import openai
+
+# Suppress Pandas/yfinance deprecation warnings from flooding Render logs
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*Pandas4Warning.*")
+try:
+    from pandas.errors import Pandas4Warning
+    warnings.filterwarnings("ignore", category=Pandas4Warning)
+except ImportError:
+    pass
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,14 +40,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
-# Gemini Client (New SDK)
 gemini_client = None
 if GEMINI_API_KEY:
     try:
         from google import genai
         gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
-        logging.warning(f"Gemini initialization failed: {e}")
+        logging.warning(f"Gemini (google.genai) initialization failed: {e}")
 
 groq_client = None
 if GROQ_API_KEY:
@@ -77,7 +84,6 @@ WATCHLIST = [
     "HARL.TA", "PHOE.TA", "ENLT.TA", "ENOG.TA", "BEZQ.TA", "AZRG.TA", "BIG.TA", "SAEN.TA"
 ]
 
-# Timezones
 TZ_IL = pytz.timezone("Asia/Jerusalem")
 TZ_US = pytz.timezone("America/New_York")
 
@@ -103,7 +109,7 @@ def analyze_with_ai(prompt: str) -> str:
     if gemini_client:
         try:
             response = gemini_client.models.generate_content(
-                model="gemini-1.5-flash",
+                model="gemini-2.5-flash",
                 contents=prompt
             )
             return response.text
@@ -113,7 +119,7 @@ def analyze_with_ai(prompt: str) -> str:
     if groq_client:
         try:
             response = groq_client.chat.completions.create(
-                model="llama-3.1-70b-versatile",
+                model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2
             )
@@ -121,6 +127,7 @@ def analyze_with_ai(prompt: str) -> str:
         except Exception as e:
             logging.error(f"Groq API error: {e}.")
 
+    logging.error("ALL AI providers failed to return a response!")
     return ""
 
 
@@ -185,7 +192,7 @@ def set_cooldown(ticker: str):
 
 
 # ==========================================
-# 3. BREAKING NEWS & EARNINGS FILTER
+# 3. TWO-TIER BREAKING NEWS & EARNINGS FILTER
 # ==========================================
 
 def parse_ai_json(text: str) -> dict:
@@ -199,8 +206,14 @@ def parse_ai_json(text: str) -> dict:
 
 
 def scan_breaking_news_events():
-    logging.info("Starting Breaking News Scan...")
-    
+    """
+    Two-Tier News Scanner:
+    - Tier 1 (Top Priority): Contracts, FDA/Medical trials, Defense/Security tensions, Geopolitics, M&A, major catalysts (Score >= 7.0).
+    - Tier 2 (Strict Secondary Priority): Actual Financial Earnings Reports only if exceptional (Score >= 8.5, no mixed signals, strong beat/guidance).
+    """
+    logging.info("Starting Two-Tier Breaking News & Earnings Scan...")
+    checked_count = 0
+
     for feed_url in BROAD_NEWS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
@@ -208,51 +221,78 @@ def scan_breaking_news_events():
                 link = entry.get("link", "")
                 if link in processed_news_links:
                     continue
-                
+
+                checked_count += 1
                 title = entry.get("title", "")
                 summary = entry.get("summary", "")
                 content_text = f"{title}\n{summary}"
 
                 prompt = f"""
-                You are a senior hedge fund analyst filtering financial news for high-probability BUY trade setups.
+                You are a senior hedge fund analyst categorizing and filtering market-moving news for high-probability BUY setups.
                 Analyze the following news item:
 
                 Headline/Content: "{content_text}"
 
-                CRITICAL FILTERING RULES:
-                1. PREVIEW / EXPECTATIONS FILTER: If this is an earnings preview, upcoming event prediction, or "what to expect" article (e.g., "earnings preview: what to look for"), set "is_earnings_actual_report" to false. We ONLY trade actual released reports.
-                2. MIXED SIGNALS FILTER: If the company beat earnings but missed revenue, disappointed on network/product volume, or showed key operational weaknesses, set "mixed_or_negative_signals" to true.
-                3. GUIDANCE RAISE: Did the company raise full-year/next-quarter guidance or report overwhelmingly strong actual results? Set "guidance_raised" accordingly.
-                4. QUALITY SCORE: Rate the net impact from 1 to 10 (10 = massive clean beat & raised guidance like Bloom Energy; 1 = negative/disappointing).
+                CLASSIFICATION & RULES:
+                1. EVENT TYPE ("event_type"):
+                   - "breaking_catalyst": Major contracts, medical/clinical trial results, FDA approvals, defense/security tensions, geopolitical developments, M&A, strategic partnerships, or major non-earnings catalysts.
+                   - "earnings_report": Quarterly/annual financial earnings releases.
+                   - "other": Routine commentary, analyst opinions, earnings previews ("what to expect"), or irrelevant news.
+                2. PREVIEW FILTER: If this is an earnings preview or prediction before a report, classify as "other" and set "is_relevant_trade" to false.
+                3. MIXED SIGNALS ("mixed_or_negative"): True if there are notable caveats (e.g., beat EPS but missed revenue, weak volume, lowered guidance, or trial setbacks).
+                4. GUIDANCE / CATALYST STRENGTH ("strong_catalyst_or_guidance"): True if guidance was raised OR the non-earnings catalyst is major and concrete.
+                5. QUALITY SCORE ("quality_score", 1 to 10):
+                   - For "breaking_catalyst": 7.0-10.0 = concrete positive catalyst affecting a specific stock (contract win, successful trial, defense demand).
+                   - For "earnings_report": 8.5-10.0 = ONLY exceptional clean beats WITH raised guidance or massive outperformance (like Bloom Energy). Anything routine/minor/mixed must score <= 8.0.
 
-                Return ONLY a JSON response in the exact format:
+                Return ONLY valid JSON:
                 {{
                   "is_relevant_trade": true/false,
+                  "event_type": "breaking_catalyst" or "earnings_report" or "other",
                   "ticker": "SYMBOL" or null,
-                  "is_earnings_actual_report": true/false,
-                  "mixed_or_negative_signals": true/false,
-                  "guidance_raised": true/false,
-                  "earnings_quality_score": number_between_1_and_10,
+                  "mixed_or_negative": true/false,
+                  "strong_catalyst_or_guidance": true/false,
+                  "quality_score": number_1_to_10,
                   "summary_hebrew": "ניתוח והסקה קצרים בעברית",
                   "recommendation_hebrew": "המלצה מפורטת בעברית"
                 }}
                 """
 
                 ai_response = analyze_with_ai(prompt)
-                parsed = parse_ai_json(ai_response)
+                if not ai_response:
+                    continue
 
+                parsed = parse_ai_json(ai_response)
                 processed_news_links.add(link)
 
                 if not parsed.get("is_relevant_trade") or not parsed.get("ticker"):
                     continue
 
                 ticker = parsed.get("ticker", "").upper().strip()
-                score = parsed.get("earnings_quality_score", 0)
-                mixed = parsed.get("mixed_or_negative_signals", True)
-                is_actual = parsed.get("is_earnings_actual_report", False)
+                event_type = parsed.get("event_type", "other")
+                score = float(parsed.get("quality_score", 0))
+                mixed = parsed.get("mixed_or_negative", True)
+                strong_catalyst = parsed.get("strong_catalyst_or_guidance", False)
 
-                if mixed or not is_actual or score < 8.5:
-                    logging.info(f"Skipped {ticker}: Score={score}, Mixed={mixed}, Actual={is_actual}")
+                # Reject mixed/negative or irrelevant types
+                if mixed or event_type == "other":
+                    logging.info(f"Filtered out {ticker}: Type={event_type}, Mixed={mixed}")
+                    continue
+
+                # Tier 1: Top Priority Breaking Catalysts (Contracts, Medical, Security, Geopolitics)
+                if event_type == "breaking_catalyst":
+                    if score < 7.0:
+                        logging.info(f"Skipped Tier-1 Catalyst {ticker}: Score={score} (< 7.0)")
+                        continue
+                    header_type = "🚨 **איתות חדשותי מתפרץ - עדיפות עליונה (קנייה)**"
+
+                # Tier 2: Strict Earnings Filter (Prevent noise from average earnings)
+                elif event_type == "earnings_report":
+                    if score < 8.5 or not strong_catalyst:
+                        logging.info(f"Skipped Tier-2 Earnings {ticker}: Score={score}, StrongGuidance={strong_catalyst}")
+                        continue
+                    header_type = "📄 **איתות דוח כספי מובחר (קנייה)**"
+                else:
                     continue
 
                 if is_in_cooldown(ticker):
@@ -260,10 +300,12 @@ def scan_breaking_news_events():
 
                 market_status = check_market_status(ticker)
                 if market_status == "CLOSED":
+                    logging.info(f"Skipped {ticker}: Market is CLOSED")
                     continue
 
                 is_liquid, price, _ = check_liquidity_and_price(ticker)
                 if not is_liquid or price <= 0:
+                    logging.info(f"Skipped {ticker}: Failed liquidity check")
                     continue
 
                 currency_sym = "₪" if ticker.endswith(".TA") else "$"
@@ -272,7 +314,7 @@ def scan_breaking_news_events():
                 tp2 = round(price * 1.12, 2)
 
                 msg = (
-                    f"🚨 **איתות חדשותי מתפרץ (קנייה)**\n"
+                    f"{header_type}\n"
                     f"**מניה:** {ticker} | **עוצמה:** HIGH 🔥\n"
                     f"**מצב שוק:** {market_status}\n"
                     f"**כותרת/דיווח:** {title}\n\n"
@@ -294,9 +336,12 @@ def scan_breaking_news_events():
                 if bot and TELEGRAM_CHAT_ID:
                     bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown", reply_markup=markup)
                     set_cooldown(ticker)
+                    logging.info(f"Sent {event_type} alert for {ticker} (Score: {score})")
 
         except Exception as e:
             logging.error(f"Error processing feed {feed_url}: {e}")
+
+    logging.info(f"Finished News Scan. Evaluated {checked_count} new articles.")
 
 
 # ==========================================
@@ -349,7 +394,7 @@ def scan_watchlist_technical():
 
             body = abs(close_price - open_price)
             lower_shadow = min(open_price, close_price) - low_price
-            
+
             is_hammer = (lower_shadow >= 2 * body) and (low_price <= curr_sma20 * 1.005)
             is_strong_green = (close_price > open_price) and (close_price >= (high_price + open_price) / 2)
 
@@ -394,6 +439,8 @@ def scan_watchlist_technical():
 
         except Exception as e:
             logging.error(f"Error scanning ticker {ticker}: {e}")
+
+    logging.info("Finished Technical Watchlist Scan.")
 
 
 # ==========================================
@@ -487,14 +534,12 @@ def webhook():
     return 'Invalid', 400
 
 
-# Start Background Scheduler
 scheduler = BackgroundScheduler(timezone=pytz.utc)
 if not scheduler.running:
     scheduler.add_job(scan_breaking_news_events, 'interval', minutes=15)
     scheduler.add_job(scan_watchlist_technical, 'interval', minutes=30)
     scheduler.start()
 
-# Auto-set Webhook on Module Load
 if bot and RENDER_EXTERNAL_URL:
     try:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
