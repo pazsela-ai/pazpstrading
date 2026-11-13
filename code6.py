@@ -1,8 +1,11 @@
 import os
 import re
 import json
+import time
+import sqlite3
 import logging
 import warnings
+import calendar
 import pytz
 import datetime
 import telebot
@@ -60,10 +63,6 @@ if GROQ_API_KEY:
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False) if TELEGRAM_BOT_TOKEN else None
 app = Flask(__name__)
 
-# Cooldown Tracker (In-Memory)
-sent_ticker_cooldowns = {}
-processed_news_links = set()
-
 # Broad News Feeds (RSS)
 BROAD_NEWS_FEEDS = [
     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
@@ -73,7 +72,7 @@ BROAD_NEWS_FEEDS = [
     "https://www.sec.gov/news/pressreleases.rss"
 ]
 
-# Watchlist for Technical Scanner (~50 Tickers)
+# Watchlist for Technical Scanner (~46 Tickers)
 WATCHLIST = [
     # US Stocks
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "UNH", "JNJ",
@@ -86,6 +85,85 @@ WATCHLIST = [
 
 TZ_IL = pytz.timezone("Asia/Jerusalem")
 TZ_US = pytz.timezone("America/New_York")
+DB_PATH = "trading_bot_state.db"
+
+
+# ==========================================
+# 0. PERSISTENT SQLITE STATE MANAGEMENT
+# ==========================================
+
+def init_db():
+    """Initializes SQLite tables so state survives Render server restarts."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS ticker_cooldowns (
+                ticker TEXT PRIMARY KEY,
+                last_sent_ts REAL
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS processed_links (
+                link TEXT PRIMARY KEY,
+                processed_ts REAL
+            )
+        ''')
+        # Cleanup records older than 7 days
+        cutoff = time.time() - (7 * 86400)
+        c.execute('DELETE FROM processed_links WHERE processed_ts < ?', (cutoff,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite init error: {e}")
+
+init_db()
+
+def is_in_cooldown(ticker: str, hours: int = 48) -> bool:
+    """Checks if ticker was alerted within the last 48 hours."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT last_sent_ts FROM ticker_cooldowns WHERE ticker = ?', (ticker,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            if (time.time() - row[0]) < (hours * 3600):
+                return True
+        return False
+    except Exception:
+        return False
+
+def set_cooldown(ticker: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('REPLACE INTO ticker_cooldowns (ticker, last_sent_ts) VALUES (?, ?)', (ticker, time.time()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite set_cooldown error: {e}")
+
+def is_link_processed(link: str) -> bool:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM processed_links WHERE link = ?', (link,))
+        exists = c.fetchone() is not None
+        conn.close()
+        return exists
+    except Exception:
+        return False
+
+def mark_link_processed(link: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('REPLACE INTO processed_links (link, processed_ts) VALUES (?, ?)', (link, time.time()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"SQLite mark_link error: {e}")
 
 
 # ==========================================
@@ -132,8 +210,15 @@ def analyze_with_ai(prompt: str) -> str:
 
 
 # ==========================================
-# 2. MARKET HOURS & LIQUIDITY CHECKS
+# 2. MARKET HOURS, LIVE PRICE & SAFETY CHECKS
 # ==========================================
+
+def get_tradingview_url(ticker: str) -> str:
+    """Converts .TA tickers to TLV format for TradingView URLs."""
+    if ticker.endswith(".TA"):
+        clean_sym = ticker.replace(".TA", "")
+        return f"https://www.tradingview.com/symbols/TLV-{clean_sym}/"
+    return f"https://www.tradingview.com/symbols/{ticker}/"
 
 def check_market_status(ticker: str) -> str:
     now_il = datetime.datetime.now(TZ_IL)
@@ -158,37 +243,96 @@ def check_market_status(ticker: str) -> str:
                 return "US Markets (AFTER_HOURS)"
         return "CLOSED"
 
-
-def check_liquidity_and_price(ticker: str) -> tuple[bool, float, float]:
+def get_live_quote_and_liquidity(ticker: str) -> dict:
+    """
+    Fetches live price (including extended hours), previous close, gap %,
+    and 20-day average liquidity.
+    """
     try:
-        data = yf.Ticker(ticker)
-        hist = data.history(period="20d")
+        t_obj = yf.Ticker(ticker)
+        hist = t_obj.history(period="25d")
         if hist.empty or len(hist) < 5:
-            return False, 0.0, 0.0
+            return {"valid": False}
 
-        current_price = float(hist['Close'].iloc[-1])
-        avg_volume_20d = float(hist['Volume'].mean())
-        daily_liquidity_usd = current_price * avg_volume_20d
+        avg_volume_20d = float(hist['Volume'].tail(20).mean())
+        prev_close = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else float(hist['Close'].iloc[-1])
+        live_price = float(hist['Close'].iloc[-1])
 
-        if daily_liquidity_usd >= 500000:
-            return True, current_price, daily_liquidity_usd
-        return False, current_price, daily_liquidity_usd
+        # Try fetching real-time / extended hours price via fast_info
+        try:
+            fast = t_obj.fast_info
+            if hasattr(fast, 'last_price') and fast.last_price and fast.last_price > 0:
+                live_price = float(fast.last_price)
+            if hasattr(fast, 'previous_close') and fast.previous_close and fast.previous_close > 0:
+                prev_close = float(fast.previous_close)
+        except Exception:
+            pass
+
+        daily_liquidity_usd = live_price * avg_volume_20d
+        if daily_liquidity_usd < 500000:
+            return {"valid": False}
+
+        gap_percent = ((live_price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
+
+        return {
+            "valid": True,
+            "live_price": live_price,
+            "prev_close": prev_close,
+            "gap_percent": gap_percent,
+            "avg_volume_20d": avg_volume_20d,
+            "liquidity": daily_liquidity_usd
+        }
     except Exception as e:
-        logging.error(f"Liquidity check error for {ticker}: {e}")
-        return False, 0.0, 0.0
+        logging.error(f"Quote/liquidity error for {ticker}: {e}")
+        return {"valid": False}
 
-
-def is_in_cooldown(ticker: str) -> bool:
-    now = datetime.datetime.now()
-    if ticker in sent_ticker_cooldowns:
-        last_sent = sent_ticker_cooldowns[ticker]
-        if (now - last_sent).total_seconds() < 21600:
-            return True
+def is_earnings_within_days(ticker: str, days: int = 3) -> bool:
+    """Checks if the company has an upcoming earnings report within N days."""
+    try:
+        t_obj = yf.Ticker(ticker)
+        cal = t_obj.calendar
+        if cal is not None and isinstance(cal, dict) and 'Earnings Date' in cal:
+            earnings_dates = cal['Earnings Date']
+            if earnings_dates:
+                next_date = earnings_dates[0]
+                if isinstance(next_date, datetime.datetime):
+                    next_date = next_date.date()
+                today = datetime.date.today()
+                delta = (next_date - today).days
+                if 0 <= delta <= days:
+                    return True
+    except Exception:
+        pass
     return False
 
+def is_article_fresh(entry, max_age_hours: float = 3.0) -> bool:
+    """Rejects RSS articles older than max_age_hours to prevent stale alerts."""
+    parsed_time = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not parsed_time:
+        return True  # Allow if feed doesn't provide timestamp
+    try:
+        pub_ts = calendar.timegm(parsed_time)
+        age_hours = (time.time() - pub_ts) / 3600.0
+        return age_hours <= max_age_hours
+    except Exception:
+        return True
 
-def set_cooldown(ticker: str):
-    sent_ticker_cooldowns[ticker] = datetime.datetime.now()
+def get_intraday_volume_pace(ticker: str) -> float:
+    """Estimates normalized relative volume pace based on elapsed market session."""
+    if ticker.endswith(".TA"):
+        now_il = datetime.datetime.now(TZ_IL)
+        start = now_il.replace(hour=10, minute=0, second=0, microsecond=0)
+        total_minutes = 445.0  # 10:00 to 17:25
+        elapsed = (now_il - start).total_seconds() / 60.0
+    else:
+        now_us = datetime.datetime.now(TZ_US)
+        start = now_us.replace(hour=9, minute=30, second=0, microsecond=0)
+        total_minutes = 390.0  # 09:30 to 16:00
+        elapsed = (now_us - start).total_seconds() / 60.0
+
+    if elapsed <= 15:
+        return 1.0  # Too early in session to penalize volume
+    return min(elapsed / total_minutes, 1.0)
 
 
 # ==========================================
@@ -204,12 +348,11 @@ def parse_ai_json(text: str) -> dict:
     except Exception:
         return {}
 
-
 def scan_breaking_news_events():
     """
-    Two-Tier News Scanner:
-    - Tier 1 (Top Priority): Contracts, FDA/Medical trials, Defense/Security tensions, Geopolitics, M&A, major catalysts (Score >= 7.0).
-    - Tier 2 (Strict Secondary Priority): Actual Financial Earnings Reports only if exceptional (Score >= 8.5, no mixed signals, strong beat/guidance).
+    Two-Tier News Scanner with Stale-News Filter & Anti-Chasing Protection:
+    - Tier 1 (Top Priority): Contracts, FDA/Medical trials, Defense/Security tensions, Geopolitics, M&A (Score >= 7.0).
+    - Tier 2 (Strict Secondary Priority): Exceptional Actual Earnings Reports (Score >= 8.5, no mixed signals, strong guidance).
     """
     logging.info("Starting Two-Tier Breaking News & Earnings Scan...")
     checked_count = 0
@@ -217,9 +360,13 @@ def scan_breaking_news_events():
     for feed_url in BROAD_NEWS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:10]:
+            for entry in feed.entries[:12]:
                 link = entry.get("link", "")
-                if link in processed_news_links:
+                if not link or is_link_processed(link):
+                    continue
+
+                if not is_article_fresh(entry, max_age_hours=3.0):
+                    mark_link_processed(link)
                     continue
 
                 checked_count += 1
@@ -259,12 +406,11 @@ def scan_breaking_news_events():
                 """
 
                 ai_response = analyze_with_ai(prompt)
+                mark_link_processed(link)
                 if not ai_response:
                     continue
 
                 parsed = parse_ai_json(ai_response)
-                processed_news_links.add(link)
-
                 if not parsed.get("is_relevant_trade") or not parsed.get("ticker"):
                     continue
 
@@ -274,19 +420,14 @@ def scan_breaking_news_events():
                 mixed = parsed.get("mixed_or_negative", True)
                 strong_catalyst = parsed.get("strong_catalyst_or_guidance", False)
 
-                # Reject mixed/negative or irrelevant types
                 if mixed or event_type == "other":
-                    logging.info(f"Filtered out {ticker}: Type={event_type}, Mixed={mixed}")
                     continue
 
-                # Tier 1: Top Priority Breaking Catalysts (Contracts, Medical, Security, Geopolitics)
                 if event_type == "breaking_catalyst":
                     if score < 7.0:
                         logging.info(f"Skipped Tier-1 Catalyst {ticker}: Score={score} (< 7.0)")
                         continue
                     header_type = "🚨 **איתות חדשותי מתפרץ - עדיפות עליונה (קנייה)**"
-
-                # Tier 2: Strict Earnings Filter (Prevent noise from average earnings)
                 elif event_type == "earnings_report":
                     if score < 8.5 or not strong_catalyst:
                         logging.info(f"Skipped Tier-2 Earnings {ticker}: Score={score}, StrongGuidance={strong_catalyst}")
@@ -295,7 +436,7 @@ def scan_breaking_news_events():
                 else:
                     continue
 
-                if is_in_cooldown(ticker):
+                if is_in_cooldown(ticker, hours=48):
                     continue
 
                 market_status = check_market_status(ticker)
@@ -303,69 +444,96 @@ def scan_breaking_news_events():
                     logging.info(f"Skipped {ticker}: Market is CLOSED")
                     continue
 
-                is_liquid, price, _ = check_liquidity_and_price(ticker)
-                if not is_liquid or price <= 0:
-                    logging.info(f"Skipped {ticker}: Failed liquidity check")
+                quote = get_live_quote_and_liquidity(ticker)
+                if not quote.get("valid"):
+                    continue
+
+                price = quote["live_price"]
+                gap_pct = quote["gap_percent"]
+
+                # Anti-Chasing Filter: Block entry if stock already surged > 4.5%
+                if gap_pct > 4.5:
+                    logging.info(f"Anti-Chasing blocked {ticker}: Already up +{gap_pct:.2f}% from previous close.")
                     continue
 
                 currency_sym = "₪" if ticker.endswith(".TA") else "$"
-                sl = round(price * 0.97, 2)
-                tp1 = round(price * 1.06, 2)
-                tp2 = round(price * 1.12, 2)
+                sl = round(price * 0.965, 2)  # 3.5% Stop Loss for news volatility
+                tp1 = round(price * 1.07, 2)
+                tp2 = round(price * 1.14, 2)
+                tv_url = get_tradingview_url(ticker)
+
+                gap_note = f" (שינוי יומי נוכחי: {gap_pct:+.2f}%)" if abs(gap_pct) >= 0.1 else ""
 
                 msg = (
                     f"{header_type}\n"
                     f"**מניה:** {ticker} | **עוצמה:** HIGH 🔥\n"
-                    f"**מצב שוק:** {market_status}\n"
+                    f"**מצב שוק:** {market_status}{gap_note}\n"
                     f"**כותרת/דיווח:** {title}\n\n"
                     f"💡 **ניתוח והסקה:**\n{parsed.get('summary_hebrew', '')}\n\n"
                     f"📌 **המלצת קנייה:** {parsed.get('recommendation_hebrew', '')}\n\n"
                     f"🎯 **פרמטרי פוזיציה (BUY):**\n"
-                    f"• מחיר כניסה משוער: {currency_sym}{price:.2f}\n"
-                    f"• Stop Loss (3%): {currency_sym}{sl:.2f}\n"
-                    f"• Target 1 (6%): {currency_sym}{tp1:.2f}\n"
-                    f"• Target 2 (12%): {currency_sym}{tp2:.2f}"
+                    f"• מחיר כניסה חי משוער: {currency_sym}{price:.2f}\n"
+                    f"• Stop Loss (3.5%): {currency_sym}{sl:.2f}\n"
+                    f"• Target 1 (7%): {currency_sym}{tp1:.2f} *(בהגעה ליעד: מימוש 50% והעלאת סטופ למחיר כניסה)*\n"
+                    f"• Target 2 (14%): {currency_sym}{tp2:.2f}"
                 )
 
                 markup = InlineKeyboardMarkup()
                 markup.add(
                     InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"calc_{ticker}_{price}_{sl}"),
-                    InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/symbols/{ticker}")
+                    InlineKeyboardButton("📈 TradingView", url=tv_url)
                 )
 
                 if bot and TELEGRAM_CHAT_ID:
                     bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown", reply_markup=markup)
                     set_cooldown(ticker)
-                    logging.info(f"Sent {event_type} alert for {ticker} (Score: {score})")
+                    logging.info(f"Sent {event_type} alert for {ticker} (Score: {score}, Gap: {gap_pct:.2f}%)")
 
         except Exception as e:
             logging.error(f"Error processing feed {feed_url}: {e}")
 
-    logging.info(f"Finished News Scan. Evaluated {checked_count} new articles.")
+    logging.info(f"Finished News Scan. Evaluated {checked_count} fresh articles.")
 
 
 # ==========================================
-# 4. TECHNICAL WATCHLIST SCANNER
+# 4. ENHANCED TECHNICAL WATCHLIST SCANNER
 # ==========================================
 
 def scan_watchlist_technical():
-    logging.info("Starting Technical Watchlist Scan...")
+    """
+    Enhanced MA20 Pullback Scanner:
+    1. Rising SMA20 slope + SMA20 > SMA40/SMA50
+    2. Pullback zone: 0.0% to 1.5% above SMA20
+    3. RSI(14) between 45 and 65 (healthy pullback momentum)
+    4. Confirmation candle (Hammer or Strong Green) + Normalized Volume Pace >= 1.1x
+    5. Earnings Blackout check (skips if earnings within 3 days)
+    6. ATR-adjusted Stop Loss below SMA20 (capped between 3.0% and 5.5%)
+    """
+    logging.info("Starting Enhanced Technical Watchlist Scan...")
 
     for ticker in WATCHLIST:
         try:
-            if is_in_cooldown(ticker):
+            if is_in_cooldown(ticker, hours=48):
                 continue
 
             market_status = check_market_status(ticker)
             if market_status == "CLOSED":
                 continue
 
-            is_liquid, price, _ = check_liquidity_and_price(ticker)
-            if not is_liquid or price <= 0:
+            # Skip if earnings report is imminent (within 3 days)
+            if is_earnings_within_days(ticker, days=3):
+                logging.info(f"Skipped {ticker}: Upcoming earnings within 3 days.")
                 continue
 
-            df = yf.download(ticker, period="60d", interval="1d", progress=False)
-            if df.empty or len(df) < 30:
+            quote = get_live_quote_and_liquidity(ticker)
+            if not quote.get("valid"):
+                continue
+
+            price = quote["live_price"]
+            avg_vol_20d = quote["avg_volume_20d"]
+
+            df = yf.download(ticker, period="75d", interval="1d", progress=False)
+            if df.empty or len(df) < 35:
                 continue
 
             if isinstance(df.columns, pd.MultiIndex):
@@ -374,23 +542,36 @@ def scan_watchlist_technical():
             df['SMA20'] = ta.sma(df['Close'], length=20)
             df['SMA40'] = ta.sma(df['Close'], length=40)
             df['SMA50'] = ta.sma(df['Close'], length=50)
+            df['RSI'] = ta.rsi(df['Close'], length=14)
+            df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
 
             curr_sma20 = float(df['SMA20'].iloc[-1])
+            prev_sma20_5d = float(df['SMA20'].iloc[-6])
             curr_sma40 = float(df['SMA40'].iloc[-1]) if 'SMA40' in df and not pd.isna(df['SMA40'].iloc[-1]) else curr_sma20
             curr_sma50 = float(df['SMA50'].iloc[-1]) if 'SMA50' in df and not pd.isna(df['SMA50'].iloc[-1]) else curr_sma20
+            curr_rsi = float(df['RSI'].iloc[-1]) if not pd.isna(df['RSI'].iloc[-1]) else 55.0
+            curr_atr = float(df['ATR'].iloc[-1]) if not pd.isna(df['ATR'].iloc[-1]) else (price * 0.025)
 
-            trend_ok = curr_sma20 > curr_sma40 or curr_sma20 > curr_sma50
+            # 1. Trend & Rising SMA20 Slope Check
+            trend_ok = (curr_sma20 > curr_sma40 or curr_sma20 > curr_sma50) and (curr_sma20 > prev_sma20_5d)
             if not trend_ok:
                 continue
 
+            # 2. Pullback Zone Check (0% to 1.5% above SMA20)
             dist_percent = ((price - curr_sma20) / curr_sma20) * 100
             if not (0.0 <= dist_percent <= 1.5):
                 continue
 
+            # 3. RSI Pullback Sweet Spot (45 to 65)
+            if not (45.0 <= curr_rsi <= 65.0):
+                continue
+
+            # 4. Candle Pattern & Normalized Volume Check
             open_price = float(df['Open'].iloc[-1])
             high_price = float(df['High'].iloc[-1])
             low_price = float(df['Low'].iloc[-1])
             close_price = float(df['Close'].iloc[-1])
+            curr_volume = float(df['Volume'].iloc[-1])
 
             body = abs(close_price - open_price)
             lower_shadow = min(open_price, close_price) - low_price
@@ -401,14 +582,34 @@ def scan_watchlist_technical():
             if not (is_hammer or is_strong_green):
                 continue
 
-            sl_price = round(price * 0.97, 2)
+            session_pace = get_intraday_volume_pace(ticker)
+            expected_vol_so_far = avg_vol_20d * session_pace
+            rvol = curr_volume / expected_vol_so_far if expected_vol_so_far > 0 else 1.0
+
+            if rvol < 1.1:
+                continue
+
+            # 5. Dynamic ATR Stop Loss (Below SMA20, bounded between 3.0% and 5.5%)
+            atr_stop = price - (1.5 * curr_atr)
+            sma_stop = curr_sma20 * 0.992  # Just below SMA20 support
+            raw_sl = min(atr_stop, sma_stop)
+
+            min_sl_price = price * 0.945  # Max 5.5% risk cap
+            max_sl_price = price * 0.970  # Min 3.0% risk floor
+
+            sl_price = round(max(min_sl_price, min(max_sl_price, raw_sl)), 2)
             if sl_price >= curr_sma20:
                 continue
 
-            tp1_price = round(price * 1.06, 2)
-            tp2_price = round(price * 1.12, 2)
-            currency_sym = "₪" if ticker.endswith(".TA") else "$"
+            risk_pct = ((price - sl_price) / price) * 100
+            tp1_pct = risk_pct * 2.0
+            tp2_pct = risk_pct * 3.0
 
+            tp1_price = round(price * (1 + tp1_pct / 100), 2)
+            tp2_price = round(price * (1 + tp2_pct / 100), 2)
+
+            currency_sym = "₪" if ticker.endswith(".TA") else "$"
+            tv_url = get_tradingview_url(ticker)
             pattern_desc = "נר פטיש" if is_hammer else "נר ירוק חזק עקב נגיעה ב-MA20"
 
             msg = (
@@ -416,31 +617,32 @@ def scan_watchlist_technical():
                 f"**מניה:** {ticker} | **עוצמה:** HIGH 🔥\n"
                 f"**מצב שוק:** {market_status}\n\n"
                 f"💡 **ניתוח והסקה:**\n"
-                f"• מיקום ממוצע 20: {currency_sym}{curr_sma20:.2f} (מרחק: {dist_percent:.2f}%)\n"
-                f"• תבנית שנצפתה: {pattern_desc}\n"
-                f"• בדיקת סטופ לוס 3%: {currency_sym}{sl_price:.2f} (מתחת לתמיכת MA20)\n\n"
+                f"• מיקום ממוצע 20: {currency_sym}{curr_sma20:.2f} (מרחק: {dist_percent:.2f}% | שיפוע עולה)\n"
+                f"• תבנית שנצפתה: {pattern_desc} (נפח יחסי: {rvol:.1f}x | RSI: {curr_rsi:.0f})\n"
+                f"• בדיקת סטופ לוס ({risk_pct:.1f}% מותאם ATR): {currency_sym}{sl_price:.2f} (מתחת לתמיכת MA20)\n\n"
                 f"📌 **המלצת קנייה:** כניסה מומלצת על בסיס נגיעה ואישור תמיכה ב-MA20.\n\n"
                 f"🎯 **פרמטרי פוזיציה (BUY):**\n"
                 f"• מחיר כניסה משוער: {currency_sym}{price:.2f}\n"
-                f"• Stop Loss (3%): {currency_sym}{sl_price:.2f}\n"
-                f"• Target 1 (6%): {currency_sym}{tp1_price:.2f}\n"
-                f"• Target 2 (12%): {currency_sym}{tp2_price:.2f}"
+                f"• Stop Loss ({risk_pct:.1f}%): {currency_sym}{sl_price:.2f}\n"
+                f"• Target 1 ({tp1_pct:.1f}%): {currency_sym}{tp1_price:.2f} *(מימוש 50% והעלאת סטופ לכניסה)*\n"
+                f"• Target 2 ({tp2_pct:.1f}%): {currency_sym}{tp2_price:.2f}"
             )
 
             markup = InlineKeyboardMarkup()
             markup.add(
                 InlineKeyboardButton("🎯 בצע עסקה / חישוב סיכון", callback_data=f"calc_{ticker}_{price}_{sl_price}"),
-                InlineKeyboardButton("📈 TradingView", url=f"https://www.tradingview.com/symbols/{ticker}")
+                InlineKeyboardButton("📈 TradingView", url=tv_url)
             )
 
             if bot and TELEGRAM_CHAT_ID:
                 bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown", reply_markup=markup)
                 set_cooldown(ticker)
+                logging.info(f"Sent technical alert for {ticker} (RVOL: {rvol:.2f}, RSI: {curr_rsi:.1f}, Risk: {risk_pct:.1f}%)")
 
         except Exception as e:
             logging.error(f"Error scanning ticker {ticker}: {e}")
 
-    logging.info("Finished Technical Watchlist Scan.")
+    logging.info("Finished Enhanced Technical Watchlist Scan.")
 
 
 # ==========================================
@@ -454,11 +656,12 @@ if bot:
             _, ticker, price_str, sl_str = call.data.split("_")
             price = float(price_str)
             sl = float(sl_str)
+            currency_sym = "₪" if ticker.endswith(".TA") else "$"
 
             msg = bot.send_message(
                 call.message.chat.id,
                 f"📊 **חישוב גודל פוזיציה עבור {ticker}**\n"
-                f"מחיר כניסה: ${price} | סטופ לוס: ${sl}\n\n"
+                f"מחיר כניסה: {currency_sym}{price} | סטופ לוס: {currency_sym}{sl}\n\n"
                 f"אנא הקלד את סכום הסיכון הכספי שברצונך לסכן (לדוגמה: 100 או 500):"
             )
             bot.register_next_step_handler(msg, process_risk_amount, ticker, price, sl)
@@ -469,6 +672,7 @@ if bot:
         try:
             risk_amount = float(message.text.strip())
             risk_per_share = price - sl
+            currency_sym = "₪" if ticker.endswith(".TA") else "$"
 
             if risk_per_share <= 0:
                 bot.reply_to(message, "שגיאה בחישוב: מחיר הסטופ לוס חייב להיות נמוך ממחיר הכניסה.")
@@ -476,14 +680,14 @@ if bot:
 
             shares = int(risk_amount / risk_per_share)
             total_position = shares * price
-            potential_profit_6pct = shares * (price * 0.06)
+            potential_profit_2r = shares * (risk_per_share * 2)
 
             res_msg = (
                 f"🧮 **תוצאות חישוב סיכון ל-{ticker}:**\n\n"
-                f"• סכום סיכון מבוקש: ${risk_amount:.2f}\n"
+                f"• סכום סיכון מבוקש: {currency_sym}{risk_amount:.2f}\n"
                 f"• כמות מניות לקנייה: **{shares}** מניות\n"
-                f"• שווי פוזיציה כולל: ${total_position:,.2f}\n"
-                f"• רווח פוטנציאלי ביעד 1 (6%): ${potential_profit_6pct:,.2f}"
+                f"• שווי פוזיציה כולל: {currency_sym}{total_position:,.2f}\n"
+                f"• רווח פוטנציאלי ביעד 1 (יחס 1:2): {currency_sym}{potential_profit_2r:,.2f}"
             )
             bot.send_message(message.chat.id, res_msg, parse_mode="Markdown")
         except ValueError:
@@ -493,16 +697,16 @@ if bot:
 
     @bot.message_handler(commands=['start', 'status'])
     def cmd_start_or_status(message):
-        bot.reply_to(message, "🤖 PazPSTrading Bot פעיל, מחובר לשרת ומוכן לפעולה!")
+        bot.reply_to(message, "🤖 PazPSTrading Bot v3.0 פעיל, מחובר לשרת ומוכן לפעולה!")
 
     @bot.message_handler(commands=['test_news'])
     def cmd_test_news(message):
-        bot.reply_to(message, "🔍 מריץ סריקת חדשות ודוחות ידנית...")
+        bot.reply_to(message, "🔍 מריץ סריקת חדשות ודוחות דו-שכבתית ידנית...")
         scan_breaking_news_events()
 
     @bot.message_handler(commands=['test_tech'])
     def cmd_test_tech(message):
-        bot.reply_to(message, "📊 מריץ סריקה טכנית ידנית על ה-Watchlist...")
+        bot.reply_to(message, "📊 מריץ סריקה טכנית משודרגת על ה-Watchlist...")
         scan_watchlist_technical()
 
 
@@ -512,7 +716,7 @@ if bot:
 
 @app.route("/", methods=["GET"])
 def index():
-    return "PazPSTrading Bot is running smoothly!", 200
+    return "PazPSTrading Bot v3.0 is running smoothly!", 200
 
 @app.route("/set_webhook", methods=["GET"])
 def set_webhook_route():
